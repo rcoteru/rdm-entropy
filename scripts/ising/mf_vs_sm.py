@@ -17,7 +17,7 @@ N = 20000
 Q = 100
 
 J = 1.5    # coupling strength; adjust to test different regimes
-I = 1.1    # external field; adjust to test different regimes
+I = 1.2    # external field; adjust to test different regimes
 beta = 40
 theta = 1
 dt = 1
@@ -26,19 +26,20 @@ tau_int = 20
 tau_ref = 3
 K_ref = 0
 
-steps1 = 10000
-steps2 = 5000
+steps1 = 20000
+steps2 = 10000
 
 # Model initialization
 # ~~~~~~~~~~~~~~~~~~~~
 torch.set_default_dtype(torch.float64)
 
-sm = SpinIsingModel(N, J, I, beta, theta, 
+sm = SpinIsingModel(N, J/dt, I, beta, theta, 
             tau_int, tau_ref=tau_ref, K_ref=K_ref, 
             dt=dt, device=device, ic="silent")
 
-mf = RDMIsingModel(J, I, beta, theta,
+mf = RDMIsingModel(J/dt, I, beta, theta,
         tau_int, tau_ref, K_ref, dt, eps=0.01, device=device)
+print(mf.Qm)
 
 # mf.P = sm.fdist(Q) # initialize mean-field distribution to match spin model
 
@@ -67,7 +68,7 @@ if True: # visualize final p(n) distribution
 
     plt.figure(figsize=(10, 4))
     plt.title("Firing age distribution (mean-field vs spin model)")
-    plt.plot(sm.fdist(Q).cpu().numpy(), label='Spin Model', linewidth=2)
+    plt.plot(sm.fdist(mf.Qm[0]).cpu().numpy(), label='Spin Model', linewidth=2)
     plt.plot(mf.p[0].cpu().numpy(), label='Mean Field', linewidth=2)
     plt.xlabel('p(n)'); plt.ylabel('Probability'); plt.legend(); plt.grid()
 
@@ -136,8 +137,8 @@ if True: # entropy trajectories
 
     # print trajetcory averages
     skip = Q # skip initial and final transient
-    print(f"Spin Model: <sigma> = {sm_traj2['sigma'][skip:-skip].mean():.8f}, <S_fwd> = {sm_traj2['S_fwd'][skip:-skip].mean():.8f}, <S_rev> = {sm_traj2['S_rev'][skip:-skip].mean():.8f}")
-    print(f"Mean Field: <sigma> = {mf_traj2['sigma'][skip:-skip].mean():.8f}, <S_fwd> = {mf_traj2['S_fwd'][skip:-skip].mean():.8f}, <S_rev> = {mf_traj2['S_rev'][skip:-skip].mean():.8f}")
+    print(f"Spin Model: <sigma> = {sm_traj2['sigma'][skip:-skip].mean():.8f} nats/ms, <S_fwd> = {sm_traj2['S_fwd'][skip:-skip].mean():.8f}, <S_rev> = {sm_traj2['S_rev'][skip:-skip].mean():.8f}")
+    print(f"Mean Field: <sigma> = {mf_traj2['sigma'][skip:-skip].mean():.8f} nats/ms, <S_fwd> = {mf_traj2['S_fwd'][skip:-skip].mean():.8f}, <S_rev> = {mf_traj2['S_rev'][skip:-skip].mean():.8f}")
 
     plt.tight_layout()
 

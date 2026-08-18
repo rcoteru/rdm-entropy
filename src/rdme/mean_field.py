@@ -243,7 +243,7 @@ class RDMNetwork:
         self.alpha_int = shrd.tau2alpha(self.tau_int, deltaT)
 
         if Qm is None:
-            Qm = [shrd.q_from_tau(max(self.tau_int[i].item(), self.tau_ref[i].item()), eps)
+            Qm = [shrd.q_from_tau(max(self.tau_int[i].item(), self.tau_ref[i].item()), deltaT, eps)
                   for i in range(M)]
         assert len(Qm) == M and all(isinstance(q, int) and q > 0 for q in Qm)
         self.Qm = Qm
@@ -420,11 +420,6 @@ class RDMNetwork:
             "S_rev_tot": (out_S_rev * self.N_ratios).sum(dim=1).cpu(),
         }
 
-
-
-
-
-
 def RDMIsingModel(
     J: float,
     I: float,
@@ -444,7 +439,6 @@ def RDMIsingModel(
             tau_int=[tau_int], tau_ref=[tau_ref], K_ref=[K_ref],
             deltaT=dt, eps=eps, device=device,
         )
-
 
 def RDMWilsonCowan(
     w_EE: float,
@@ -478,3 +472,331 @@ def RDMWilsonCowan(
         tau_ref=[tau_ref_E, tau_ref_I], K_ref=[K_ref_E, K_ref_I],
         deltaT=dt, eps=eps, device=device,
     )
+
+
+# Class for batch of systems
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+class RDMNetworkBatch:
+
+    """ Batch of N_param independent RDMNetworks sharing the same architecture
+    (M populations, N neurons per population, Qm age bins per population) but
+    each with its own parameters. """
+
+    B: int                    # batch size (N_param)
+    M: int                    # number of populations
+    deltaT: float             # time step size, in ms
+    Qm: list[int]             # (M,) number of age bins per population, shared across the batch
+    N: list[int]              # (M,) number of neurons per population, shared across the batch
+    w: torch.Tensor           # (B, M, M) synaptic weights
+
+    p: list[torch.Tensor]     # age distribution, one (B, Qm[i]) tensor per population
+    y: list[torch.Tensor]     # integration variable, one (B, Qm[i]) tensor per population
+    eta: list[torch.Tensor]   # refractory kernel, one (B, Qm[i]) tensor per population
+
+    I: torch.Tensor           # (B, M) external input current
+    beta: torch.Tensor        # (B, M) inverse temperature
+    theta: torch.Tensor       # (B, M) firing threshold
+    tau_int: torch.Tensor     # (B, M) integration kernel time constant (ms)
+    tau_ref: torch.Tensor     # (B, M) refractory kernel time constant (ms)
+    K_ref: torch.Tensor       # (B, M) refractory kernel strength
+    alpha_int: torch.Tensor   # (B, M) integration kernel scaling factor
+
+    m: torch.Tensor           # (B, M) current per-population overlaps
+
+    device: str                 # device for tensors
+
+    # precomputed quantities
+    N_ratios: torch.Tensor      # (M,) population size ratios, shared across the batch
+
+    # Construction and initialization
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def __init__(self, M: int,
+                 w: torch.Tensor,
+                 N: list[int],
+                 I: torch.Tensor,
+                 beta: torch.Tensor,
+                 theta: torch.Tensor,
+                 tau_int: torch.Tensor,
+                 tau_ref: torch.Tensor,
+                 K_ref: torch.Tensor,
+                 deltaT: float = 1.0,
+                 Qm: list[int] | None = None,
+                 eps: float = 0.01,
+                 device: str = 'cpu') -> None:
+        """ Initialize a batch of RDMNetworks with given parameters and default initial conditions.
+
+        w has shape (B, M, M); I, beta, theta, tau_int, tau_ref, K_ref have shape (B, M), with
+        B=N_param inferred from w. N stays a plain length-M list (population sizes are structural,
+        not fitted parameters) and is shared across the whole batch, same as M.
+
+        Qm, if given, is a length-M list shared across the batch. Otherwise each population's bin
+        count is auto-sized from the slowest (tau_int, tau_ref) pair *anywhere in the batch* for
+        that population, so a single Qm[i] safely represents every system in the batch. """
+
+        assert w.ndim == 3 and w.shape[1:] == (M, M), f"w must be (B,{M},{M})"
+        B = w.shape[0]
+        for name, arr in [("I", I), ("beta", beta), ("theta", theta),
+                          ("tau_int", tau_int), ("tau_ref", tau_ref), ("K_ref", K_ref)]:
+            assert arr.shape == (B, M), f"{name} must have shape (B={B},M={M})"
+        assert len(N) == M and all(isinstance(n, int) for n in N), "N must be a list of M integers."
+
+        # see RDMNetwork.__init__ for why dtype is pinned to the ambient default here
+        dtype = torch.get_default_dtype()
+
+        self.B, self.M, self.deltaT, self.device = B, M, deltaT, device
+        self.N = N
+        self.w = w.to(device=device, dtype=dtype)
+
+        self.I       = torch.as_tensor(I,       dtype=dtype, device=device)
+        self.beta    = torch.as_tensor(beta,    dtype=dtype, device=device)
+        self.theta   = torch.as_tensor(theta,   dtype=dtype, device=device)
+        self.tau_int = torch.as_tensor(tau_int, dtype=dtype, device=device)
+        self.tau_ref = torch.as_tensor(tau_ref, dtype=dtype, device=device)
+        self.K_ref   = torch.as_tensor(K_ref,   dtype=dtype, device=device)
+
+        self.N_ratios = torch.as_tensor(N, dtype=dtype, device=device)
+        self.N_ratios = self.N_ratios / self.N_ratios.sum()
+
+        self.alpha_int = shrd.tau2alpha(self.tau_int, deltaT)  # (B, M), elementwise
+
+        if Qm is None:
+            Qm = [shrd.q_from_tau(max(self.tau_int[:, i].max().item(), self.tau_ref[:, i].max().item()), deltaT, eps)
+                  for i in range(M)]
+        assert len(Qm) == M and all(isinstance(q, int) and q > 0 for q in Qm)
+        self.Qm = Qm
+
+        # per-population, per-batch-element refractory kernel: simple_refractory_kernel takes
+        # scalar K/tau_r, so vmap over the batch axis for each population separately (ragged Qm
+        # across i rules out a single vmap over both axes at once)
+        self.eta = [
+            torch.vmap(lambda K, tau, i=i: shrd.simple_refractory_kernel(self.Qm[i], K, tau, device=device))(
+                self.K_ref[:, i], self.tau_ref[:, i])
+            for i in range(M)
+        ]  # list of (B, Qm[i])
+
+        # initial conditions: all age-mass in the oldest bin, zero integrated field
+        self.p = [torch.zeros(B, Qm[i], device=device) for i in range(M)]
+        for pi in self.p: pi[:, -1] = 1.0
+        self.y = [torch.zeros(B, Qm[i], device=device) for i in range(M)]
+
+        self.m = torch.zeros(B, M, device=device)  # m[:, i] == p[i][:, 0], starts at 0
+
+    # Observables and derived quantities
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    @torch.inference_mode()
+    def overlaps(self) -> torch.Tensor:
+        """ Returns the current per-population activity vector m, shape (B, M). """
+        return self.m
+
+    @torch.inference_mode()
+    def activity(self) -> torch.Tensor:
+        """ Returns the N-weighted mean network activity per batch element, shape (B,). """
+        return (self.N_ratios * self.m).sum(dim=-1)
+
+    @torch.inference_mode()
+    def population_input(self) -> torch.Tensor:
+        """ Computes the cross-population input current, shape (B, M). """
+        return torch.vmap(compute_population_input)(self.m, self.w, self.I)
+
+    @torch.inference_mode()
+    def field(self) -> list[torch.Tensor]:
+        """ Returns the total local field y_i + eta_i per population, list of (B, Qm[i]) tensors. """
+        return [self.y[i] + self.eta[i] for i in range(self.M)]
+
+    @torch.inference_mode()
+    def firing_prob(self) -> list[torch.Tensor]:
+        """ Computes firing probabilities Phi(beta*(field - theta)) per population, list of (B, Qm[i]) tensors. """
+        fields = self.field()
+        return [torch.sigmoid(self.beta[:, i:i+1] * (fields[i] - self.theta[:, i:i+1])) for i in range(self.M)]
+
+    # Dynamics and trajectories
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    @torch.inference_mode()
+    def update(self) -> None:
+        """ Perform a single time-step update across the whole batch. """
+        pop_input = self.population_input()   # (B, M) — from OLD self.m
+        fprobs    = self.firing_prob()         # list of (B, Qm[i]) — from OLD y/eta
+
+        self.m = torch.stack(
+            [torch.vmap(compute_firing_rate)(self.p[i], fprobs[i]) for i in range(self.M)], dim=1)
+
+        for i in range(self.M):
+            self.p[i] = torch.vmap(update_age_distribution)(self.p[i], fprobs[i])
+            self.y[i] = torch.vmap(update_integration_variable)(
+                self.y[i], self.alpha_int[:, i], pop_input[:, i])
+
+        for i, pi in enumerate(self.p):
+            total = pi.sum(dim=-1)
+            if not torch.allclose(total, torch.ones_like(total), atol=1e-6):
+                raise ValueError(f"Population {i} distribution not normalized: sum={total.detach().cpu().tolist()}")
+
+    @torch.inference_mode()
+    def forward(self, T: int, pb: bool = True) -> None:
+        for _ in tqdm.tqdm(range(T), disable=not pb):
+            self.update()
+
+    def _out_device_kwargs(self) -> dict:
+        """ Allocation kwargs for trajectory-output accumulators. These grow linearly with T,
+        so on long trajectories they can rival or exceed the O(B*Qm^2) per-step compute buffers
+        (which stay fixed-size) — pinning them in CPU memory up front and streaming each step's
+        result in via non_blocking copies keeps that growth off the GPU entirely, instead of
+        accumulating on-device and paying for one big transfer at the end. No-op (plain
+        device-resident allocation) when the compute device isn't CUDA. """
+        if torch.device(self.device).type == 'cuda':
+            return dict(device='cpu', pin_memory=True)
+        return dict(device=self.device)
+
+    @torch.inference_mode()
+    def trajectory(self, T: int, act: bool = False, p: bool = False, y: bool = False, pb: bool = True) -> dict:
+        """ Run for T steps, returning only the requested quantities.
+        Always returns "m" (B, T, M). Optional keys: act (B, T);
+        p/y as lists of M tensors, each (B, T, Qm[i]) — ragged across populations, dense across time. """
+        out_kwargs = self._out_device_kwargs()
+        out: dict[str, torch.Tensor | list[torch.Tensor]] = {"m": torch.zeros(self.B, T, self.M, **out_kwargs)}
+        if act: out["act"] = torch.zeros(self.B, T, **out_kwargs)
+        if p:   out["p"] = [torch.zeros(self.B, T, self.Qm[i], **out_kwargs) for i in range(self.M)]
+        if y:   out["y"] = [torch.zeros(self.B, T, self.Qm[i], **out_kwargs) for i in range(self.M)]
+
+        for t in tqdm.tqdm(range(T), disable=not pb):
+            out["m"][:, t].copy_(self.m, non_blocking=True)
+            if act: out["act"][:, t].copy_(self.activity(), non_blocking=True)
+            if p:
+                for i in range(self.M): out["p"][i][:, t].copy_(self.p[i], non_blocking=True)
+            if y:
+                for i in range(self.M): out["y"][i][:, t].copy_(self.y[i], non_blocking=True)
+            self.update()
+
+        return out
+
+    @torch.inference_mode()
+    def entropy_trajectory(self, T: int, pb: bool = True) -> dict[str, torch.Tensor]:
+        """ Batched online per-population EPR using O(B*Qm[i]^2) rolling buffers per population.
+
+        Batched analogue of RDMNetwork.entropy_trajectory: all populations advance on ONE shared
+        clock, but each keeps its own Qm[i]. The fill phase runs Q_max=max(Qm) shared ticks,
+        writing into population i's (B, Qm[i], Qm[i]) buffer for only the first Qm[i] of them;
+        leftover snapshots for smaller populations are stashed in a per-population FIFO and
+        drained into the main loop's first few tail-writes, so no batch element or population
+        ever loses or re-reads a timestep.
+
+        Returns dict of CPU tensors: a_pop (B, T) N-weighted network activity;
+        sigma/S_fwd/S_rev (B, T, M) per-population entropy-production decomposition
+        (sigma = S_bw - S_fwd, per population); sigma_tot/S_fwd_tot/S_rev_tot (B, T) the
+        same quantities aggregated across populations via the N_ratios weighting already
+        used for activity(). """
+        B, M, Qm, device = self.B, self.M, self.Qm, self.device
+        Q_max = max(Qm)
+
+        out_kwargs = self._out_device_kwargs()
+        out_act   = torch.zeros(B, T, **out_kwargs)
+        out_sigma = torch.zeros(B, T, M, **out_kwargs)
+        out_S_fwd = torch.zeros(B, T, M, **out_kwargs)
+        out_S_rev = torch.zeros(B, T, M, **out_kwargs)
+
+        buff_p  = [torch.zeros(B, Qm[i], Qm[i], device=device) for i in range(M)]
+        buff_y  = [torch.zeros(B, Qm[i], Qm[i], device=device) for i in range(M)]
+        buff_in = [torch.zeros(B, Qm[i],        device=device) for i in range(M)]
+        pending = [deque() for _ in range(M)]  # leftover fill-phase snapshots, Qm[i] < Q_max
+
+        for j in range(Q_max):
+            pop_input = self.population_input()   # (B, M)
+            for i in range(M):
+                snap = (self.p[i].clone(), self.y[i].clone(), pop_input[:, i].clone())
+                if j < Qm[i]:
+                    buff_p[i][:, j], buff_y[i][:, j], buff_in[i][:, j] = snap
+                else:
+                    pending[i].append(snap)
+            self.update()
+
+        for t in tqdm.tqdm(range(T), disable=not pb):
+            for i in range(M):
+                H_rev = torch.vmap(compute_backward_field)(buff_in[i], self.alpha_int[:, i])
+                P_joint = torch.vmap(compute_joint_distribution)(
+                    buff_p[i][:, 0], buff_p[i], buff_y[i], self.eta[i], self.beta[:, i], self.theta[:, i])
+                epr = torch.vmap(compute_epr)(
+                    buff_p[i][:, 0], P_joint, buff_y[i][:, 0], H_rev, self.eta[i], self.beta[:, i], self.theta[:, i])
+                out_sigma[:, t, i].copy_(epr[:, 0], non_blocking=True)
+                out_S_fwd[:, t, i].copy_(epr[:, 1], non_blocking=True)
+                out_S_rev[:, t, i].copy_(epr[:, 2], non_blocking=True)
+
+                buff_p[i]  = torch.roll(buff_p[i],  shifts=-1, dims=1)
+                buff_y[i]  = torch.roll(buff_y[i],  shifts=-1, dims=1)
+                buff_in[i] = torch.roll(buff_in[i], shifts=-1, dims=1)
+
+            m_t = torch.stack([buff_p[i][:, 0, 0] for i in range(M)], dim=1)   # (B, M)
+            out_act[:, t].copy_((self.N_ratios * m_t).sum(dim=-1), non_blocking=True)
+
+            # read the tail from the CURRENT (pre-update) live state, THEN advance —
+            # this ordering (vs. update-then-read) is what avoids a timestep skip
+            pop_input = self.population_input()
+            for i in range(M):
+                if pending[i]:
+                    p_val, y_val, in_val = pending[i].popleft()
+                else:
+                    p_val, y_val, in_val = self.p[i].clone(), self.y[i].clone(), pop_input[:, i].clone()
+                buff_p[i][:, -1]  = p_val
+                buff_y[i][:, -1]  = y_val
+                buff_in[i][:, -1] = in_val
+            self.update()
+
+        # rewind live state to match the last reported timestep, discarding the
+        # extra Q_max-step lookahead accumulated in self.p/self.y during buffering
+        for i in range(M):
+            self.p[i] = buff_p[i][:, 0].clone()
+            self.y[i] = buff_y[i][:, 0].clone()
+        self.m = torch.stack([self.p[i][:, 0] for i in range(M)], dim=1)
+
+        # out_* accumulators may already be pinned CPU tensors (see _out_device_kwargs);
+        # match N_ratios to whichever device they ended up on for this final reduction
+        N_ratios = self.N_ratios.to(out_sigma.device)
+        return {
+            "a_pop":     out_act,
+            "sigma":     out_sigma,
+            "S_fwd":     out_S_fwd,
+            "S_rev":     out_S_rev,
+            "sigma_tot": (out_sigma * N_ratios).sum(dim=-1),
+            "S_fwd_tot": (out_S_fwd * N_ratios).sum(dim=-1),
+            "S_rev_tot": (out_S_rev * N_ratios).sum(dim=-1),
+        }
+
+
+def RDMIsingModelBatch(
+    J: float | torch.Tensor,
+    I: float | torch.Tensor,
+    beta: float | torch.Tensor,
+    theta: float | torch.Tensor,
+    tau_int: float | torch.Tensor,
+    tau_ref: float | torch.Tensor,
+    K_ref: float | torch.Tensor,
+    dt: float = 1.0,
+    Qm: list[int] | None = None,
+    eps: float = 0.01,
+    device: str = 'cpu',
+    ) -> RDMNetworkBatch:
+        """ Batched Ising RDMNetwork (M=1). Batched analogue of RDMIsingModel: each of
+        J, I, beta, theta, tau_int, tau_ref, K_ref may be a scalar (broadcast across the
+        batch) or a 1D tensor of length B — e.g. sweep I over a grid while keeping the
+        rest fixed, mirroring IsingModelBatch's mixed scalar/vector parameter interface
+        in the sibling spike-response-hopfield-model repo. """
+        dtype = torch.get_default_dtype()
+        names = ("J", "I", "beta", "theta", "tau_int", "tau_ref", "K_ref")
+        params = [torch.as_tensor(v, dtype=dtype, device=device).reshape(-1)
+                  for v in (J, I, beta, theta, tau_int, tau_ref, K_ref)]
+        B = max(p.numel() for p in params)
+        for name, p in zip(names, params):
+            assert p.numel() in (1, B), f"{name} has length {p.numel()}, expected 1 or {B}"
+        J_, I_, beta_, theta_, tau_int_, tau_ref_, K_ref_ = [
+            p.expand(B) if p.numel() == 1 else p for p in params
+        ]
+
+        w = J_.reshape(B, 1, 1)
+        return RDMNetworkBatch(
+            M=1, w=w, N=[1000],
+            I=I_.reshape(B, 1), beta=beta_.reshape(B, 1), theta=theta_.reshape(B, 1),
+            tau_int=tau_int_.reshape(B, 1), tau_ref=tau_ref_.reshape(B, 1), K_ref=K_ref_.reshape(B, 1),
+            deltaT=dt, Qm=Qm, eps=eps, device=device,
+        )
