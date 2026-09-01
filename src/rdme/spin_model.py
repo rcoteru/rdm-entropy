@@ -401,7 +401,7 @@ class SpinModel:
         H_win = torch.zeros((W, N), device=dev, dtype=store_dtype)
         X_win = torch.zeros((W, N), device=dev, dtype=store_dtype)
         D_win = torch.zeros((W, N), device=dev, dtype=store_dtype)
-        fd_win  = torch.zeros((W, Q), device=dev, dtype=store_dtype) if fdist else None
+        if fdist: fd_win  = torch.zeros((W, Q), device=dev, dtype=store_dtype)
 
         out = {k: torch.zeros(T, device=dev, dtype=acc)
                for k in ("a_tot", "sigma", "S_fwd", "S_rev")}

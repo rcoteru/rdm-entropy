@@ -652,12 +652,19 @@ class RDMNetworkBatch:
         return dict(device=self.device)
 
     @torch.inference_mode()
-    def trajectory(self, T: int, act: bool = False, p: bool = False, y: bool = False, pb: bool = True) -> dict:
+    def trajectory(self, T: int, 
+                act: bool = False, 
+                p: bool = False, 
+                y: bool = False, 
+                pb: bool = True
+                ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
         """ Run for T steps, returning only the requested quantities.
         Always returns "m" (B, T, M). Optional keys: act (B, T);
         p/y as lists of M tensors, each (B, T, Qm[i]) — ragged across populations, dense across time. """
         out_kwargs = self._out_device_kwargs()
-        out: dict[str, torch.Tensor | list[torch.Tensor]] = {"m": torch.zeros(self.B, T, self.M, **out_kwargs)}
+
+        out = {}
+        out["m"] = torch.zeros(self.B, T, self.M, **out_kwargs)
         if act: out["act"] = torch.zeros(self.B, T, **out_kwargs)
         if p:   out["p"] = [torch.zeros(self.B, T, self.Qm[i], **out_kwargs) for i in range(self.M)]
         if y:   out["y"] = [torch.zeros(self.B, T, self.Qm[i], **out_kwargs) for i in range(self.M)]
