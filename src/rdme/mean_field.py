@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from pathlib import Path
 import torch
 import tqdm
 
@@ -420,6 +421,9 @@ class RDMNetwork:
             "S_rev_tot": (out_S_rev * self.N_ratios).sum(dim=1).cpu(),
         }
 
+# Constructors for common models
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 def RDMIsingModel(
     J: float,
     I: float,
@@ -507,6 +511,10 @@ class RDMNetworkBatch:
 
     device: str                 # device for tensors
 
+    # parameter-grid bookkeeping (see unflatten())
+    grid_shape: tuple[int, ...]         # axis sizes whose product is B; (B,) if not a grid
+    grid_axes: dict[str, torch.Tensor]  # swept 1D input vectors, in grid order
+
     # precomputed quantities
     N_ratios: torch.Tensor      # (M,) population size ratios, shared across the batch
 
@@ -525,6 +533,8 @@ class RDMNetworkBatch:
                  deltaT: float = 1.0,
                  Qm: list[int] | None = None,
                  eps: float = 0.01,
+                 grid_shape: tuple[int, ...] | None = None,
+                 grid_axes: dict[str, torch.Tensor] | None = None,
                  device: str = 'cpu') -> None:
         """ Initialize a batch of RDMNetworks with given parameters and default initial conditions.
 
@@ -534,7 +544,13 @@ class RDMNetworkBatch:
 
         Qm, if given, is a length-M list shared across the batch. Otherwise each population's bin
         count is auto-sized from the slowest (tau_int, tau_ref) pair *anywhere in the batch* for
-        that population, so a single Qm[i] safely represents every system in the batch. """
+        that population, so a single Qm[i] safely represents every system in the batch.
+
+        grid_shape/grid_axes describe a batch that came from a flattened parameter grid (see
+        shared.flatten_param_grid, and the RDMIsingModelBatch / RDMWilsonCowanBatch constructors
+        that use it): trajectory outputs are then returned with the batch axis expanded back into
+        the grid axes, and grid_axes carries the swept 1D vectors for plotting. Omit both for a
+        plain flat batch, which is left untouched. """
 
         assert w.ndim == 3 and w.shape[1:] == (M, M), f"w must be (B,{M},{M})"
         B = w.shape[0]
@@ -549,6 +565,12 @@ class RDMNetworkBatch:
         self.B, self.M, self.deltaT, self.device = B, M, deltaT, device
         self.N = N
         self.w = w.to(device=device, dtype=dtype)
+
+        self.grid_shape = tuple(int(s) for s in grid_shape) if grid_shape is not None else (B,)
+        n_grid = 1
+        for s in self.grid_shape: n_grid *= s
+        assert n_grid == B, f"grid_shape {self.grid_shape} has {n_grid} cells, expected B={B}"
+        self.grid_axes = dict(grid_axes) if grid_axes is not None else {}
 
         self.I       = torch.as_tensor(I,       dtype=dtype, device=device)
         self.beta    = torch.as_tensor(beta,    dtype=dtype, device=device)
@@ -583,6 +605,48 @@ class RDMNetworkBatch:
         self.y = [torch.zeros(B, Qm[i], device=device) for i in range(M)]
 
         self.m = torch.zeros(B, M, device=device)  # m[:, i] == p[i][:, 0], starts at 0
+
+    def unflatten(self, x: torch.Tensor) -> torch.Tensor:
+        """ Expand a leading flat batch axis (B, ...) into the parameter-grid axes (*grid, ...).
+
+        Pass-through when this batch didn't come from a grid, so a directly constructed
+        RDMNetworkBatch keeps the plain (B, ...) output shapes. """
+        if len(self.grid_shape) <= 1:
+            return x
+        return shrd.unflatten_batch(x, self.grid_shape)
+
+    # Serialization
+    # ~~~~~~~~~~~~~
+
+    _SAVE_TENSORS = ("w", "I", "beta", "theta", "tau_int", "tau_ref", "K_ref",
+                     "alpha_int", "N_ratios", "m")
+    _SAVE_LISTS   = ("eta", "p", "y")
+
+    def save(self, path: str | Path) -> None:
+        """ Save the full batch state, parameters and grid layout to a file. """
+        data = {
+            "B": self.B, "M": self.M, "deltaT": self.deltaT, "Qm": self.Qm, "N": self.N,
+            "grid_shape": self.grid_shape, "grid_axes": self.grid_axes, "device": self.device,
+        }
+        data.update({k: getattr(self, k) for k in self._SAVE_TENSORS})
+        data.update({k: getattr(self, k) for k in self._SAVE_LISTS})
+        torch.save(data, path)
+
+    @classmethod
+    def load(cls, path: str | Path, device: str | None = None) -> RDMNetworkBatch:
+        """ Load a batch saved with save(), without rebuilding the parameter grid. """
+        data = torch.load(path, map_location=device, weights_only=True)
+        obj = object.__new__(cls)
+        obj.B, obj.M, obj.deltaT = data["B"], data["M"], data["deltaT"]
+        obj.Qm, obj.N = list(data["Qm"]), list(data["N"])
+        obj.grid_shape = tuple(data["grid_shape"])
+        obj.device = device if device is not None else data["device"]
+        obj.grid_axes = {k: v.to(obj.device) for k, v in data["grid_axes"].items()}
+        for key in cls._SAVE_TENSORS:
+            setattr(obj, key, data[key].to(obj.device))
+        for key in cls._SAVE_LISTS:
+            setattr(obj, key, [t.to(obj.device) for t in data[key]])
+        return obj
 
     # Observables and derived quantities
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -659,8 +723,10 @@ class RDMNetworkBatch:
                 pb: bool = True
                 ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
         """ Run for T steps, returning only the requested quantities.
-        Always returns "m" (B, T, M). Optional keys: act (B, T);
-        p/y as lists of M tensors, each (B, T, Qm[i]) — ragged across populations, dense across time. """
+        Always returns "m" (*grid, T, M). Optional keys: act (*grid, T);
+        p/y as lists of M tensors, each (*grid, T, Qm[i]) — ragged across populations, dense
+        across time. The leading grid axes are (B,) unless this batch was built from a
+        parameter grid (see unflatten()). """
         out_kwargs = self._out_device_kwargs()
 
         out = {}
@@ -678,7 +744,8 @@ class RDMNetworkBatch:
                 for i in range(self.M): out["y"][i][:, t].copy_(self.y[i], non_blocking=True)
             self.update()
 
-        return out
+        def _uf(v): return self.unflatten(v) if torch.is_tensor(v) else [self.unflatten(t) for t in v]
+        return {k: _uf(v) for k, v in out.items()}
 
     @torch.inference_mode()
     def entropy_trajectory(self, T: int, pb: bool = True) -> dict[str, torch.Tensor]:
@@ -691,11 +758,12 @@ class RDMNetworkBatch:
         drained into the main loop's first few tail-writes, so no batch element or population
         ever loses or re-reads a timestep.
 
-        Returns dict of CPU tensors: a_pop (B, T) N-weighted network activity;
-        sigma/S_fwd/S_rev (B, T, M) per-population entropy-production decomposition
-        (sigma = S_bw - S_fwd, per population); sigma_tot/S_fwd_tot/S_rev_tot (B, T) the
+        Returns dict of CPU tensors: a_pop (*grid, T) N-weighted network activity;
+        sigma/S_fwd/S_rev (*grid, T, M) per-population entropy-production decomposition
+        (sigma = S_bw - S_fwd, per population); sigma_tot/S_fwd_tot/S_rev_tot (*grid, T) the
         same quantities aggregated across populations via the N_ratios weighting already
-        used for activity(). """
+        used for activity(). The leading grid axes are (B,) unless this batch was built from
+        a parameter grid (see unflatten()). """
         B, M, Qm, device = self.B, self.M, self.Qm, self.device
         Q_max = max(Qm)
 
@@ -761,7 +829,7 @@ class RDMNetworkBatch:
         # out_* accumulators may already be pinned CPU tensors (see _out_device_kwargs);
         # match N_ratios to whichever device they ended up on for this final reduction
         N_ratios = self.N_ratios.to(out_sigma.device)
-        return {
+        out = {
             "a_pop":     out_act,
             "sigma":     out_sigma,
             "S_fwd":     out_S_fwd,
@@ -770,7 +838,10 @@ class RDMNetworkBatch:
             "S_fwd_tot": (out_S_fwd * N_ratios).sum(dim=-1),
             "S_rev_tot": (out_S_rev * N_ratios).sum(dim=-1),
         }
+        return {k: self.unflatten(v) for k, v in out.items()}
 
+# Constructors for common models
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 def RDMIsingModelBatch(
     J: float | torch.Tensor,
@@ -786,27 +857,28 @@ def RDMIsingModelBatch(
     device: str = 'cpu',
     ) -> RDMNetworkBatch:
         """ Batched Ising RDMNetwork (M=1). Batched analogue of RDMIsingModel: each of
-        J, I, beta, theta, tau_int, tau_ref, K_ref may be a scalar (broadcast across the
-        batch) or a 1D tensor of length B — e.g. sweep I over a grid while keeping the
-        rest fixed, mirroring IsingModelBatch's mixed scalar/vector parameter interface
-        in the sibling spike-response-hopfield-model repo. """
-        dtype = torch.get_default_dtype()
-        names = ("J", "I", "beta", "theta", "tau_int", "tau_ref", "K_ref")
-        params = [torch.as_tensor(v, dtype=dtype, device=device).reshape(-1)
-                  for v in (J, I, beta, theta, tau_int, tau_ref, K_ref)]
-        B = max(p.numel() for p in params)
-        for name, p in zip(names, params):
-            assert p.numel() in (1, B), f"{name} has length {p.numel()}, expected 1 or {B}"
-        J_, I_, beta_, theta_, tau_int_, tau_ref_, K_ref_ = [
-            p.expand(B) if p.numel() == 1 else p for p in params
-        ]
+        J, I, beta, theta, tau_int, tau_ref, K_ref may be a scalar or a 1D tensor, and the
+        batch is the **outer product** of them all — pass two vectors and you get the full
+        2D sweep, no meshgrid needed at the call site. This mirrors IsingModelBatch in the
+        sibling spike-response-hopfield-model repo.
 
-        w = J_.reshape(B, 1, 1)
+        Parameters passed as scalars contribute a singleton grid axis that is dropped again
+        on output, so trajectory results come back shaped by the swept axes only, in the
+        argument order above (e.g. sweeping J and I gives (n_J, n_I, T)). The swept vectors
+        are kept in the returned model's grid_axes for plotting. """
+        flat, grid_shape, axes = shrd.flatten_param_grid({
+            "J": J, "I": I, "beta": beta, "theta": theta,
+            "tau_int": tau_int, "tau_ref": tau_ref, "K_ref": K_ref,
+        }, device=device)
+        B = flat["J"].numel()
+
         return RDMNetworkBatch(
-            M=1, w=w, N=[1000],
-            I=I_.reshape(B, 1), beta=beta_.reshape(B, 1), theta=theta_.reshape(B, 1),
-            tau_int=tau_int_.reshape(B, 1), tau_ref=tau_ref_.reshape(B, 1), K_ref=K_ref_.reshape(B, 1),
-            deltaT=dt, Qm=Qm, eps=eps, device=device,
+            M=1, w=flat["J"].reshape(B, 1, 1), N=[1000],
+            I=flat["I"].reshape(B, 1), beta=flat["beta"].reshape(B, 1),
+            theta=flat["theta"].reshape(B, 1), tau_int=flat["tau_int"].reshape(B, 1),
+            tau_ref=flat["tau_ref"].reshape(B, 1), K_ref=flat["K_ref"].reshape(B, 1),
+            deltaT=dt, Qm=Qm, eps=eps,
+            grid_shape=grid_shape, grid_axes=axes, device=device,
         )
 
 
@@ -834,40 +906,40 @@ def RDMWilsonCowanBatch(
     device: str = 'cpu',
     ) -> RDMNetworkBatch:
         """ Batched Wilson-Cowan-*like* two-population (M=2, order [E, I]) RDMNetwork.
-        Batched analogue of RDMWilsonCowan: each parameter may be a scalar (broadcast
-        across the batch) or a 1D tensor of length B — e.g. sweep w_EE and w_II over a
-        grid while keeping the rest fixed, mirroring RDMIsingModelBatch's mixed
-        scalar/vector parameter interface. """
-        dtype = torch.get_default_dtype()
-        names = ("w_EE", "w_EI", "w_IE", "w_II", "I_E", "I_I", "beta_E", "beta_I",
-                  "theta_E", "theta_I", "tau_int_E", "tau_int_I", "tau_ref_E", "tau_ref_I",
-                  "K_ref_E", "K_ref_I")
-        params = [torch.as_tensor(v, dtype=dtype, device=device).reshape(-1)
-                  for v in (w_EE, w_EI, w_IE, w_II, I_E, I_I, beta_E, beta_I,
-                            theta_E, theta_I, tau_int_E, tau_int_I, tau_ref_E, tau_ref_I,
-                            K_ref_E, K_ref_I)]
-        B = max(p.numel() for p in params)
-        for name, p in zip(names, params):
-            assert p.numel() in (1, B), f"{name} has length {p.numel()}, expected 1 or {B}"
-        (w_EE_, w_EI_, w_IE_, w_II_, I_E_, I_I_, beta_E_, beta_I_, theta_E_, theta_I_,
-         tau_int_E_, tau_int_I_, tau_ref_E_, tau_ref_I_, K_ref_E_, K_ref_I_) = [
-            p.expand(B) if p.numel() == 1 else p for p in params
-        ]
+        Batched analogue of RDMWilsonCowan: each parameter may be a scalar or a 1D tensor,
+        and the batch is the **outer product** of them all — pass w_EE and w_II as vectors
+        and you get the full 2D sweep, no meshgrid needed at the call site, mirroring
+        RDMIsingModelBatch.
+
+        Parameters passed as scalars contribute a singleton grid axis that is dropped again
+        on output, so trajectory results come back shaped by the swept axes only, in the
+        argument order above. The swept vectors are kept in the returned model's grid_axes
+        for plotting. E_ratio is structural (it sets the population sizes N) and stays a
+        scalar — it is not a grid axis. """
+        flat, grid_shape, axes = shrd.flatten_param_grid({
+            "w_EE": w_EE, "w_EI": w_EI, "w_IE": w_IE, "w_II": w_II,
+            "I_E": I_E, "I_I": I_I, "beta_E": beta_E, "beta_I": beta_I,
+            "theta_E": theta_E, "theta_I": theta_I,
+            "tau_int_E": tau_int_E, "tau_int_I": tau_int_I,
+            "tau_ref_E": tau_ref_E, "tau_ref_I": tau_ref_I,
+            "K_ref_E": K_ref_E, "K_ref_I": K_ref_I,
+        }, device=device)
 
         N_E = int(E_ratio * 1000)
         N_I = 1000 - N_E
         w = torch.stack([
-            torch.stack([w_EE_, w_EI_], dim=-1),
-            torch.stack([w_IE_, w_II_], dim=-1),
+            torch.stack([flat["w_EE"], flat["w_EI"]], dim=-1),
+            torch.stack([flat["w_IE"], flat["w_II"]], dim=-1),
         ], dim=1)  # (B, 2, 2)
 
-        def stack2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            return torch.stack([a, b], dim=-1)  # (B, 2)
+        def stack2(name_E: str, name_I: str) -> torch.Tensor:
+            return torch.stack([flat[name_E], flat[name_I]], dim=-1)  # (B, 2)
 
         return RDMNetworkBatch(
             M=2, w=w, N=[N_E, N_I],
-            I=stack2(I_E_, I_I_), beta=stack2(beta_E_, beta_I_), theta=stack2(theta_E_, theta_I_),
-            tau_int=stack2(tau_int_E_, tau_int_I_), tau_ref=stack2(tau_ref_E_, tau_ref_I_),
-            K_ref=stack2(K_ref_E_, K_ref_I_),
-            deltaT=dt, Qm=Qm, eps=eps, device=device,
+            I=stack2("I_E", "I_I"), beta=stack2("beta_E", "beta_I"),
+            theta=stack2("theta_E", "theta_I"), tau_int=stack2("tau_int_E", "tau_int_I"),
+            tau_ref=stack2("tau_ref_E", "tau_ref_I"), K_ref=stack2("K_ref_E", "K_ref_I"),
+            deltaT=dt, Qm=Qm, eps=eps,
+            grid_shape=grid_shape, grid_axes=axes, device=device,
         )

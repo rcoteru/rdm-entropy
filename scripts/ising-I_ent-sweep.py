@@ -4,13 +4,14 @@ import time
 import matplotlib.pyplot as plt
 import torch
 
-from rdme.mean_field import RDMIsingModelBatch
+from rdme.mean_field import RDMIsingModelBatch, RDMNetworkBatch
 
 # ── Cache paths ───────────────────────────────────────────────────────────────
 
 bname = Path(__file__).stem
 CACHE_DIR       = Path(__file__).parents[2] / "cache"
 CACHE_TRAJ_FILE = CACHE_DIR / f"{bname}_traj.pt"
+CACHE_SIM_FILE  = CACHE_DIR / f"{bname}_sim.pt"
 
 run_sim   = True
 run_plot  = True
@@ -47,24 +48,27 @@ if run_sim:
         t0 = time.time()
         mf.forward(equi, pb=True)
         traj = mf.entropy_trajectory(steps, pb=True)
-        traj["I"]  = I.cpu()
         traj["dt"] = torch.tensor(dt)
         print(f"Done in {time.time() - t0:.2f}s")
 
         CACHE_DIR.mkdir(exist_ok=True)
         torch.save(traj, CACHE_TRAJ_FILE)
         print(f"Trajectory saved to {CACHE_TRAJ_FILE}.")
+        mf.save(CACHE_SIM_FILE)
+        print(f"Simulation state saved to {CACHE_SIM_FILE}.")
 
 
 # ── Analysis & Plot ───────────────────────────────────────────────────────────
 
 if run_plot:
 
-    if not CACHE_TRAJ_FILE.exists():
-        raise FileNotFoundError(f"Trajectory not found at {CACHE_TRAJ_FILE}. Run simulation first.")
+    for f in (CACHE_TRAJ_FILE, CACHE_SIM_FILE):
+        if not f.exists():
+            raise FileNotFoundError(f"{f} not found. Run simulation first.")
 
     traj = torch.load(CACHE_TRAJ_FILE, weights_only=True)
-    I = traj["I"]
+    mf   = RDMNetworkBatch.load(CACHE_SIM_FILE, device="cpu")
+    I    = mf.grid_axes["I"]   # the only swept axis, so every output stays (n_I, T)
 
     n_points = 1000  # tail points per I shown in the bifurcation-diagram scatter
     max_freq = None   # (1/ms) y-limit for the spectrogram panel; None = full Nyquist range
@@ -116,6 +120,10 @@ if run_plot:
     ax5.set_xlabel('External input  I')
     ax5.plot(I, traj["sigma_tot"].mean(dim=1), linewidth=2)
 
-    fig.suptitle(f'RDM Ising mean-field  J={J},  β={beta},  τ_int={tau_int},  τ_ref={tau_ref},  K_ref={K_ref}', fontsize=14)
+    # fixed parameters read off the loaded model, so the plot half stands alone (run_sim=False)
+    dt_ = traj["dt"].item()
+    fig.suptitle(f'RDM Ising mean-field  J={mf.w[0, 0, 0].item()*dt_:g},  β={mf.beta[0, 0].item():g},  '
+                 f'τ_int={mf.tau_int[0, 0].item():g},  τ_ref={mf.tau_ref[0, 0].item():g},  '
+                 f'K_ref={mf.K_ref[0, 0].item():g}', fontsize=14)
     # plt.tight_layout()
     plt.show()
