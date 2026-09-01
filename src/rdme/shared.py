@@ -1,10 +1,20 @@
 import torch
 import math
 
+def q_from_tau(tau_m: float, dt: float, eps: float = 0.01) -> int:
+    """
+    Minimum number of bins Q such that the omitted tail mass of the
+    normalized exponential kernel kappa(tau) = alpha * r**(tau-1),
+    r = exp(-dt/tau_m), alpha = 1-r, falls below eps.
 
-def q_from_tau(tau_max: float, eps: float = 0.01) -> int:
-    """ Minimum Q such that the exponential kernel exp(-Q/tau_max) < eps. """
-    return math.ceil(-tau_max * math.log(eps))
+    Tail mass after Q terms is exactly r**Q = exp(-Q*dt/tau_m), so:
+        r**Q < eps  =>  Q > -(tau_m/dt) * ln(eps)
+    """
+    if not (0.0 < eps < 1.0):
+        raise ValueError("eps must be in (0, 1)")
+    tau_ratio = tau_m / dt          # tau_m expressed in units of dt (bins)
+    Q = math.ceil(-tau_ratio * math.log(eps))
+    return max(Q, 1)
 
 def synaptic_kernel(Q, tau_m, delta):
     """ Normalized synaptic kernel for a leaky integrate-and-fire neuron model. """

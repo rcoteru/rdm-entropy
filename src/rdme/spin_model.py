@@ -174,7 +174,7 @@ class SpinModel:
     def drive(self) -> torch.Tensor:
         """ Computes the drive at current time, i.e. D_t = J*s_t + I. """
         activities = self.population_activity()
-        pop_drive = self.w @ activities + self.I
+        pop_drive = self.w.T @ activities + self.I
         return self.pop_to_network(pop_drive)
 
     @torch.inference_mode()
@@ -240,7 +240,7 @@ class SpinModel:
     @torch.inference_mode()
     def trajectory(self, T: int, kur: bool = False, ent: bool = False,
                    s: bool = False, pot: bool = False, fdist: bool = False, 
-                   Q: int = 100) -> dict:
+                   Q: int = 100) -> dict[str, torch.Tensor]:
         """Run for T steps, returning only the requested quantities.
 
         Always returns "obs" (observables, shape (T, n_obs)). Optional keys:
@@ -516,12 +516,23 @@ def SpinIsingModel(N: int, J: float, I: float, beta: float, theta: float,
 
 
 def SpinWilsonCowan(
-        N1: int, N2: int, J11: float, J12: float, J21: float, J22: float,
-        I1: float, I2: float, 
-        beta1: float, beta2: float,
-        theta1: float, theta2: float,
-        tau_int1: float, tau_int2: float,
-        tau_ref1: float, tau_ref2: float,
+        N: int, 
+        E_ratio: float,
+        w_EE: float,
+        w_EI: float,
+        w_IE: float,
+        w_II: float,
+        I_E: float,
+        I_I: float,
+        beta_E: float,
+        beta_I: float,
+        theta_E: float,
+        theta_I: float,
+        tau_int_E: float,
+        tau_int_I: float,
+        tau_ref_E: float,
+        tau_ref_I: float,
+ 
         K_ref1: float, K_ref2: float,
         dt: float = 1.0, n_obs: int = 1, 
         device: str = "cpu", ic: str = "random"
@@ -530,13 +541,15 @@ def SpinWilsonCowan(
     """ Construct a Wilson-Cowan SpinModel. """
 
     M = 2
-    Nm = torch.tensor([N1, N2], device=device)
-    w = torch.tensor([[J11, J12], [J21, J22]], device=device, dtype=torch.float32)
-    I_vec = torch.tensor([I1, I2], device=device, dtype=torch.float32)
-    beta_vec = torch.tensor([beta1, beta2], device=device, dtype=torch.float32)
-    theta_vec = torch.tensor([theta1, theta2], device=device, dtype=torch.float32)
-    tau_int_vec = torch.tensor([tau_int1, tau_int2], device=device, dtype=torch.float32)
-    tau_ref_vec = torch.tensor([tau_ref1, tau_ref2], device=device, dtype=torch.float32)
+    N_I = int(N * (1 - E_ratio))
+    N_E = N - N_I
+    Nm = torch.tensor([N_E, N_I], device=device)
+    w = torch.tensor([[w_EE, w_EI], [w_IE, w_II]], device=device, dtype=torch.float32)
+    I_vec = torch.tensor([I_E, I_I], device=device, dtype=torch.float32)
+    beta_vec = torch.tensor([beta_E, beta_I], device=device, dtype=torch.float32)
+    theta_vec = torch.tensor([theta_E, theta_I], device=device, dtype=torch.float32)
+    tau_int_vec = torch.tensor([tau_int_E, tau_int_I], device=device, dtype=torch.float32)
+    tau_ref_vec = torch.tensor([tau_ref_E, tau_ref_I], device=device, dtype=torch.float32)
     K_ref_vec = torch.tensor([K_ref1, K_ref2], device=device, dtype=torch.float32)
 
     if ic == "random":

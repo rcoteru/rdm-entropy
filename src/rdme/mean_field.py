@@ -16,7 +16,7 @@ def compute_population_input(
         I: torch.Tensor, # (M,) pop external inputs
         ) -> torch.Tensor:
     """ Compute the input current to population m. """
-    return w@m+I
+    return w.T@m+I
 
 def update_integration_variable(
         y: torch.Tensor,               # (Q) integration variable
@@ -441,6 +441,7 @@ def RDMIsingModel(
         )
 
 def RDMWilsonCowan(
+    E_ratio: float,
     w_EE: float,
     w_EI: float,
     w_IE: float,
@@ -457,13 +458,13 @@ def RDMWilsonCowan(
     tau_ref_I: float,
     K_ref_E: float,
     K_ref_I: float,
-    N_E: int,
-    N_I: int,
     dt: float = 1.0,
     eps: float = 0.01,
     device: str = 'cpu',
 ) -> RDMNetwork:
     """ Wilson-Cowan-*like* two-population (M=2, order [E, I]) RDMNetwork. """
+    N_E = int(E_ratio * 1000)
+    N_I = 1000 - N_E
     w = torch.tensor([[w_EE, w_EI],
                       [w_IE, w_II]], dtype=torch.float32)
     return RDMNetwork(
@@ -798,5 +799,68 @@ def RDMIsingModelBatch(
             M=1, w=w, N=[1000],
             I=I_.reshape(B, 1), beta=beta_.reshape(B, 1), theta=theta_.reshape(B, 1),
             tau_int=tau_int_.reshape(B, 1), tau_ref=tau_ref_.reshape(B, 1), K_ref=K_ref_.reshape(B, 1),
+            deltaT=dt, Qm=Qm, eps=eps, device=device,
+        )
+
+
+def RDMWilsonCowanBatch(
+    E_ratio: float,
+    w_EE: float | torch.Tensor,
+    w_EI: float | torch.Tensor,
+    w_IE: float | torch.Tensor,
+    w_II: float | torch.Tensor,
+    I_E: float | torch.Tensor,
+    I_I: float | torch.Tensor,
+    beta_E: float | torch.Tensor,
+    beta_I: float | torch.Tensor,
+    theta_E: float | torch.Tensor,
+    theta_I: float | torch.Tensor,
+    tau_int_E: float | torch.Tensor,
+    tau_int_I: float | torch.Tensor,
+    tau_ref_E: float | torch.Tensor,
+    tau_ref_I: float | torch.Tensor,
+    K_ref_E: float | torch.Tensor,
+    K_ref_I: float | torch.Tensor,
+    dt: float = 1.0,
+    Qm: list[int] | None = None,
+    eps: float = 0.01,
+    device: str = 'cpu',
+    ) -> RDMNetworkBatch:
+        """ Batched Wilson-Cowan-*like* two-population (M=2, order [E, I]) RDMNetwork.
+        Batched analogue of RDMWilsonCowan: each parameter may be a scalar (broadcast
+        across the batch) or a 1D tensor of length B — e.g. sweep w_EE and w_II over a
+        grid while keeping the rest fixed, mirroring RDMIsingModelBatch's mixed
+        scalar/vector parameter interface. """
+        dtype = torch.get_default_dtype()
+        names = ("w_EE", "w_EI", "w_IE", "w_II", "I_E", "I_I", "beta_E", "beta_I",
+                  "theta_E", "theta_I", "tau_int_E", "tau_int_I", "tau_ref_E", "tau_ref_I",
+                  "K_ref_E", "K_ref_I")
+        params = [torch.as_tensor(v, dtype=dtype, device=device).reshape(-1)
+                  for v in (w_EE, w_EI, w_IE, w_II, I_E, I_I, beta_E, beta_I,
+                            theta_E, theta_I, tau_int_E, tau_int_I, tau_ref_E, tau_ref_I,
+                            K_ref_E, K_ref_I)]
+        B = max(p.numel() for p in params)
+        for name, p in zip(names, params):
+            assert p.numel() in (1, B), f"{name} has length {p.numel()}, expected 1 or {B}"
+        (w_EE_, w_EI_, w_IE_, w_II_, I_E_, I_I_, beta_E_, beta_I_, theta_E_, theta_I_,
+         tau_int_E_, tau_int_I_, tau_ref_E_, tau_ref_I_, K_ref_E_, K_ref_I_) = [
+            p.expand(B) if p.numel() == 1 else p for p in params
+        ]
+
+        N_E = int(E_ratio * 1000)
+        N_I = 1000 - N_E
+        w = torch.stack([
+            torch.stack([w_EE_, w_EI_], dim=-1),
+            torch.stack([w_IE_, w_II_], dim=-1),
+        ], dim=1)  # (B, 2, 2)
+
+        def stack2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            return torch.stack([a, b], dim=-1)  # (B, 2)
+
+        return RDMNetworkBatch(
+            M=2, w=w, N=[N_E, N_I],
+            I=stack2(I_E_, I_I_), beta=stack2(beta_E_, beta_I_), theta=stack2(theta_E_, theta_I_),
+            tau_int=stack2(tau_int_E_, tau_int_I_), tau_ref=stack2(tau_ref_E_, tau_ref_I_),
+            K_ref=stack2(K_ref_E_, K_ref_I_),
             deltaT=dt, Qm=Qm, eps=eps, device=device,
         )
