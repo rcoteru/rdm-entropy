@@ -4,7 +4,7 @@ import time
 import matplotlib.pyplot as plt
 import torch
 
-from rdme.mean_field import RDMIsingModelBatch
+from rdme.mean_field import RDMWilsonCowanBatch
 
 # ── Cache paths ───────────────────────────────────────────────────────────────
 
@@ -14,7 +14,7 @@ CACHE_TRAJ_FILE = CACHE_DIR / f"{bname}_traj.pt"
 
 run_sim   = True
 run_plot  = True
-overwrite = True
+overwrite = False
 
 torch.set_default_dtype(torch.float64)
 
@@ -25,8 +25,15 @@ if run_sim:
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    J       = torch.linspace(0, 8, 101)
-    I       = torch.linspace(0.5, 2, 101)
+    # swept parameters
+    w_EE = torch.linspace(0, 4, 21)
+    w_II = torch.linspace(-4, 0, 21)
+
+    # fixed parameters, kept as in wc-mf_vs_sm.py
+    E_ratio = 0.8
+    w_EI    = 1.0
+    w_IE    = -1.0
+    I       = 1.0
     beta    = 30.0
     theta   = 1.0
     tau_int = 20.0
@@ -40,16 +47,17 @@ if run_sim:
     if CACHE_TRAJ_FILE.exists() and not overwrite:
         print(f"Simulation already exists at {CACHE_TRAJ_FILE}. Skipping.")
     else:
-        # RDMIsingModelBatch only broadcasts a scalar against a single batch axis
-        # (no built-in outer product like IsingModelBatch's meshgrid), so the
-        # (J, I) grid is built and flattened here, then reshaped back on load.
-        J_grid, I_grid = torch.meshgrid(J, I, indexing="ij")
-        J_flat, I_flat = J_grid.reshape(-1), I_grid.reshape(-1)
+        # RDMWilsonCowanBatch only broadcasts a scalar against a single batch axis
+        # (no built-in outer product), so the (w_EE, w_II) grid is built and
+        # flattened here, then reshaped back on load.
+        w_EE_grid, w_II_grid = torch.meshgrid(w_EE, w_II, indexing="ij")
+        w_EE_flat, w_II_flat = w_EE_grid.reshape(-1), w_II_grid.reshape(-1)
 
-        mf = RDMIsingModelBatch(J=J_flat/dt, I=I_flat, beta=beta, theta=theta,
-                                 tau_int=tau_int, tau_ref=tau_ref, K_ref=K_ref,
-                                 device=device)
-        print(f"Running {mf.B} mean-fields. Grid shape: ({len(J)}, {len(I)}).")
+        mf = RDMWilsonCowanBatch(E_ratio, w_EE_flat/dt, w_EI/dt, w_IE/dt, w_II_flat/dt,
+                                  I, I, beta, beta, theta, theta,
+                                  tau_int, tau_int, tau_ref, tau_ref, K_ref, K_ref,
+                                  dt=dt, device=device)
+        print(f"Running {mf.B} mean-fields. Grid shape: ({len(w_EE)}, {len(w_II)}).")
         print(f"Batch steps: {equi+steps} per mean-field. ({equi} equilibration + {steps} recording)")
         print(f"Running on: {device}")
 
@@ -58,9 +66,9 @@ if run_sim:
         traj = mf.entropy_trajectory(steps, pb=True)
         print(f"Done in {time.time() - t0:.2f}s")
 
-        traj["J"]  = J.cpu()
-        traj["I"]  = I.cpu()
-        traj["dt"] = torch.tensor(dt)
+        traj["w_EE"] = w_EE.cpu()
+        traj["w_II"] = w_II.cpu()
+        traj["dt"]   = torch.tensor(dt)
 
         CACHE_DIR.mkdir(exist_ok=True)
         torch.save(traj, CACHE_TRAJ_FILE)
@@ -75,13 +83,13 @@ if run_plot:
         raise FileNotFoundError(f"Trajectory not found at {CACHE_TRAJ_FILE}. Run simulation first.")
 
     traj = torch.load(CACHE_TRAJ_FILE, weights_only=True)
-    J, I = traj["J"], traj["I"]
-    n_J, n_I = len(J), len(I)
-    extent = (I.min().item(), I.max().item(), J.min().item(), J.max().item())
+    w_EE, w_II = traj["w_EE"], traj["w_II"]
+    n_EE, n_II = len(w_EE), len(w_II)
+    extent = (w_II.min().item(), w_II.max().item(), w_EE.min().item(), w_EE.max().item())
 
     def _grid(key: str) -> torch.Tensor:
-        """Reshape a flat (B, T) trajectory tensor back to (n_J, n_I, T)."""
-        return traj[key].reshape(n_J, n_I, -1)
+        """Reshape a flat (B, T) trajectory tensor back to (n_EE, n_II, T)."""
+        return traj[key].reshape(n_EE, n_II, -1)
 
     m_avg,     m_std     = _grid("a_pop").mean(dim=2),     _grid("a_pop").std(dim=2)
     sigma_avg, sigma_std = _grid("sigma_tot").mean(dim=2), _grid("sigma_tot").std(dim=2)
@@ -93,7 +101,7 @@ if run_plot:
         ax1.set_title('Mean Activity')
         im1 = ax1.imshow(m_avg, extent=extent, origin='lower', aspect='auto')
         fig.colorbar(im1, ax=ax1, label='Mean Activity')
-        ax1.set_ylabel('J (Coupling Strength)')
+        ax1.set_ylabel('w_EE (Self-Excitation)')
         ax1.grid()
 
         ax2.set_title('Std of Activity')
@@ -104,40 +112,40 @@ if run_plot:
         ax3.set_title('Mean Sigma')
         im3 = ax3.imshow(sigma_avg, extent=extent, origin='lower', aspect='auto')
         fig.colorbar(im3, ax=ax3, label='Mean Sigma')
-        ax3.set_xlabel('I (External Input)')
-        ax3.set_ylabel('J (Coupling Strength)')
+        ax3.set_xlabel('w_II (Self-Inhibition)')
+        ax3.set_ylabel('w_EE (Self-Excitation)')
         ax3.grid()
 
         ax4.set_title('Std of Sigma')
         im4 = ax4.imshow(sigma_std, extent=extent, origin='lower', aspect='auto')
         fig.colorbar(im4, ax=ax4, label='Std of Sigma')
-        ax4.set_xlabel('I (External Input)')
+        ax4.set_xlabel('w_II (Self-Inhibition)')
         ax4.grid()
 
         fig.tight_layout()
 
-    if True: # slices of the grid for a handful of J values
+    if True: # slices of the grid for a handful of w_EE values
 
-        J_targets = [0.0, 1.0, 2.0, 3.0]
-        J_indices = [int(torch.argmin((J - jt).abs())) for jt in J_targets]
+        wEE_targets = [0.0, 2.0, 4.0, 6.0]
+        wEE_indices = [int(torch.argmin((w_EE - wt).abs())) for wt in wEE_targets]
 
         fig, ax = plt.subplots(figsize=(8, 6))
-        ax.set_title('Activity vs I for Different J Values')
-        for idx in J_indices:
-            ax.plot(I, m_avg[idx], label=f'J={J[idx].item():.2f}')
-            ax.fill_between(I, m_avg[idx] - m_std[idx], m_avg[idx] + m_std[idx], alpha=0.3)
-        ax.set_xlabel('I (External Input)'); ax.set_ylabel('Mean Activity')
+        ax.set_title('Activity vs w_II for Different w_EE Values')
+        for idx in wEE_indices:
+            ax.plot(w_II, m_avg[idx], label=f'w_EE={w_EE[idx].item():.2f}')
+            ax.fill_between(w_II, m_avg[idx] - m_std[idx], m_avg[idx] + m_std[idx], alpha=0.3)
+        ax.set_xlabel('w_II (Self-Inhibition)'); ax.set_ylabel('Mean Activity')
         ax.legend(); ax.grid()
 
         fig, ax = plt.subplots(figsize=(8, 6))
-        ax.set_title('Sigma vs I for Different J Values')
-        for idx in J_indices:
-            ax.plot(I, sigma_avg[idx], label=f'J={J[idx].item():.2f}')
-            ax.fill_between(I, sigma_avg[idx] - sigma_std[idx], sigma_avg[idx] + sigma_std[idx], alpha=0.3)
-        ax.set_xlabel('I (External Input)'); ax.set_ylabel('Mean Sigma')
+        ax.set_title('Sigma vs w_II for Different w_EE Values')
+        for idx in wEE_indices:
+            ax.plot(w_II, sigma_avg[idx], label=f'w_EE={w_EE[idx].item():.2f}')
+            ax.fill_between(w_II, sigma_avg[idx] - sigma_std[idx], sigma_avg[idx] + sigma_std[idx], alpha=0.3)
+        ax.set_xlabel('w_II (Self-Inhibition)'); ax.set_ylabel('Mean Sigma')
         ax.legend(); ax.grid()
 
-    if True: # full (J, I) maps: activity, sigma, forward/reverse entropy
+    if True: # full (w_EE, w_II) maps: activity, sigma, forward/reverse entropy
 
         fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, sharex=True, figsize=(12, 12))
 
@@ -161,7 +169,7 @@ if run_plot:
         S_rev_avg = _grid("S_rev_tot").mean(dim=2)
         im4 = ax4.imshow(S_rev_avg, extent=extent, origin='lower', aspect='auto')
         fig.colorbar(im4, ax=ax4, label='Mean Reverse Entropy')
-        ax4.set_xlabel('I (External Input)')
+        ax4.set_xlabel('w_II (Self-Inhibition)')
         ax4.grid()
 
     plt.show()

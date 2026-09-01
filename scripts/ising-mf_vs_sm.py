@@ -16,11 +16,18 @@ torch.set_default_dtype(torch.float64)
 N = 20000
 Q = 100
 
-J = 1.5    # coupling strength; adjust to test different regimes
-I = 1.2    # external field; adjust to test different regimes
-beta = 40
+# J = 8    # coupling strength; adjust to test different regimes
+# I = 1    # external field; adjust to test different regimes
+# beta = 30
+# theta = 1
+# dt = 0.2
+
+J = -2    # coupling strength; adjust to test different regimes
+I = 1.5   # external field; adjust to test different regimes
+beta = 30
 theta = 1
-dt = 1
+dt = 0.2
+
 
 tau_int = 20
 tau_ref = 3
