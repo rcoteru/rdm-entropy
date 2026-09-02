@@ -43,6 +43,30 @@ def update_integration_variable_inplace(
     y[1:] = shifted
     y[0] = 0
 
+def compute_firing_prob(
+        y:     torch.Tensor,          # (Q,) integrated field
+        eta:   torch.Tensor,          # (Q,) refractory kernel
+        beta:  float | torch.Tensor,
+        theta: float | torch.Tensor,
+        ) -> torch.Tensor:            # (Q,) hazard Phi(beta*(y + eta - theta))
+    """ Age-resolved firing probability from an integrated field. Broadcasts, so it also
+    serves batched (B, Q) fields given (B, 1)-shaped beta/theta. """
+    return torch.sigmoid(beta * (y + eta - theta))
+
+def compute_firing_prob_noautograd(
+        y:     torch.Tensor,          # (Q,) integrated field
+        eta:   torch.Tensor,          # (Q,) refractory kernel
+        beta:  float | torch.Tensor,
+        theta: float | torch.Tensor,
+        ) -> torch.Tensor:            # (Q,) hazard Phi(beta*(y + eta - theta))
+    """ Age-resolved firing probability from an integrated field. Broadcasts, so it also
+    serves batched (B, Q) fields given (B, 1)-shaped beta/theta.
+
+    y + eta is the one allocation; the rest of the chain runs in place on that fresh
+    tensor rather than materialising a temporary per operation. Inference-only as a
+    result (the in-place chain is not autograd-safe), like every caller here. """
+    return (y + eta).sub_(theta).mul_(beta).sigmoid_()
+
 def compute_firing_rate(P: torch.Tensor, fprobs: torch.Tensor) -> torch.Tensor:
     """ Firing rate for one population: sum(P * fprobs) over the age axis. """
     return torch.dot(P, fprobs)  # fused multiply-reduce, no elementwise product materialized
@@ -68,7 +92,7 @@ def update_age_distribution_inplace(P: torch.Tensor, fprobs: torch.Tensor) -> No
 
 def check_age_normalization(P: torch.Tensor, tol: float = 1e-6) -> None:
     """ Check that the population distribution P is normalized. """
-    if not torch.allclose(P.sum(), torch.tensor(1.0, device=P.device), atol=tol):
+    if not torch.allclose(P.sum(), torch.tensor(1.0, dtype=P.dtype, device=P.device), atol=tol):
         raise ValueError(f"Population distribution not normalized: sum={P.sum().item()}")
 
 
@@ -89,7 +113,6 @@ def compute_backward_field(
 
 def compute_joint_distribution(
         p:      torch.Tensor,          # (Q,)   p_t(n) age distribution at time t
-        buff_p: torch.Tensor,          # (Q, Q) buff_p[j, n] = p_{t+j}(n), j=0 is time t
         buff_y: torch.Tensor,          # (K, Q) buff_y[j, n] = y_{t+j}(n), j=0 is time t
         eta:    torch.Tensor,          # (Q,)   refractory kernel
         beta:   float | torch.Tensor,
@@ -99,28 +122,37 @@ def compute_joint_distribution(
 
     S_t(k|n) = prod_{j<k} (1 - Phi_{t+j}(n+j)) tracks a single cohort even
     after it enters the lumped bin, because it multiplies hazards instead of
-    reading merged densities (buff_p is unused). Rows sum to 1 by
-    telescoping -- no normalisation needed. """
+    reading merged densities -- so only the marginal p_t is needed, never the
+    future age distributions. Rows sum to 1 by telescoping -- no normalisation
+    needed.
+
+    This is entropy_trajectory's hot spot -- once per population per timestep, and under
+    vmap every (Q, K) tensor here is really (B, Q, K) -- so it is written to keep as few of
+    them alive as possible: hazards are evaluated once on buff_y's own (K, Q) layout and
+    gathered onto the cohort diagonal in one pass (gathering y and eta separately would
+    cost one extra (Q, K) tensor each), and the survival is folded into the output buffer
+    in place. Three (Q, K) tensors are live at peak. In-place ops are limited to the ones
+    functorch has batching rules for -- clamp_/cumsum_ fall back to a per-sample loop
+    under vmap, so those two stay out-of-place. """
     Q, device = buff_y.shape[1], buff_y.device
     K = buff_y.shape[0]                       # look-ahead horizon (time axis)
     n_idx = torch.arange(Q, device=device)
     j_idx = torch.arange(K, device=device)
 
     future_age  = torch.clamp(n_idx.unsqueeze(1) + j_idx.unsqueeze(0), max=Q - 1)
-    future_time = j_idx
+    future_time = j_idx.unsqueeze(0)
 
-    y_future = buff_y[future_time.unsqueeze(0).expand(Q, K), future_age]
-    phi = torch.sigmoid(beta * (y_future + eta[future_age] - theta))    # (Q, K)
+    phi = compute_firing_prob(buff_y, eta, beta, theta)[future_time, future_age]   # (Q, K)
 
-    log_surv = torch.cumsum(torch.log1p(-phi.clamp(max=1 - 1e-12)), dim=1)
-    S = torch.cat([torch.ones(Q, 1, device=device, dtype=phi.dtype),
-                   torch.exp(log_surv[:, :-1])], dim=1)                 # (Q, K)
+    # S[n, k] = prod_{j<k} (1 - phi[n, j]), in log space, with the k=0 empty product
+    # already in place from the ones_like -- so the shift costs a copy, not a cat
+    log_surv = torch.cumsum(phi.clamp(max=1 - 1e-12).neg_().log1p_(), dim=1)
+    S = torch.ones_like(phi)                                            # (Q, K)
+    S[:, 1:].copy_(log_surv[:, :-1]).exp_()
 
-    boundary = torch.zeros(K, dtype=torch.bool, device=device)
-    boundary[-1] = True
-    fpt = torch.where(boundary.unsqueeze(0), S, S * phi)
-
-    return p.unsqueeze(1) * fpt
+    # first-passage weight S*phi, except the lumped final column, which keeps bare S
+    S[:, :-1].mul_(phi[:, :-1])
+    return S.mul_(p.unsqueeze(1))
 
 def compute_epr(
         p:       torch.Tensor,         # (Q,)   forward marginal p_t(n)
@@ -155,14 +187,51 @@ def compute_epr(
 
     return torch.stack([S_bw - S_fwd, S_fwd, S_bw])
 
+def compute_epr_from_buffers(
+        p:       torch.Tensor,         # (Q,)   p_t(n) age distribution at time t
+        buff_y:  torch.Tensor,         # (K, Q) buff_y[j, n] = y_{t+j}(n), j=0 is time t
+        buff_in: torch.Tensor,         # (K,)   buff_in[j] = population input at time t+j
+        eta:     torch.Tensor,         # (Q,)   refractory kernel
+        alpha:   float | torch.Tensor, # integration kernel scaling factor
+        beta:    float | torch.Tensor,
+        theta:   float | torch.Tensor,
+        ) -> torch.Tensor:             # (3,) [sigma, S_fwd, S_bw]
+    """ One population's EPR for one timestep, straight from its rolling buffers.
+
+    Keeping the joint distribution inside one function is what lets the batched caller
+    vmap the whole step under a chunk_size: the (Q, K) joint never escapes, so peak memory
+    follows the chunk rather than the batch, and only the (3,) result is materialised for
+    every batch element. """
+    H_rev   = compute_backward_field(buff_in, alpha)
+    P_joint = compute_joint_distribution(p, buff_y, eta, beta, theta)
+    return compute_epr(p, P_joint, buff_y[0], H_rev, eta, beta, theta)
+
 
 # Auxiliary functions for fixed points
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-
-
-#TODO
-
+# def fp_objective(m: float,          # guess for the fixed point
+#                  J: float,          # coupling strength
+#                  I: float,          # external input strength
+#                  a: float,          # integration kernel scaling factor
+#                  beta: float,       # inverse temperature 
+#                  theta: float,
+#                  eta: torch.Tensor
+#                  ) -> torch.Tensor:
+#     """ Compute the fixed point map G(m) for a given guess m. """
+#     # Build age-dependent local field H(n)
+#     drive = compute_drive(m, J, I)
+#     Q, device = eta.shape[-1], eta.device
+#     H = compute_forward_field_constant_drive(drive, a, Q, device)
+#     # Calculate firing probabilities
+#     potential = H + eta
+#     fprob = misc.firing_prob(potential, beta, theta)
+#     # Calculate the survival probability S
+#     S = shrd.survival_probability(fprob)
+#     # Calculate the firing rate
+#     frate = fprob[..., -1] / (fprob[..., -1] * S[..., :-1].sum(dim=-1) + S[..., -1])
+#     # Return G(m) = m - F(m)
+#     return m - frate
 
 
 # Class for single systems
@@ -286,8 +355,8 @@ class RDMNetwork:
     @torch.inference_mode()
     def firing_prob(self) -> list[torch.Tensor]:
         """ Computes firing probabilities Phi(beta*(field - theta)) per population, list of (Qm[i],) tensors. """
-        fields = self.field()
-        return [torch.sigmoid(self.beta[i] * (fields[i] - self.theta[i])) for i in range(self.M)]
+        return [compute_firing_prob(self.y[i], self.eta[i], self.beta[i], self.theta[i])
+                for i in range(self.M)]
 
     # Dynamics and trajectories
     # ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -336,14 +405,21 @@ class RDMNetwork:
 
     @torch.inference_mode()
     def entropy_trajectory(self, T: int) -> dict[str, torch.Tensor]:
-        """ Online per-population EPR using O(Qm[i]^2) rolling buffers per population.
+        """ Online per-population EPR using one O(Qm[i]^2) rolling buffer per population.
+
+        Only the field history needs the (Qm[i], Qm[i]) look-ahead buffer: the joint
+        distribution builds each cohort's survival from hazards, so the age distribution is
+        read at time t only, and a single (Qm[i],) marginal stepped forward alongside the
+        buffers replaces a second square buffer.
 
         All populations advance on ONE shared clock (self.update() has no per-population
         granularity), but each has its own Qm[i]. The fill phase therefore runs Q_max=max(Qm)
         shared ticks, writing into population i's (Qm[i], Qm[i]) buffer for only the first
         Qm[i] of them; the (Q_max-Qm[i]) leftover snapshots computed for smaller populations
-        during this phase are stashed in a small per-population FIFO and drained into the
-        main loop's first few tail-writes, so no population ever loses or re-reads a timestep.
+        during this phase seed a per-population FIFO that the main loop then keeps pushing to
+        and popping from, so that population's tail-writes stay a fixed (Q_max-Qm[i]) steps
+        behind the shared clock for the whole run and no population ever loses, re-reads or
+        skips ahead of a timestep.
 
         Returns dict of CPU tensors: act (T,) N-weighted network activity;
         sigma/S_fwd/S_rev (T, M) per-population entropy-production decomposition
@@ -358,48 +434,50 @@ class RDMNetwork:
         out_S_fwd = torch.zeros(T, M, device=device)
         out_S_rev = torch.zeros(T, M, device=device)
 
-        buff_p  = [torch.zeros(Qm[i], Qm[i], device=device) for i in range(M)]
+        p_cur   = [self.p[i].clone() for i in range(M)]   # marginal at the reported time t
         buff_y  = [torch.zeros(Qm[i], Qm[i], device=device) for i in range(M)]
         buff_in = [torch.zeros(Qm[i],        device=device) for i in range(M)]
-        pending = [deque() for _ in range(M)]  # leftover fill-phase snapshots, Qm[i] < Q_max
+        pending = [deque() for _ in range(M)]  # delay line, depth Q_max-Qm[i], seeded below
 
         for j in range(Q_max):
             pop_input = self.population_input()
             for i in range(M):
-                snap = (self.p[i].clone(), self.y[i].clone(), pop_input[i].clone())
+                snap = (self.y[i].clone(), pop_input[i].clone())
                 if j < Qm[i]:
-                    buff_p[i][j], buff_y[i][j], buff_in[i][j] = snap
+                    buff_y[i][j], buff_in[i][j] = snap
                 else:
                     pending[i].append(snap)
             self.update()
 
         for t in tqdm.tqdm(range(T)):
             for i in range(M):
-                H_rev = compute_backward_field(buff_in[i], self.alpha_int[i])
-                P_joint = compute_joint_distribution(
-                    buff_p[i][0], buff_p[i], buff_y[i], self.eta[i], self.beta[i], self.theta[i])
-                epr = compute_epr(
-                    buff_p[i][0], P_joint, buff_y[i][0], H_rev, self.eta[i], self.beta[i], self.theta[i])
+                epr = compute_epr_from_buffers(
+                    p_cur[i], buff_y[i], buff_in[i], self.eta[i],
+                    self.alpha_int[i], self.beta[i], self.theta[i])
                 out_sigma[t, i] = epr[0]
                 out_S_fwd[t, i] = epr[1]
                 out_S_rev[t, i] = epr[2]
 
-                buff_p[i]  = torch.roll(buff_p[i],  shifts=-1, dims=0)
+                # step the marginal off buff_y[0] (= y_t) before that row is rolled away —
+                # same renewal update self.update() applies, so p_cur tracks it exactly
+                update_age_distribution_inplace(p_cur[i], compute_firing_prob(
+                    buff_y[i][0], self.eta[i], self.beta[i], self.theta[i]))
+
                 buff_y[i]  = torch.roll(buff_y[i],  shifts=-1, dims=0)
                 buff_in[i] = torch.roll(buff_in[i], shifts=-1, dims=0)
 
-            m_t = torch.stack([buff_p[i][0, 0] for i in range(M)])
+            m_t = torch.stack([p_cur[i][0] for i in range(M)])
             out_act[t] = (self.N_ratios * m_t).sum()
 
             # read the tail from the CURRENT (pre-update) live state, THEN advance —
             # this ordering (vs. update-then-read) is what avoids a timestep skip
             pop_input = self.population_input()
             for i in range(M):
-                if pending[i]:
-                    p_val, y_val, in_val = pending[i].popleft()
-                else:
-                    p_val, y_val, in_val = self.p[i].clone(), self.y[i].clone(), pop_input[i].clone()
-                buff_p[i][-1]  = p_val
+                # push-then-pop: pending is a standing delay line of depth Q_max-Qm[i], so a
+                # small population keeps reading the live state as of time t+Qm[i] instead of
+                # the shared clock's t+Q_max. Depth 0 (Qm[i] == Q_max) pops what it just pushed.
+                pending[i].append((self.y[i].clone(), pop_input[i].clone()))
+                y_val, in_val = pending[i].popleft()
                 buff_y[i][-1]  = y_val
                 buff_in[i][-1] = in_val
             self.update()
@@ -407,7 +485,7 @@ class RDMNetwork:
         # rewind live state to match the last reported timestep, discarding the
         # extra Q_max-step lookahead accumulated in self.p/self.y during buffering
         for i in range(M):
-            self.p[i] = buff_p[i][0].clone()
+            self.p[i] = p_cur[i]
             self.y[i] = buff_y[i][0].clone()
         self.m = torch.stack([self.p[i][0] for i in range(M)])
 
@@ -674,8 +752,8 @@ class RDMNetworkBatch:
     @torch.inference_mode()
     def firing_prob(self) -> list[torch.Tensor]:
         """ Computes firing probabilities Phi(beta*(field - theta)) per population, list of (B, Qm[i]) tensors. """
-        fields = self.field()
-        return [torch.sigmoid(self.beta[:, i:i+1] * (fields[i] - self.theta[:, i:i+1])) for i in range(self.M)]
+        return [compute_firing_prob(self.y[i], self.eta[i], self.beta[:, i:i+1], self.theta[:, i:i+1])
+                for i in range(self.M)]
 
     # Dynamics and trajectories
     # ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -748,22 +826,33 @@ class RDMNetworkBatch:
         return {k: _uf(v) for k, v in out.items()}
 
     @torch.inference_mode()
-    def entropy_trajectory(self, T: int, pb: bool = True) -> dict[str, torch.Tensor]:
-        """ Batched online per-population EPR using O(B*Qm[i]^2) rolling buffers per population.
+    def entropy_trajectory(self, T: int, pb: bool = True,
+                           chunk: int | None = None) -> dict[str, torch.Tensor]:
+        """ Batched online per-population EPR using one O(B*Qm[i]^2) rolling buffer per population.
+
+        Only the field history needs the (B, Qm[i], Qm[i]) look-ahead buffer; the age
+        distribution is read at time t only, so a single (B, Qm[i]) marginal stepped forward
+        alongside the buffers replaces a second square buffer.
 
         Batched analogue of RDMNetwork.entropy_trajectory: all populations advance on ONE shared
         clock, but each keeps its own Qm[i]. The fill phase runs Q_max=max(Qm) shared ticks,
         writing into population i's (B, Qm[i], Qm[i]) buffer for only the first Qm[i] of them;
-        leftover snapshots for smaller populations are stashed in a per-population FIFO and
-        drained into the main loop's first few tail-writes, so no batch element or population
-        ever loses or re-reads a timestep.
+        leftover snapshots for smaller populations seed a per-population FIFO that the main
+        loop keeps pushing to and popping from, holding that population's tail-writes a fixed
+        (Q_max-Qm[i]) steps behind the shared clock, so no batch element or population ever
+        loses, re-reads or skips ahead of a timestep.
 
         Returns dict of CPU tensors: a_pop (*grid, T) N-weighted network activity;
         sigma/S_fwd/S_rev (*grid, T, M) per-population entropy-production decomposition
         (sigma = S_bw - S_fwd, per population); sigma_tot/S_fwd_tot/S_rev_tot (*grid, T) the
         same quantities aggregated across populations via the N_ratios weighting already
         used for activity(). The leading grid axes are (B,) unless this batch was built from
-        a parameter grid (see unflatten()). """
+        a parameter grid (see unflatten()).
+
+        chunk caps how many batch elements go through the per-step EPR at once. None (the
+        default) does the whole batch in one shot; a smaller value trades speed for peak
+        memory, which is dominated by the (chunk, Qm[i], Qm[i]) working set rather than by
+        the buffers themselves. Results are unaffected up to float32 rounding. """
         B, M, Qm, device = self.B, self.M, self.Qm, self.device
         Q_max = max(Qm)
 
@@ -773,48 +862,49 @@ class RDMNetworkBatch:
         out_S_fwd = torch.zeros(B, T, M, **out_kwargs)
         out_S_rev = torch.zeros(B, T, M, **out_kwargs)
 
-        buff_p  = [torch.zeros(B, Qm[i], Qm[i], device=device) for i in range(M)]
+        p_cur   = [self.p[i].clone() for i in range(M)]   # marginal at the reported time t
         buff_y  = [torch.zeros(B, Qm[i], Qm[i], device=device) for i in range(M)]
         buff_in = [torch.zeros(B, Qm[i],        device=device) for i in range(M)]
-        pending = [deque() for _ in range(M)]  # leftover fill-phase snapshots, Qm[i] < Q_max
+        pending = [deque() for _ in range(M)]  # delay line, depth Q_max-Qm[i], seeded below
 
         for j in range(Q_max):
             pop_input = self.population_input()   # (B, M)
             for i in range(M):
-                snap = (self.p[i].clone(), self.y[i].clone(), pop_input[:, i].clone())
+                snap = (self.y[i].clone(), pop_input[:, i].clone())
                 if j < Qm[i]:
-                    buff_p[i][:, j], buff_y[i][:, j], buff_in[i][:, j] = snap
+                    buff_y[i][:, j], buff_in[i][:, j] = snap
                 else:
                     pending[i].append(snap)
             self.update()
 
         for t in tqdm.tqdm(range(T), disable=not pb):
             for i in range(M):
-                H_rev = torch.vmap(compute_backward_field)(buff_in[i], self.alpha_int[:, i])
-                P_joint = torch.vmap(compute_joint_distribution)(
-                    buff_p[i][:, 0], buff_p[i], buff_y[i], self.eta[i], self.beta[:, i], self.theta[:, i])
-                epr = torch.vmap(compute_epr)(
-                    buff_p[i][:, 0], P_joint, buff_y[i][:, 0], H_rev, self.eta[i], self.beta[:, i], self.theta[:, i])
+                epr = torch.vmap(compute_epr_from_buffers, chunk_size=chunk)(
+                    p_cur[i], buff_y[i], buff_in[i], self.eta[i],
+                    self.alpha_int[:, i], self.beta[:, i], self.theta[:, i])
                 out_sigma[:, t, i].copy_(epr[:, 0], non_blocking=True)
                 out_S_fwd[:, t, i].copy_(epr[:, 1], non_blocking=True)
                 out_S_rev[:, t, i].copy_(epr[:, 2], non_blocking=True)
 
-                buff_p[i]  = torch.roll(buff_p[i],  shifts=-1, dims=1)
+                # step the marginal off buff_y[:, 0] (= y_t) before that row is rolled away —
+                # same renewal update self.update() applies, so p_cur tracks it exactly
+                p_cur[i] = torch.vmap(update_age_distribution)(p_cur[i], compute_firing_prob(
+                    buff_y[i][:, 0], self.eta[i], self.beta[:, i:i+1], self.theta[:, i:i+1]))
+
                 buff_y[i]  = torch.roll(buff_y[i],  shifts=-1, dims=1)
                 buff_in[i] = torch.roll(buff_in[i], shifts=-1, dims=1)
 
-            m_t = torch.stack([buff_p[i][:, 0, 0] for i in range(M)], dim=1)   # (B, M)
+            m_t = torch.stack([p_cur[i][:, 0] for i in range(M)], dim=1)   # (B, M)
             out_act[:, t].copy_((self.N_ratios * m_t).sum(dim=-1), non_blocking=True)
 
             # read the tail from the CURRENT (pre-update) live state, THEN advance —
             # this ordering (vs. update-then-read) is what avoids a timestep skip
             pop_input = self.population_input()
             for i in range(M):
-                if pending[i]:
-                    p_val, y_val, in_val = pending[i].popleft()
-                else:
-                    p_val, y_val, in_val = self.p[i].clone(), self.y[i].clone(), pop_input[:, i].clone()
-                buff_p[i][:, -1]  = p_val
+                # push-then-pop: see RDMNetwork.entropy_trajectory -- pending is a standing
+                # delay line of depth Q_max-Qm[i], not a one-shot drain
+                pending[i].append((self.y[i].clone(), pop_input[:, i].clone()))
+                y_val, in_val = pending[i].popleft()
                 buff_y[i][:, -1]  = y_val
                 buff_in[i][:, -1] = in_val
             self.update()
@@ -822,7 +912,7 @@ class RDMNetworkBatch:
         # rewind live state to match the last reported timestep, discarding the
         # extra Q_max-step lookahead accumulated in self.p/self.y during buffering
         for i in range(M):
-            self.p[i] = buff_p[i][:, 0].clone()
+            self.p[i] = p_cur[i]
             self.y[i] = buff_y[i][:, 0].clone()
         self.m = torch.stack([self.p[i][:, 0] for i in range(M)], dim=1)
 
