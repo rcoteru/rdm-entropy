@@ -210,6 +210,9 @@ def compute_epr_from_buffers(
 # Auxiliary functions for fixed points
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+def compute_forward_field_constant_input(tot_input, a, Q: list[int], device: str):
+    pass
+
 # def fp_objective(m: float,          # guess for the fixed point
 #                  J: float,          # coupling strength
 #                  I: float,          # external input strength
@@ -790,8 +793,8 @@ class RDMNetworkBatch:
         accumulating on-device and paying for one big transfer at the end. No-op (plain
         device-resident allocation) when the compute device isn't CUDA. """
         if torch.device(self.device).type == 'cuda':
-            return dict(device='cpu', pin_memory=True)
-        return dict(device=self.device)
+            return dict(device='cpu', pin_memory=True, dtype=torch.float64)
+        return dict(device=self.device, dtype=torch.float64)
 
     @torch.inference_mode()
     def trajectory(self, T: int, 
