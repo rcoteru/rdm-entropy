@@ -25,7 +25,9 @@ pip install -e .
     - `src/rdme/spin_model.py`: Shared implementation of spin-based simulations.
     - `src/rdme/mean_field.py`: Shared implementation of mean-field calculations.
 - `scripts/`: Development scripts for running and validating simulations.
-- `paper/`: Scripts that generate the figures in the publication.
+- `papers/`: Scripts that generate figures for several related publications.
+    - `papers/fises26/`: Figures for the FISES 26 poster.
+    - `papers/scipost/`: Figures for the SciPost publication.
 - `tests/`: Unit tests for the project.
 - `requirements.txt`: List of dependencies required to run the project.
 - `README.md`: This file, providing an overview of the project.
