@@ -3,7 +3,6 @@ import tqdm
 
 import rdme.shared as shrd
 
-
 # Auxiliary functions
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -27,11 +26,11 @@ class SpinModel:
 
     s: torch.Tensor # (N,) current state
     n: torch.Tensor # (N,) neuron ages dtype int8
-    H: torch.Tensor # (N,) local field state variable, integrated from [D_t-1,...,D_t-Q]
-    X: torch.Tensor # (N,) refractory state variable
+    S: torch.Tensor # (N,) local field state variable, integrated from [D_t-1,...,D_t-Q]
+    R: torch.Tensor # (N,) refractory state variable
 
     w: torch.Tensor # (M,M), synaptic weigths between populations
-    I: torch.Tensor # (M,), external input current for each population
+    E: torch.Tensor # (M,), external input current for each population
 
     beta: torch.Tensor # (M,), inverse temperature for each population
     theta: torch.Tensor # (M,), firing threshold for each population
@@ -49,8 +48,8 @@ class SpinModel:
     # Construction and initialization
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    def __init__(self, s: torch.Tensor, n: torch.Tensor, H: torch.Tensor, X: torch.Tensor,
-             w: torch.Tensor, I: torch.Tensor, beta: torch.Tensor, theta: torch.Tensor,
+    def __init__(self, s: torch.Tensor, n: torch.Tensor, S: torch.Tensor, R: torch.Tensor,
+             w: torch.Tensor, E: torch.Tensor, beta: torch.Tensor, theta: torch.Tensor,
              tau_int: torch.Tensor, K_ref: torch.Tensor, tau_ref: torch.Tensor, 
              Nm: torch.Tensor, n_obs: int = 3, dt: float = 1.0):
     
@@ -58,10 +57,10 @@ class SpinModel:
         M = Nm.shape[0]
         
         # sanity checks on tensor shapes
-        assert s.shape == (N,) and n.shape == (N,) and H.shape == (N,) and X.shape == (N,), \
-            "State tensors s, n, H, X must all have shape (N,)."
+        assert s.shape == (N,) and n.shape == (N,) and S.shape == (N,) and R.shape == (N,), \
+            "State tensors s, n, S, R must all have shape (N,)."
         assert w.shape == (M, M), f"Synaptic weights w must have shape ({M}, {M}), got {w.shape}."
-        assert I.shape == (M,), f"Input vector I must have shape ({M},), got {I.shape}."
+        assert E.shape == (M,), f"Input vector E must have shape ({M},), got {E.shape}."
         assert beta.shape == (M,), f"beta must have shape ({M},).)"
         assert theta.shape == (M,), f"theta must have shape ({M},)."
         assert tau_int.shape == (M,), f"tau_int must have shape ({M},)."
@@ -70,8 +69,8 @@ class SpinModel:
         assert Nm.sum().item() == N, f"Sum of Nm must equal N={N}, got {Nm.sum().item()}"
         
         self.N, self.M, self.dt = N, M, dt
-        self.s, self.n, self.H, self.X = s, n, H, X
-        self.w, self.I = w, I
+        self.s, self.n, self.S, self.R = s, n, S, R
+        self.w, self.E = w, E
         self.theta, self.beta = theta, beta
         self.Nm = Nm
         
@@ -106,7 +105,7 @@ class SpinModel:
         self.beta_net = self.pop_expand.t().float() @ self.beta    # (N, M) @ (M,) -> (N,)
 
     @classmethod
-    def random_start(cls, Nm: torch.Tensor, w: torch.Tensor, I: torch.Tensor, 
+    def random_start(cls, Nm: torch.Tensor, w: torch.Tensor, E: torch.Tensor, 
                     beta: torch.Tensor, theta: torch.Tensor, 
                     tau_int: torch.Tensor, tau_ref: torch.Tensor, K_ref: torch.Tensor, 
                     n_obs: int = 1, dt: float = 1.0) -> SpinModel:
@@ -116,13 +115,13 @@ class SpinModel:
         s = torch.randint(0, 2, (N,), device=device).int()
         n = torch.randint(1, 50, (N,), device=device).long()
         n = torch.where(s==1, torch.zeros_like(n), n)
-        H = torch.zeros((N,), device=device, dtype=torch.float32)
-        X = torch.zeros((N,), device=device, dtype=torch.float32)
-        return cls(s, n, H, X, w, I, beta, theta, tau_int, K_ref, tau_ref, 
+        S = torch.zeros((N,), device=device, dtype=torch.float32)
+        R = torch.zeros((N,), device=device, dtype=torch.float32)
+        return cls(s, n, S, R, w, E, beta, theta, tau_int, K_ref, tau_ref, 
                 Nm, n_obs=n_obs, dt=dt)
 
     @classmethod
-    def silent_start(cls, Nm: torch.Tensor, w: torch.Tensor, I: torch.Tensor, 
+    def silent_start(cls, Nm: torch.Tensor, w: torch.Tensor, E: torch.Tensor, 
                     beta: torch.Tensor, theta: torch.Tensor, 
                     tau_int: torch.Tensor, tau_ref: torch.Tensor, K_ref: torch.Tensor, 
                     n_obs: int = 1, dt: float = 1.0) -> SpinModel:
@@ -130,9 +129,9 @@ class SpinModel:
         N = int(Nm.sum().item())
         s = torch.zeros((N,), device=device)
         n = torch.full((N,), 200, device=device).long()
-        H = torch.zeros((N,), device=device, dtype=torch.float32)
-        X = torch.zeros((N,), device=device, dtype=torch.float32)
-        return cls(s, n, H, X, w, I, beta, theta, tau_int, K_ref, tau_ref, 
+        S = torch.zeros((N,), device=device, dtype=torch.float32)
+        R = torch.zeros((N,), device=device, dtype=torch.float32)
+        return cls(s, n, S, R, w, E, beta, theta, tau_int, K_ref, tau_ref, 
                 Nm, n_obs=n_obs, dt=dt)
     
     
@@ -171,15 +170,19 @@ class SpinModel:
         return self.pop_expand.t() @ a_pop  # (N, M) @ (M,) -> (N,)
 
     @torch.inference_mode()
-    def drive(self) -> torch.Tensor:
-        """ Computes the drive at current time, i.e. D_t = J*s_t + I. """
+    def total_input(self) -> torch.Tensor:
+        """ Computes the I at current time, i.e. I^a_t = sum_b w[a, b] m^b_t + E^a_t.
+
+        Row = target, column = source, matching w^{ab} ("from b onto a") in the theory
+        and compute_total_input in mean_field. The source-first w_XY names the model
+        constructors take are transposed into this layout there, not here. """
         activities = self.population_activity()
-        pop_drive = self.w.T @ activities + self.I
-        return self.pop_to_network(pop_drive)
+        pop_I = self.w @ activities + self.E
+        return self.pop_to_network(pop_I)
 
     @torch.inference_mode()
     def field(self) -> torch.Tensor:
-        return self.H + self.X
+        return self.S + self.R
 
     @torch.inference_mode()
     def firing_prob(self) -> torch.Tensor:
@@ -211,7 +214,7 @@ class SpinModel:
     def update(self) -> None:
         """ Update the state of the system based on firing probabilities. """
         probs = self.firing_prob()
-        drive = self.drive()
+        I = self.total_input()
 
         # sample new spikes based on probabilities
         fired = torch.rand(self.N, device=self.device) < probs
@@ -223,13 +226,13 @@ class SpinModel:
         # update neuron ages: if fired, age is 0, else increment age by 1
         self.n = torch.where(fired, torch.zeros_like(self.n), self.n + 1).long()
         
-        # update field for next time step: integrate drive and reset
-        self.H = self.a_int_net * drive + (1 - self.a_int_net) * self.H # integrate drive
-        self.H[self.s==1] = 0 # reset local field for neurons that just fired
+        # update field for next time step: integrate I and reset
+        self.S = self.a_int_net * I + (1 - self.a_int_net) * self.S # integrate I
+        self.S[self.s==1] = 0 # reset local field for neurons that just fired
 
         # update refractory state for next time step: decay and set to K_ref
-        self.X = (1-self.a_ref_net)*self.X # refractory state decays
-        self.X[fired] = -self.K_ref_net[fired] # set refractory state to K_ref if fired
+        self.R = (1-self.a_ref_net)*self.R # refractory state decays
+        self.R[fired] = -self.K_ref_net[fired] # set refractory state to K_ref if fired
 
     @torch.inference_mode()
     def forward(self, T: int) -> None:
@@ -247,20 +250,20 @@ class SpinModel:
           kur  — Kuramoto order parameter, shape (T,)
           ent  — age-distribution entropy, shape (T,)
           s    — full spin state, shape (T, N)
-          pot  — membrane potential H+X, shape (T, N)
+          pot  — membrane potential h = S+R, shape (T, N)
           fdist — firing distribution over ages, shape (T, M, Q)
         All tensors are moved to CPU.
         """
-        out = {"a_tot": torch.zeros(T, self.n_obs, device=self.device),
-               "a_pop": torch.zeros(T, self.M, device=self.device)}
+        out = {"m_tot": torch.zeros(T, self.n_obs, device=self.device),
+               "m": torch.zeros(T, self.M, device=self.device)}
         if kur: out["kur"] = torch.zeros(T, device=self.device)
         if ent: out["ent"] = torch.zeros(T, device=self.device)
         if s:   out["s"]   = torch.zeros(T, self.N, device=self.device, dtype=torch.int8)
         if pot: out["pot"] = torch.zeros(T, self.N, device=self.device)
         if fdist: out["fdist"] = torch.zeros(T, self.M, Q, device=self.device)
         for t in tqdm.tqdm(range(T)):
-            out["a_tot"][t] = self.activity()
-            out["a_pop"][t] = self.population_activity()
+            out["m_tot"][t] = self.activity()
+            out["m"][t] = self.population_activity()
             # if kur: out["kur"][t] = self.kuramoto_order()
             # if ent: out["ent"][t] = self.age_entropy()
             if s:   out["s"][t]   = self.s
@@ -277,9 +280,16 @@ class SpinModel:
                                 Q: int = 100) -> dict[str, torch.Tensor]:
         """Forward/backward EPR trajectory.
 
-        Timing: the field at index t generates the spike at index t+1, so
-        P(s[t+1]=1) = sigmoid(hf[t]) and the reverse-process counterpart is
-        hr[t+2].
+        Timing: sigma[t] is a property of the TRANSITION t -> t+1, so both halves
+        describe the same bond (t, t+1), following eq. (total-epr) in the model
+        write-up. Expanding ln p(Gamma)/p(Gamma^dagger), the reverse path factorises
+        as p(s_T) prod_t p(s_t | hr[t+1]): the forward traversal emits s[t+1] from
+        hf[t], and the reverse traversal of that same bond emits s[t] from hr[t+1].
+
+        Pairing hr[t+2] with s[t+1] instead -- matching on the realized spike rather
+        than on the bond -- sums to the same total EPR up to boundary terms, but
+        shifts H_rev one step against H_fwd, which shows up as a one-step offset in
+        per-step plots and against RDMNetwork.entropy_trajectory.
 
         sigma[t] is the *sampled* log-ratio ln p(Gamma)/p(Gamma^dagger) per
         neuron per step. It fluctuates in sign; only its average is the EP
@@ -288,7 +298,12 @@ class SpinModel:
         substitution turns the estimator into a pointwise KL that is
         non-negative by construction and cannot detect reversibility.
 
-        Runs T + 2*buffer steps: burn-in | analysis window | tail.
+        Time origin: index 0 is the state this is called on, so the trajectory lines
+        up step-for-step with RDMNetwork.entropy_trajectory called on an equivalent
+        state. `buffer` is the TAIL the reverse recursion needs, not a lead-in --
+        nothing is discarded at the front, so equilibrate with forward() beforehand.
+
+        Runs T + buffer steps: analysis window | tail.
         """
         if buffer < 2:
             raise ValueError("buffer must be >= 2; in practice use several "
@@ -296,62 +311,58 @@ class SpinModel:
 
         dev = self.device
         F = torch.nn.functional
-        L = T + 2 * buffer
-        lo, hi = buffer, buffer + T
+        L = T + buffer
+        lo, hi = 0, T
 
         s_trj = torch.zeros((L, self.N), device=dev, dtype=torch.int8)
-        H_fwd = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
-        X_fwd = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
-        drive = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
+        S_fwd = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
+        R_fwd = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
+        I = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
         if kur: kur_buf = torch.zeros(L, device=dev)
         if ent: ent_buf = torch.zeros(L, device=dev)
         if fdist: P_fwd = torch.zeros((L, self.M, Q), device=dev, dtype=torch.float32)
 
         for t in tqdm.tqdm(range(L), desc="Forward pass"):
             s_trj[t] = self.s
-            H_fwd[t] = self.H
-            X_fwd[t] = self.X
-            drive[t] = self.drive()
+            S_fwd[t] = self.S
+            R_fwd[t] = self.R
+            I[t] = self.total_input()
             if fdist: P_fwd[t] = self.fdist(Q)
             self.update()
 
-        H_rev = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
-        X_rev = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
+        S_rev = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
+        R_rev = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
 
         for t in tqdm.tqdm(range(L - 2, -1, -1), desc="Reverse pass"):
             fired_t = s_trj[t] == 1
-            H_rev[t] = (1 - self.a_int_net) * H_rev[t + 1] + self.a_int_net * drive[t + 1]
-            H_rev[t, fired_t] = 0
-            X_rev[t] = (1 - self.a_ref_net) * X_rev[t + 1]
-            X_rev[t, fired_t] = -self.K_ref_net[fired_t]
+            S_rev[t] = (1 - self.a_int_net) * S_rev[t + 1] + self.a_int_net * I[t + 1]
+            S_rev[t, fired_t] = 0
+            R_rev[t] = (1 - self.a_ref_net) * R_rev[t + 1]
+            R_rev[t, fired_t] = -self.K_ref_net[fired_t]
 
-        hf = self.beta_net * (H_fwd + X_fwd - self.theta_net)
-        hr = self.beta_net * (H_rev + X_rev - self.theta_net)
+        hf = self.beta_net * (S_fwd + R_fwd - self.theta_net)
+        hr = self.beta_net * (S_rev + R_rev - self.theta_net)
 
+        # both halves of the bond (t, t+1): forward emits s[t+1] from hf[t], reverse
+        # emits s[t] from hr[t+1]
         hf_a = hf[lo:hi]                          # field that generated s[t+1]
-        hr_a = hr[lo + 2:hi + 2]                  # reverse field, same spike
+        hr_a = hr[lo + 1:hi + 1]                  # reverse field that generated s[t]
         s_next = s_trj[lo + 1:hi + 1].float()     # the realized spike s[t+1]
+        s_cur  = s_trj[lo:hi].float()             # the realized spike s[t]
 
-        # log-likelihood of the realized spike under each field
-        lp_f = s_next * hf_a - F.softplus(hf_a)
-        lp_r = s_next * hr_a - F.softplus(hr_a)
-
-        # conditional entropies (diagnostics only -- their difference is a KL
-        # and is NOT the entropy production)
-        # p_f = torch.sigmoid(hf_a)
         ent_f = -s_next * hf_a + F.softplus(hf_a)
-        ent_r = -s_next * hr_a + F.softplus(hr_a)
+        ent_r = -s_cur  * hr_a + F.softplus(hr_a)
 
         out = {
-            "a_tot":  s_trj[lo:hi].mean(dim=1, dtype=torch.float32),
-            "sigma": (lp_f - lp_r).mean(dim=1),
-            "S_fwd": ent_f.mean(dim=1),
-            "S_rev": ent_r.mean(dim=1),
+            "m_tot":  s_trj[lo:hi].mean(dim=1, dtype=torch.float32),
+            "sigma": (ent_r - ent_f).mean(dim=1),
+            "H_fwd": ent_f.mean(dim=1),
+            "H_rev": ent_r.mean(dim=1),
         }
         if kur: out["kur"] = kur_buf[lo:hi]
         if ent: out["ent"] = ent_buf[lo:hi]
         if s:   out["s"]   = s_trj[lo:hi]
-        if pot: out["pot"] = (H_fwd + X_fwd)[lo:hi]
+        if pot: out["pot"] = (S_fwd + R_fwd)[lo:hi]
         if fdist: out["fdist"] = P_fwd[lo:hi]
         if fields:
             out["hf"] = hf_a
@@ -361,7 +372,6 @@ class SpinModel:
 
     @torch.inference_mode()
     def entropy_trajectory_chunked(self, T: int, chunk: int = 2048, overlap: int = 512,
-                               burn_in: int | None = None,
                                store_dtype: torch.dtype = torch.float32,
                                s: bool = False, pot: bool = False,
                                fields: bool = False, fdist: bool = False,
@@ -377,9 +387,14 @@ class SpinModel:
         that has not fired within the window tail still carries the zero
         boundary condition. Set check_overlap=True to be warned when this bites.
 
-        Timing (unchanged): P(s[t+1]=1) = sigmoid(hf[t]); the reverse-process
-        counterpart of hf[t] is hr[t+2]. Both S_fwd and S_rev use the realized
-        spike, so sigma == S_rev - S_fwd identically.
+        Timing: as in SpinModel.entropy_trajectory -- sigma[t] describes the
+        transition t -> t+1, with hf[t] emitting s[t+1] and hr[t+1] emitting s[t].
+        Both halves use a realized spike, so sigma == H_rev - H_fwd identically.
+
+        Time origin: index 0 is the state this is called on, matching
+        SpinModel.entropy_trajectory and RDMNetwork.entropy_trajectory, so the three
+        line up step-for-step. Nothing is discarded at the front -- equilibrate with
+        forward() before the call.
 
         Trajectories are stored in `store_dtype` (float32 is ample -- the
         estimator is sampling-noise dominated) while all reductions accumulate
@@ -389,8 +404,6 @@ class SpinModel:
             raise ValueError("overlap must be >= 4")
         if chunk < overlap:
             raise ValueError("chunk must be >= overlap (the slide would self-overlap)")
-        if burn_in is None:
-            burn_in = overlap
 
         dev, N = self.device, self.N
         F = torch.nn.functional
@@ -398,13 +411,13 @@ class SpinModel:
         acc = torch.float64
 
         s_win = torch.zeros((W, N), device=dev, dtype=torch.int8)
-        H_win = torch.zeros((W, N), device=dev, dtype=store_dtype)
-        X_win = torch.zeros((W, N), device=dev, dtype=store_dtype)
-        D_win = torch.zeros((W, N), device=dev, dtype=store_dtype)
+        S_win = torch.zeros((W, N), device=dev, dtype=store_dtype)
+        R_win = torch.zeros((W, N), device=dev, dtype=store_dtype)
+        I_win = torch.zeros((W, N), device=dev, dtype=store_dtype)
         if fdist: fd_win  = torch.zeros((W, Q), device=dev, dtype=store_dtype)
 
         out = {k: torch.zeros(T, device=dev, dtype=acc)
-               for k in ("a_tot", "sigma", "S_fwd", "S_rev")}
+               for k in ("m_tot", "sigma", "H_fwd", "H_rev")}
         if fdist: out["fdist"] = torch.zeros((T, Q), device=dev, dtype=store_dtype)
         if s:     out["s"]   = torch.zeros((T, N), device=dev, dtype=torch.int8)
         if pot:   out["pot"] = torch.zeros((T, N), device=dev, dtype=store_dtype)
@@ -414,13 +427,10 @@ class SpinModel:
 
         def record(j):
             s_win[j] = self.s
-            H_win[j].copy_(self.H)
-            X_win[j].copy_(self.X)
-            D_win[j].copy_(self.drive())
+            S_win[j].copy_(self.S)
+            R_win[j].copy_(self.R)
+            I_win[j].copy_(self.total_input())
             if fdist: fd_win[j].copy_(self.fdist(Q))
-
-        for _ in range(burn_in):
-            self.update()
 
         h_rev = torch.zeros(N, device=dev, dtype=store_dtype)
         x_rev = torch.zeros(N, device=dev, dtype=store_dtype)
@@ -434,7 +444,7 @@ class SpinModel:
                     record(j); self.update()
                 first = False
             else:
-                for buf in (s_win, H_win, X_win, D_win):
+                for buf in (s_win, S_win, R_win, I_win):
                     buf[:overlap].copy_(buf[chunk:])
                 if fdist: fd_win[:overlap].copy_(fd_win[chunk:])
                 for j in range(overlap, W):
@@ -449,30 +459,33 @@ class SpinModel:
                           f"{overlap}-step tail; increase overlap.")
 
             h_rev.zero_(); x_rev.zero_()
-            for t in range(W - 2, 1, -1):
+            for t in range(W - 2, 0, -1):
                 fired = s_win[t].bool()
-                h_rev.mul_(1.0 - self.a_int_net).addcmul_(D_win[t + 1], self.a_int_net)
+                h_rev.mul_(1.0 - self.a_int_net).addcmul_(I_win[t + 1], self.a_int_net)
                 h_rev.masked_fill_(fired, 0.0)
                 x_rev.mul_(1.0 - self.a_ref_net)
                 x_rev[fired] = -self.K_ref_net[fired]
 
-                k = t - 2
+                # h_rev/x_rev now hold the reverse field at window index t, which is
+                # the one that emits s[t-1] -- so it pairs with the bond (t-1, t)
+                k = t - 1
                 if k < n_emit:
                     i  = emitted + k
-                    hf = self.beta_net * (H_win[k] + X_win[k] - self.theta_net)
+                    hf = self.beta_net * (S_win[k] + R_win[k] - self.theta_net)
                     hr = self.beta_net * (h_rev + x_rev - self.theta_net)
-                    sn = s_win[k + 1].to(store_dtype)
+                    sn = s_win[k + 1].to(store_dtype)   # s[t+1], forward emission
+                    sc = s_win[k].to(store_dtype)       # s[t],   reverse emission
 
                     lp_f = sn * hf - F.softplus(hf)
-                    lp_r = sn * hr - F.softplus(hr)
+                    lp_r = sc * hr - F.softplus(hr)
 
                     out["sigma"][i] = (lp_f - lp_r).mean(dtype=acc)
-                    out["S_fwd"][i] = (-lp_f).mean(dtype=acc)
-                    out["S_rev"][i] = (-lp_r).mean(dtype=acc)
-                    out["a_tot"][i]     = s_win[k].mean(dtype=acc)
+                    out["H_fwd"][i] = (-lp_f).mean(dtype=acc)
+                    out["H_rev"][i] = (-lp_r).mean(dtype=acc)
+                    out["m_tot"][i]     = s_win[k].mean(dtype=acc)
 
                     if s:      out["s"][i]     = s_win[k]
-                    if pot:    out["pot"][i]   = H_win[k] + X_win[k]
+                    if pot:    out["pot"][i]   = S_win[k] + R_win[k]
                     if fields: out["hf"][i]    = hf; out["hr"][i] = hr
                     if fdist:  out["fdist"][i] = fd_win[k]
 
@@ -486,7 +499,7 @@ class SpinModel:
 # Convenience constructors for common spin models
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-def SpinIsingModel(N: int, J: float, I: float, beta: float, theta: float,
+def SpinIsingModel(N: int, J: float, E: float, beta: float, theta: float,
                tau_int: float, tau_ref: float, K_ref: float,
                dt: float = 1.0, device: str = "cpu",
                ic: str = "random") -> SpinModel:
@@ -496,7 +509,7 @@ def SpinIsingModel(N: int, J: float, I: float, beta: float, theta: float,
     M = 1
     Nm = torch.tensor([N], device=device)
     w = torch.full((M,M), J, device=device, dtype=torch.float32)
-    I_vec = torch.full((M,), I, device=device, dtype=torch.float32)
+    E_vec = torch.full((M,), E, device=device, dtype=torch.float32)
     beta_vec = torch.full((M,), beta, device=device, dtype=torch.float32)
     theta_vec = torch.full((M,), theta, device=device, dtype=torch.float32)
     tau_int_vec = torch.full((M,), tau_int, device=device, dtype=torch.float32)
@@ -504,11 +517,11 @@ def SpinIsingModel(N: int, J: float, I: float, beta: float, theta: float,
     K_ref_vec = torch.full((M,), K_ref, device=device, dtype=torch.float32)
 
     if ic == "random":
-        return SpinModel.random_start(Nm=Nm, w=w, I=I_vec, beta=beta_vec, theta=theta_vec,
+        return SpinModel.random_start(Nm=Nm, w=w, E=E_vec, beta=beta_vec, theta=theta_vec,
                                       tau_int=tau_int_vec, tau_ref=tau_ref_vec, K_ref=K_ref_vec,
                                       n_obs=1, dt=dt)
     elif ic == "silent":
-        return SpinModel.silent_start(Nm=Nm, w=w, I=I_vec, beta=beta_vec, theta=theta_vec,
+        return SpinModel.silent_start(Nm=Nm, w=w, E=E_vec, beta=beta_vec, theta=theta_vec,
                                   tau_int=tau_int_vec, tau_ref=tau_ref_vec, K_ref=K_ref_vec,
                                   n_obs=1, dt=dt)
     else:
@@ -522,8 +535,8 @@ def SpinWilsonCowan(
         w_EI: float,
         w_IE: float,
         w_II: float,
-        I_E: float,
-        I_I: float,
+        E_exc: float,
+        E_inh: float,
         beta_E: float,
         beta_I: float,
         theta_E: float,
@@ -544,8 +557,9 @@ def SpinWilsonCowan(
     N_I = int(N * (1 - E_ratio))
     N_E = N - N_I
     Nm = torch.tensor([N_E, N_I], device=device)
-    w = torch.tensor([[w_EE, w_EI], [w_IE, w_II]], device=device, dtype=torch.float32)
-    I_vec = torch.tensor([I_E, I_I], device=device, dtype=torch.float32)
+    # w_XY is source-first (X -> Y); the stored matrix is target-first (row = target)
+    w = torch.tensor([[w_EE, w_IE], [w_EI, w_II]], device=device, dtype=torch.float32)
+    E_vec = torch.tensor([E_exc, E_inh], device=device, dtype=torch.float32)
     beta_vec = torch.tensor([beta_E, beta_I], device=device, dtype=torch.float32)
     theta_vec = torch.tensor([theta_E, theta_I], device=device, dtype=torch.float32)
     tau_int_vec = torch.tensor([tau_int_E, tau_int_I], device=device, dtype=torch.float32)
@@ -553,14 +567,14 @@ def SpinWilsonCowan(
     K_ref_vec = torch.tensor([K_ref1, K_ref2], device=device, dtype=torch.float32)
 
     if ic == "random":
-        return SpinModel.random_start(Nm=Nm, w=w, I=I_vec, beta=beta_vec,
+        return SpinModel.random_start(Nm=Nm, w=w, E=E_vec, beta=beta_vec,
                                       theta=theta_vec,
                                       tau_int=tau_int_vec,
                                       tau_ref=tau_ref_vec,
                                       K_ref=K_ref_vec,
                                       n_obs=n_obs, dt=dt)
     elif ic == "silent":
-        return SpinModel.silent_start(Nm=Nm, w=w, I=I_vec,
+        return SpinModel.silent_start(Nm=Nm, w=w, E=E_vec,
                                       beta=beta_vec,
                                       theta=theta_vec,
                                       tau_int=tau_int_vec,
