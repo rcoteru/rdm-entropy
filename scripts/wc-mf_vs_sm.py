@@ -3,8 +3,10 @@ import torch
 import time
 
 import rdme.fixed_points as fpts
+import rdme.lyapunov as lyap
+from rdme.single import RDMWilsonCowan
 from rdme.spin_model import SpinWilsonCowan
-from rdme.mean_field import RDMWilsonCowan, fp_guess_lattice
+
 
 # Simulation parameters
 # ~~~~~~~~~~~~~~~~~~~~~
@@ -18,23 +20,50 @@ N = 50000
 
 E_ratio = 0.8 # ratio of excitatory neurons
 
-w_EE = 5.0      # coupling strength; adjust to test different regimes
-w_EI = 3.0      # external field; adjust to test different regimes
-w_IE = -6.0       # external field; adjust to test different regimes
-w_II = -0.5       # external field; adjust to test different regimes
+# Previous hand-picked values, kept so this is a one-line revert:
+# w_EE = 5.0      # coupling strength; adjust to test different regimes
+# w_EI = 3.0      # external field; adjust to test different regimes
+# w_IE = -6.0       # external field; adjust to test different regimes
+# w_II = -0.5       # external field; adjust to test different regimes
+# E = 1
+# tau_int = 20; tau_int_E = tau_int; tau_int_I = tau_int
+# K_ref = 0; K_ref_E = K_ref; K_ref_I = K_ref
 
-E = 1; 
+# The sharpest cell on the 28561-cell (E, w_EE, g, w_II) grid swept by wc-search.py and
+# wc-lyapunov.py, where g = sqrt(w_EI*|w_IE|) is the E-I loop gain and the weights come from
+# w_EI = g*rho, w_IE = -g/rho with rho = sqrt(2). This is E = 1.16, w_EE = 3.67, g = 11.25,
+# w_II = -2.50.
+#
+# Why this one: it sits inside the re-entrant suppression tongue in g -- the oscillatory
+# region is bounded by two bifurcation curves that pinch together around g ~ 8-12, and the
+# leading Lyapunov exponent peaks right on that pinch. It carried the largest lambda_1 of the
+# whole grid, +2.5e-3 /ms at 4.4 sigma.
+#
+# Do not read that as chaos. Re-run at dt = 0.1 the same cell gives lambda_1 = -6.5e-4 /ms,
+# so the positive sign is a discretization artifact of dt = 0.2 and the attractor is an
+# invariant circle (quasiperiodic). It is still the most strongly structured dynamics anywhere
+# on the grid, which is what makes it worth looking at here.
+w_EE = 3.67
+w_EI = 15.910     #  g*rho,  g = 11.25, rho = sqrt(2)
+w_IE = -7.955     # -g/rho
+w_II = -2.50
+
+E = 1.16;
 E_exc = E 
 E_inh = E
 beta = 30; beta_E = beta; beta_I = beta
 theta = 1; theta_E = theta; theta_I = theta
-tau_int = 20; tau_int_E = tau_int; tau_int_I = tau_int
+# Asymmetric, unlike the old symmetric tau_int = 20: slow inhibition is what the Hopf
+# condition wants, and it is what the sweep ran. Note tau_int_I = 40 at dt = 0.2 pushes the
+# inhibitory age grid to Qm ~ 922 bins, so both models get appreciably heavier than before.
+tau_int_E, tau_int_I = 10.0, 40.0
 tau_ref = 3; tau_ref_E = tau_ref; tau_ref_I = tau_ref
-K_ref = 0; K_ref_E = K_ref; K_ref_I = K_ref
+# Adaptation on the excitatory population only -- K_ref_I made no measurable difference.
+K_ref_E, K_ref_I = 0.5, 0.0
 
-dt = 0.2
-steps1 = 20000
-steps2 = 10000
+dt = 0.3
+steps1 = 50000
+steps2 = 20000
 
 # Model initialization
 # ~~~~~~~~~~~~~~~~~~~~
@@ -45,10 +74,12 @@ sm = SpinWilsonCowan(N, E_ratio, w_EE/dt, w_EI/dt, w_IE/dt, w_II/dt,
                     tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I, 
                     dt=dt, device=device, ic="silent")
 
-mf = RDMWilsonCowan(E_ratio, w_EE/dt, w_EI/dt, w_IE/dt, w_II/dt, 
+# srm takes the weights in physical units -- no /dt, since the input is built from the
+# rate -- and hazard="synchronous" is the sigmoid of the original model.
+mf = RDMWilsonCowan(E_ratio, w_EE, w_EI, w_IE, w_II, 
                     E_exc, E_inh, beta_E, beta_I, theta_E, theta_I, 
                     tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I,
-                    dt=dt, eps=0.01, device=device)
+                    dt=dt, hazard="synchronous", eps=0.01, device=device)
 
 print(mf.Qm)
 
@@ -83,10 +114,10 @@ if True: # visualize final p(n) distribution
 
     fdists = sm.fdists(max(mf.Qm)).cpu().numpy()
     plt.plot(fdists[0], label='Spin Model [E]', linewidth=2)
-    plt.plot(fdists[1], label='Spin Model [E]', linewidth=2)
+    plt.plot(fdists[1], label='Spin Model [I]', linewidth=2)
 
     plt.plot(mf.p[0].cpu().numpy(), label='Mean Field [E]', linewidth=2)
-    plt.plot(mf.p[1].cpu().numpy(), label='Mean Field [E]', linewidth=2)
+    plt.plot(mf.p[1].cpu().numpy(), label='Mean Field [I]', linewidth=2)
 
     plt.xlabel('p(n)'); plt.ylabel('Probability'); plt.legend(); plt.grid()
 
@@ -95,15 +126,17 @@ if True: # equilibration trajectories
     plt.figure(figsize=(10, 4))
     plt.title('Equilibration Trajectories')
     plt.plot(sm_traj1["m"][:, 0], label='Spin Model [E]', linewidth=2)
-    plt.plot(sm_traj1["m"][:, 1], label='Spin Model [E]', linewidth=2)
+    plt.plot(sm_traj1["m"][:, 1], label='Spin Model [I]', linewidth=2)
     plt.plot(mf_traj1["m"][:, 0], label='Mean Field [E]', linewidth=2)
-    plt.plot(mf_traj1["m"][:, 1], label='Mean Field [E]', linewidth=2)
+    plt.plot(mf_traj1["m"][:, 1], label='Mean Field [I]', linewidth=2)
     plt.xlabel('Time Steps'); plt.ylabel('Mean Activity'); 
     plt.legend(); plt.grid(); plt.tight_layout()
 
 
 if True: # return map (m_t vs m_{t+1}) of non-transient trajectories
 
+    # a return map is a scalar series against its own lag, so it wants the network
+    # aggregate, not the (T, M) per-population overlaps
     sm_m = sm_traj2["m_tot"].cpu().numpy()
     mf_m = mf_traj2["m_tot"].cpu().numpy()
 
@@ -124,6 +157,30 @@ if True: # return map (m_t vs m_{t+1}) of non-transient trajectories
 
     fig.tight_layout()
 
+if True: # phase plane trajectories
+
+    # the phase plane is the E overlap against the I overlap, so it wants the
+    # per-population (T, M) array
+    sm_m = sm_traj2["m"].cpu().numpy()
+    mf_m = mf_traj2["m"].cpu().numpy()
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+    # ax1: plt.Axes; ax2: plt.Axes
+
+    fig.suptitle('Phase Plane - Non-transient Trajectories')
+
+    ax1.set_title('Spin Model')
+    ax1.scatter(sm_m[:, 0], sm_m[:, 1], s=1, alpha=1)
+    ax1.set_xlabel(r'$m_E$'); ax1.set_ylabel(r'$m_I$')
+    ax1.grid()
+
+    ax2.set_title('Mean Field')
+    ax2.scatter(mf_m[:, 0], mf_m[:, 1], s=1, alpha=1)
+    ax2.set_xlabel(r'$m_E$'); ax2.set_ylabel(r'$m_I$')
+    ax2.grid()
+
+    fig.tight_layout()
+
 
 if True: # fixed-point objective |G(m)| over the (m_E, m_I) square
 
@@ -134,7 +191,7 @@ if True: # fixed-point objective |G(m)| over the (m_E, m_I) square
     # dynamics does with them.
     n_grid = 201
 
-    roots = mf.fixed_points(method='newton', guesses=fp_guess_lattice(2, 15, device=device))
+    roots = mf.fixed_points(method='newton', guesses=fpts.fp_guess_lattice(2, 15, device=device))
     rho   = torch.tensor([fpts.spectral_radius(mf.fp_eigenvalues(r)) for r in roots])
     orbit = mf_traj2["m"]                                                   # (T, 2)
 
@@ -199,20 +256,20 @@ if True: # entropy trajectories
 
     # sigma trajectories
     ax2.set_title('Entropy Production Rate')
-    ax2.plot(sm_traj2["sigma"], label='Spin Model', linewidth=2)
-    ax2.plot(mf_traj2["sigma"], label='Mean Field', linewidth=2)
+    ax2.plot(sm_traj2["sigma_tot"], label='Spin Model', linewidth=2)
+    ax2.plot(mf_traj2["sigma_tot"], label='Mean Field', linewidth=2)
     ax2.legend(); ax2.grid()
 
     # H_fwd trajectories
     ax3.set_title('Forward Entropy')
-    ax3.plot(sm_traj2["H_fwd"], label='Spin Model', linewidth=2)
-    ax3.plot(mf_traj2["H_fwd"], label='Mean Field', linewidth=2)
+    ax3.plot(sm_traj2["H_fwd_tot"], label='Spin Model', linewidth=2)
+    ax3.plot(mf_traj2["H_fwd_tot"], label='Mean Field', linewidth=2)
     ax3.legend(); ax3.grid()
 
     # H_rev trajectories
     ax4.set_title('Backward Entropy')
-    ax4.plot(sm_traj2["H_rev"], label='Spin Model', linewidth=2)
-    ax4.plot(mf_traj2["H_rev"], label='Mean Field', linewidth=2)
+    ax4.plot(sm_traj2["H_rev_tot"], label='Spin Model', linewidth=2)
+    ax4.plot(mf_traj2["H_rev_tot"], label='Mean Field', linewidth=2)
     ax4.legend(); ax4.grid()
 
     # print trajetcory averages
@@ -223,5 +280,98 @@ if True: # entropy trajectories
     plt.tight_layout()
 
 
+if True: # entropy trajectories, decomposed by population
+
+    # The same four quantities as above, but per population rather than N-weighted totals.
+    # The "_tot" series hide the thing that is actually interesting at these parameters: E and
+    # I run at very different rates and their entropy production need not even have the same
+    # sign of trend, and a population-size-weighted sum of the two is dominated by E (N_E/N is
+    # 0.8 here) and so says little about I.
+    #
+    # Column is the population, colour is the model. The comparison this figure exists for is
+    # spin-model against mean-field within one panel, so the model keeps one colour everywhere
+    # and the population is read off position. Rows share a y-axis so E and I are on the same
+    # scale; that is the point of splitting them.
+    POPS = ["Excitatory", "Inhibitory"]
+    ROWS = [("m",     "Activity"),
+            ("sigma", "Entropy Production Rate"),
+            ("H_fwd", "Forward Entropy"),
+            ("H_rev", "Backward Entropy")]
+
+    fig, axs = plt.subplots(len(ROWS), 2, sharex=True, sharey='row', figsize=(14, 12))
+
+    for r, (key, title) in enumerate(ROWS):
+        for c in range(len(POPS)):
+            ax = axs[r, c]
+            ax.plot(sm_traj2[key][:, c], label='Spin Model', linewidth=2)
+            ax.plot(mf_traj2[key][:, c], label='Mean Field', linewidth=2)
+            ax.set_title(f'{title} - {POPS[c]}')
+            ax.grid()
+            if r == len(ROWS) - 1:
+                ax.set_xlabel('Time Steps')
+    axs[0, 0].legend()   # identity is the same in every panel, so one legend covers the figure
+
+    # per-population averages, with the same transient trim the totals use above
+    skip = 100
+    for c, pop in enumerate(POPS):
+        print(f"{pop} (column {c}):")
+        for nm, tr in (("  Spin Model", sm_traj2), ("  Mean Field", mf_traj2)):
+            print(f"{nm}: <m> = {tr['m'][skip:-skip, c].mean():.8f}, "
+                  f"<sigma> = {tr['sigma'][skip:-skip, c].mean():.8f} nats/ms, "
+                  f"<H_fwd> = {tr['H_fwd'][skip:-skip, c].mean():.8f}, "
+                  f"<H_rev> = {tr['H_rev'][skip:-skip, c].mean():.8f}")
+
+    plt.tight_layout()
+
+
+if True: # Lyapunov spectrum of the mean field
+
+    # The exponents are a property of the deterministic mean-field map, so only mf is used
+    # here; the spin model is a finite-N stochastic process and has no Lyapunov spectrum in
+    # this sense. Also note this is a MAP, not a flow: an attracting periodic orbit has every
+    # exponent strictly negative, and lambda_1 ~ 0 means an invariant circle (quasiperiodic),
+    # not a limit cycle. Reading the flow table here would call every locked cycle a fixed
+    # point.
+    k_lyap   = 2       # lambda_1 decides chaos; lambda_2 separates a circle from a 2-torus
+    eq_lyap  = 15000   # settle the trajectory
+    wu_lyap  = 2000    # settle the tangent BASIS: a random one is not yet aligned
+    T_lyap   = 20000   # accumulation window; sets the ~1e-4 /ms noise floor
+
+    lmf = RDMWilsonCowan(E_ratio, w_EE, w_EI, w_IE, w_II,
+                         E_exc, E_inh, beta_E, beta_I, theta_E, theta_I,
+                         tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I,
+                         dt=dt, hazard="synchronous", eps=0.01, device=device)
+
+    print(f"\nLyapunov: equilibrating {eq_lyap} steps, then {wu_lyap} warmup + {T_lyap} "
+          f"accumulation, k={k_lyap} ...")
+    t0 = time.time()
+    lmf.forward(eq_lyap)
+    blocks = lmf.init_tangent(k_lyap, generator=torch.Generator().manual_seed(0))
+    lmf.step_tangent(blocks)        # one step annihilates the 2M unphysical directions
+    lyap.orthonormalize(blocks)
+    spec = lyap.benettin(lmf.step_tangent, blocks, n_steps=T_lyap, dt=dt,
+                         cadence=100, n_blocks=20, warmup=wu_lyap)
+    print(f"  done in {time.time() - t0:.1f}s")
+
+    for i in range(k_lyap):
+        print(f"  lambda_{i+1} = {spec.lam[i]:+.4e} +/- {spec.se[i]:.1e} /ms"
+              f"   ({spec.lam[i]/spec.se[i]:+.1f} sigma)"
+              f"   drift {spec.drift[i]:+.1e}"
+              f"{'   [degenerate with its neighbour]' if spec.degenerate[i] else ''}")
+    print(f"  partial sums: {[f'{v:+.4e}' for v in spec.partial.tolist()]}")
+
+    # Classification needs one bit the spectrum cannot supply: whether the state actually
+    # moves. In a map a dead cell and a locked cycle both have lambda_1 < 0.
+    m_E = mf_traj2["m"][:, 0]
+    cv = (m_E.std() / m_E.mean().clamp_min(1e-300))
+    moving = torch.tensor(bool(cv > 1e-4))
+    tol = max(5e-4, 3 * spec.se[0].item())      # floor, or 3 sigma, whichever binds
+    cls = lyap.classify_spectrum(spec.lam, tol=tol, moving=moving,
+                                 se=spec.se, n_sigma=3.0)
+    print(f"  CV(m_E) = {cv:.3e} -> moving={bool(moving)};  band = +/-{tol:.1e} /ms")
+    print(f"  => {lyap.CLASS_NAMES[int(cls)]}")
+    if int(cls) == lyap.CHAOS:
+        print("  NOTE: confirm at dt <= 0.1 before believing this. On the parameter sweep every"
+              "\n        chaotic candidate at dt = 0.2 flipped sign at dt = 0.1.")
 
 plt.show()

@@ -3,8 +3,9 @@ import torch
 import time
 
 import rdme.fixed_points as fpts
+from rdme.single import RDMIsingModel
 from rdme.spin_model import SpinIsingModel
-from rdme.mean_field import RDMIsingModel
+
 
 # Simulation parameters
 # ~~~~~~~~~~~~~~~~~~~~~
@@ -37,7 +38,7 @@ K_ref = 0
 
 steps1 = 5000
 steps2 = 10000
-dt = 0.2
+dt = 0.05
 
 # Model initialization
 # ~~~~~~~~~~~~~~~~~~~~
@@ -47,8 +48,10 @@ sm = SpinIsingModel(N, J/dt, E, beta, theta,
             tau_int, tau_ref=tau_ref, K_ref=K_ref, 
             dt=dt, device=device, ic="silent")
 
-mf = RDMIsingModel(J/dt, E, beta, theta,
-        tau_int, tau_ref, K_ref, dt, eps=0.01, device=device)
+# srm takes J in physical units -- no /dt here, the input is built from the rate.
+# hazard="synchronous" is the sigmoid of the original model.
+mf = RDMIsingModel(J, E, beta, theta,
+        tau_int, tau_ref, K_ref, dt, hazard="sync", eps=0.01, device=device)
 print(mf.Qm)
 
 # mf.P = sm.fdist(Q) # initialize mean-field distribution to match spin model
@@ -67,8 +70,8 @@ sm_traj1 = sm.trajectory(T=steps1)
 sm_traj2 = sm.entropy_trajectory_chunked(T=steps2)
 times.append(time.time())
 # show timings
-print(f"Markovian mean-field simulation completed in {times[1] - times[0]:.2f} seconds.")
-print(f"Markovian spin-model simulation completed in {times[2] - times[1]:.2f} seconds.")
+print(f"Mean field simulation completed in {times[1] - times[0]:.2f} seconds.")
+print(f"Spin model simulation completed in {times[2] - times[1]:.2f} seconds.")
 print("All simulations completed successfully.")
 
 # Plotting
@@ -131,22 +134,22 @@ if True: # entropy trajectories
 
     # sigma trajectories
     ax2.set_title('Entropy Production Rate')
-    ax2.plot(t, sm_traj2["sigma"], label='Spin Model', linewidth=2)
-    ax2.plot(t, mf_traj2["sigma"], label='Mean Field', linewidth=2)
+    ax2.plot(t, sm_traj2["sigma_tot"], label='Spin Model', linewidth=2)
+    ax2.plot(t, mf_traj2["sigma_tot"], label='Mean Field', linewidth=2)
     ax2.set_xlabel('Time (ms)'); ax2.set_ylabel('Entropy Production Rate (nats/ms)');
     ax2.legend(); ax2.grid()
 
     # H_fwd trajectories
     ax3.set_title('Forward Entropy')
-    ax3.plot(t, sm_traj2["H_fwd"], label='Spin Model', linewidth=2)
-    ax3.plot(t, mf_traj2["H_fwd"], label='Mean Field', linewidth=2)
+    ax3.plot(t, sm_traj2["H_fwd_tot"], label='Spin Model', linewidth=2)
+    ax3.plot(t, mf_traj2["H_fwd_tot"], label='Mean Field', linewidth=2)
     ax3.set_xlabel('Time (ms)'); ax3.set_ylabel('Forward Entropy (nats)');
     ax3.legend(); ax3.grid()
 
     # H_rev trajectories
     ax4.set_title('Backward Entropy')
-    ax4.plot(t, sm_traj2["H_rev"], label='Spin Model', linewidth=2)
-    ax4.plot(t, mf_traj2["H_rev"], label='Mean Field', linewidth=2)
+    ax4.plot(t, sm_traj2["H_rev_tot"], label='Spin Model', linewidth=2)
+    ax4.plot(t, mf_traj2["H_rev_tot"], label='Mean Field', linewidth=2)
     ax4.set_xlabel('Time (ms)'); ax4.set_ylabel('Backward Entropy (nats)');
     ax4.legend(); ax4.grid()
 
@@ -200,7 +203,6 @@ if True: # fixed-point objective G(m) = m - F(m) over the overlap range
     ax2.set_ylim(G[inside].min() - pad, G[inside].max() + pad)
 
     fig.tight_layout()
-
 
 
 plt.show()

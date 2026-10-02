@@ -5,8 +5,8 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import torch
 
-import rdme.fixed_points as fpts
-from rdme.mean_field import RDMIsingModelBatch, RDMNetworkBatch
+from rdme.batch import RDMIsingModelBatch, RDMNetworkBatch
+
 
 # ── Cache paths ───────────────────────────────────────────────────────────────
 
@@ -19,7 +19,7 @@ CACHE_FP_FILE   = CACHE_DIR / f"{bname}_fp.pt"
 run_sim   = True
 run_fp    = True
 run_plot  = True
-overwrite = False
+overwrite = True
 
 torch.set_default_dtype(torch.float64)
 
@@ -30,9 +30,9 @@ if run_sim:
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    J       = 2
+    J       = 10
     E       = torch.linspace(0.7, 2.0, 300)
-    beta    = 30.0
+    beta    = 40.0
     theta   = 1.0
     tau_int = 20.0
     tau_ref = 3.0
@@ -45,9 +45,11 @@ if run_sim:
     if CACHE_TRAJ_FILE.exists() and not overwrite:
         print(f"Simulation already exists at {CACHE_TRAJ_FILE}. Skipping.")
     else:
-        mf = RDMIsingModelBatch(J=J/dt, E=E, beta=beta, theta=theta,
-                                 tau_int=tau_int, tau_ref=tau_ref, K_ref=K_ref,
-                                 device=device, dt=dt, eps=0.01)
+        # J in physical units (srm builds the input from the rate), and the sigmoid kernel
+        # of the original model
+        mf = RDMIsingModelBatch(J=J, E=E, beta=beta, theta=theta,
+                                tau_int=tau_int, tau_ref=tau_ref, K_ref=K_ref,
+                                device=device, dt=dt, hazard="synchronous", eps=0.01)
         print(f"Running {mf.B} mean-fields for {equi+steps} steps on {device}...")
         t0 = time.time()
         mf.forward(equi, pb=True)
@@ -106,7 +108,7 @@ if run_fp:
 
         fp = {"E": torch.stack(E_of_root), "m_star": torch.stack(m_star),
               "rho": torch.stack(rho), "lead": torch.stack(lead),
-              "dt": torch.tensor(mf_fp.deltaT)}
+              "dt": torch.tensor(mf_fp.dt)}
         CACHE_DIR.mkdir(exist_ok=True)
         torch.save(fp, CACHE_FP_FILE)
         print(f"Fixed points saved to {CACHE_FP_FILE}.")
