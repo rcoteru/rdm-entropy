@@ -1,10 +1,16 @@
-""" Tests for the basic mean-field functions in mean_field.py: 
-    compute_total_input, update_synaptic_term, update_age_distribution, compute_firing_prob. """
+""" Tests for the per-step primitives in rdme.dynamics: compute_total_input,
+update_synaptic_term, compute_firing_rate, update_age_distribution, check_age_normalization.
+
+These are the kernel-independent half of the model -- none of them evaluates a hazard, which
+is why one copy serves every member of the family. The hazards themselves are tested in
+test_srm.py. """
 
 import pytest
 import torch
 
-import rdme.mean_field as mf
+import rdme.hazards as hzd
+import rdme.dynamics as dyn
+from rdme.single import RDMWilsonCowan
 
 
 def test_population_input():
@@ -19,14 +25,14 @@ def test_population_input():
         1.0 * 0.5 + 2.0 * (-0.25) + 0.1,
         3.0 * 0.5 + 4.0 * (-0.25) + 0.2,
     ])
-    assert torch.allclose(mf.compute_total_input(m, w, E), expected)
+    assert torch.allclose(dyn.compute_total_input(m, w, E), expected)
 
     # random case, checked against a plain matmul rather than re-deriving the call
     M = 5
     w = torch.randn(M, M, dtype=torch.float64)
     m = torch.randn(M, dtype=torch.float64)
     E = torch.randn(M, dtype=torch.float64)
-    got = mf.compute_total_input(m, w, E)
+    got = dyn.compute_total_input(m, w, E)
     assert torch.allclose(got, w @ m + E)
 
 
@@ -42,7 +48,7 @@ def test_wilson_cowan_weight_orientation_matches_the_spin_model():
               theta_E=1.0, theta_I=1.0, tau_int_E=10.0, tau_int_I=5.0,
               tau_ref_E=3.0, tau_ref_I=3.0)
 
-    net = mf.RDMWilsonCowan(K_ref_E=0.0, K_ref_I=0.0, dt=0.5, **kw)
+    net = RDMWilsonCowan(K_ref_E=0.0, K_ref_I=0.0, dt=0.5, hazard="synchronous", **kw)
     spin = SpinWilsonCowan(N=1000, K_ref1=0.0, K_ref2=0.0, dt=0.5, **kw)
 
     assert torch.allclose(net.w.float(), spin.w)
@@ -55,8 +61,8 @@ def test_wilson_cowan_weight_orientation_matches_the_spin_model():
 
     # the inhibitory column must actually inhibit E: raising m_I lowers I_E
     E = torch.zeros(2, dtype=net.w.dtype)
-    quiet = mf.compute_total_input(torch.tensor([0.1, 0.0], dtype=net.w.dtype), net.w, E)
-    loud  = mf.compute_total_input(torch.tensor([0.1, 0.5], dtype=net.w.dtype), net.w, E)
+    quiet = dyn.compute_total_input(torch.tensor([0.1, 0.0], dtype=net.w.dtype), net.w, E)
+    loud  = dyn.compute_total_input(torch.tensor([0.1, 0.5], dtype=net.w.dtype), net.w, E)
     assert loud[0] < quiet[0]
 
 
@@ -67,7 +73,7 @@ def test_update_synaptic_term():
     I = 0.7
     S = torch.rand(Q, dtype=torch.float64)
 
-    S_new = mf.update_synaptic_term(S, alpha, I)
+    S_new = dyn.update_synaptic_term(S, alpha, I)
 
     # bin 0 is always reset -- there is no age-0 field yet
     assert S_new[0] == 0
@@ -78,39 +84,31 @@ def test_update_synaptic_term():
     assert not torch.allclose(S, S_new)
 
     # edge cases: alpha=0 keeps only the aged-in history, alpha=1 forgets it entirely
-    S_no_input = mf.update_synaptic_term(S, 0.0, I)
+    S_no_input = dyn.update_synaptic_term(S, 0.0, I)
     assert torch.allclose(S_no_input[1:], S[:-1])
-    S_no_memory = mf.update_synaptic_term(S, 1.0, I)
+    S_no_memory = dyn.update_synaptic_term(S, 1.0, I)
     assert torch.allclose(S_no_memory[1:], torch.full_like(S[:-1], I))
 
     # in-place variant must match the out-of-place one bit-for-bit
     S_inplace = S.clone()
-    mf.update_synaptic_term(S_inplace, alpha, I, inplace=True)
+    dyn.update_synaptic_term(S_inplace, alpha, I, inplace=True)
     assert torch.equal(S_inplace, S_new)
 
 
-def test_compute_firing_prob():
+def test_sync_hazard_is_the_sigmoid_of_the_field():
+    """ The kernel the old compute_firing_prob hard-coded, now one member of the family.
+    Its derivative and its relatives are tested in test_srm.py; this just pins the form. """
     torch.manual_seed(2)
     Q = 5
     S = torch.randn(Q, dtype=torch.float64)
     R = torch.randn(Q, dtype=torch.float64)
     beta, theta = 2.5, 0.3
-
-    expected = torch.sigmoid(beta * (S + R - theta))
-    got = mf.compute_firing_prob(S, R, beta, theta)
-    assert torch.allclose(got, expected)
-
-    # the no-autograd (in-place-chained) variant must agree numerically...
-    got_noag = mf.compute_firing_prob(S.clone(), R.clone(), beta, theta, inplace=True)
-    assert torch.allclose(got, got_noag)
-
-    # ...and, despite chaining in-place internally, must not clobber the caller's S/R:
-    # the first op is `S + R`, which allocates a fresh tensor, so the in-place chain
-    # after that only ever mutates that fresh tensor, never the inputs
+    got = hzd.sync_hazard(S + R - theta, beta, lam0=1.0, dt=1.0)
+    assert torch.allclose(got, torch.sigmoid(beta * (S + R - theta)))
+    # and it does not touch the caller's tensors
     S_before, R_before = S.clone(), R.clone()
-    mf.compute_firing_prob(S, R, beta, theta, inplace=True)
-    assert torch.equal(S, S_before)
-    assert torch.equal(R, R_before)
+    hzd.sync_hazard(S + R - theta, beta, 1.0, 1.0)
+    assert torch.equal(S, S_before) and torch.equal(R, R_before)
 
 
 def test_update_age_distribution():
@@ -120,33 +118,33 @@ def test_update_age_distribution():
     P /= P.sum()
     fprobs = torch.rand(Q, dtype=torch.float64) * 0.8  # stay away from 1
 
-    P_new = mf.update_age_distribution(P, fprobs)
+    P_new = dyn.update_age_distribution(P, fprobs)
 
     # renewal update stays a valid distribution
     assert torch.allclose(P_new.sum(), torch.tensor(1.0, dtype=torch.float64))
     # births into bin 0 are exactly the firing rate
-    assert torch.allclose(P_new[0], mf.compute_firing_rate(P, fprobs))
+    assert torch.allclose(P_new[0], dyn.compute_firing_rate(P, fprobs))
     # interior bins age by one step, decayed by survival
     assert torch.allclose(P_new[1:-1], P[:-2] * (1 - fprobs[:-2]))
     # the boundary bin absorbs whatever remains, so P_new stays normalized by construction
     assert torch.allclose(P_new[-1], 1 - P_new[:-1].sum())
 
-    mf.check_age_normalization(P_new)  # should not raise
+    dyn.check_age_normalization(P_new)  # should not raise
     with pytest.raises(ValueError):
-        mf.check_age_normalization(torch.tensor([0.5, 0.6]))
+        dyn.check_age_normalization(torch.tensor([0.5, 0.6]))
 
     # in-place variant must match the out-of-place one to floating-point rounding: both
     # compute the boundary bin as 1 minus the same two quantities, but grouped differently
     # (1 - (frate + interior.sum()) vs (1 - frate) - interior.sum()), so they are not
     # guaranteed bit-exact
     P_inplace = P.clone()
-    mf.update_age_distribution(P_inplace, fprobs, inplace=True)
+    dyn.update_age_distribution(P_inplace, fprobs, inplace=True)
     assert torch.allclose(P_inplace, P_new)
 
 
 @pytest.mark.parametrize("shape", [(9,), (4, 9)])
 def test_inplace_branches_match_out_of_place(shape):
-    """ Every function carrying an `inplace` flag must give the same answer either way, and
+    """ Both functions carrying an `inplace` flag must give the same answer either way, and
     must do so for BATCHED input too -- the in-place branches were once written with
     first-axis indexing (P[0], S[:-1]), which silently addresses the batch axis instead of
     the age axis once P is (B, Q). """
@@ -159,22 +157,18 @@ def test_inplace_branches_match_out_of_place(shape):
     P /= P.sum(dim=-1, keepdim=True)
     fprobs = torch.rand(*shape, dtype=torch.float64)
 
-    P_ref = mf.update_age_distribution(P.clone(), fprobs)
-    P_ip  = P.clone(); mf.update_age_distribution(P_ip, fprobs, inplace=True)
+    P_ref = dyn.update_age_distribution(P.clone(), fprobs)
+    P_ip  = P.clone(); dyn.update_age_distribution(P_ip, fprobs, inplace=True)
     assert torch.allclose(P_ref, P_ip, atol=1e-12)
     assert torch.allclose(P_ip.sum(dim=-1), torch.ones(shape[:-1], dtype=torch.float64), atol=1e-12)
 
     S = torch.randn(*shape, dtype=torch.float64)
-    S_ref = mf.update_synaptic_term(S.clone(), alpha, I)
-    S_ip  = S.clone(); mf.update_synaptic_term(S_ip, alpha, I, inplace=True)
+    S_ref = dyn.update_synaptic_term(S.clone(), alpha, I)
+    S_ip  = S.clone(); dyn.update_synaptic_term(S_ip, alpha, I, inplace=True)
     assert torch.equal(S_ref, S_ip)
 
-    R = torch.randn(*shape, dtype=torch.float64)
-    beta  = torch.full((shape[0], 1), 2.5, dtype=torch.float64) if batched else 2.5
-    theta = torch.full((shape[0], 1), 0.4, dtype=torch.float64) if batched else 0.4
-    phi_ref = mf.compute_firing_prob(S, R, beta, theta)
-    phi_ip  = mf.compute_firing_prob(S.clone(), R.clone(), beta, theta, inplace=True)
-    assert torch.allclose(phi_ref, phi_ip, atol=1e-12)
+    # (the hazard has no in-place branch: measured, one would save ~2% of a step, and the
+    # one rdme.mean_field carried was never called with inplace=True in production)
 
 
 @pytest.mark.parametrize("shape", [(9,), (4, 9)])
@@ -184,4 +178,4 @@ def test_compute_firing_rate_reduces_over_the_age_axis(shape):
     torch.manual_seed(1)
     P = torch.rand(*shape, dtype=torch.float64)
     fprobs = torch.rand(*shape, dtype=torch.float64)
-    assert torch.allclose(mf.compute_firing_rate(P, fprobs), (P * fprobs).sum(dim=-1), atol=1e-12)
+    assert torch.allclose(dyn.compute_firing_rate(P, fprobs), (P * fprobs).sum(dim=-1), atol=1e-12)

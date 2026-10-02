@@ -1,19 +1,48 @@
-""" Tests for the entropy-production machinery in mean_field.py: the low-level
-compute_joint_distribution/compute_epr/compute_epr_from_buffers formulas, and the
-RDMNetwork(Batch).entropy_trajectory buffering built on top of them. """
+""" Tests for rdme.epr: the time-reversed field, the joint distribution of forward and
+reverse age, and the two paths that read the entropy production off it.
+
+Everything here runs the synchronous kernel, so these are statements about the EPR machinery
+rather than about a particular hazard -- the comparison across the three is in test_srm.py.
+That also means the unvectorized references below can keep writing the hazard as a plain
+sigmoid, which is what makes them independent of the implementation they check.
+"""
 
 import contextlib
 
 import pytest
 import torch
 
-import rdme.mean_field as mf
+import rdme.hazards as hzd
+import rdme.dynamics as dyn
+import rdme.epr
+import rdme.single
+from rdme.batch import RDMNetworkBatch
+from rdme.epr import (anchor_reverse_synaptic_term, compute_reverse_synaptic_term,
+                      epr_from_joint, epr_from_parts, init_epr_state, joint_distribution,
+                      make_epr_indices, step_epr)
+from rdme.single import RDMIsingModel, RDMNetwork
+
 
 torch.manual_seed(0)
 
+# the synchronous kernel at its own quantum: lam0*dt = 1, where sync ignores both anyway
+HZ, LAM0, DT = hzd.HAZARDS["synchronous"], 1.0, 1.0
 
-# Low-level formulas
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+def _phi(S, R, beta, theta):
+    return HZ.phi(S + R - theta, beta, LAM0, DT)
+
+
+def _epr_from_buffers(p, buff_S, buff_I, R, alpha, beta, theta):
+    """ One population's EPR for one timestep, straight from its rolling buffers.
+
+    rdme.mean_field had this as a function; srm composes it inline inside
+    entropy_trajectory, so the reference the sliding path is checked against lives here. """
+    S_rev = anchor_reverse_synaptic_term(buff_I, alpha)
+    J = joint_distribution(p, buff_S, R, beta, theta, HZ, LAM0, DT)
+    return epr_from_joint(J, _phi(buff_S[0], R, beta, theta),
+                              _phi(S_rev, R, beta, theta))
+
 
 def test_compute_backward_field():
     torch.manual_seed(4)
@@ -21,7 +50,7 @@ def test_compute_backward_field():
     alpha = 0.4
     I = torch.randn(Q, dtype=torch.float64)
 
-    H = mf.compute_reverse_synaptic_term(I, alpha)
+    H = compute_reverse_synaptic_term(I, alpha)
 
     # no field has accumulated yet at age 0
     assert H[0] == 0
@@ -38,17 +67,17 @@ def test_compute_backward_field():
     assert torch.allclose(H, expected, rtol=0, atol=1e-15)
 
     # alpha as a 0-d tensor -- how the models actually store it -- must be no different
-    H_t = mf.compute_reverse_synaptic_term(I, torch.tensor(alpha, dtype=torch.float64))
+    H_t = compute_reverse_synaptic_term(I, torch.tensor(alpha, dtype=torch.float64))
     assert torch.equal(H, H_t)
 
     # batched: a (B, K) buffer with a (B, 1) alpha is the same field, row by row
-    H_b = mf.compute_reverse_synaptic_term(I.expand(3, Q).contiguous(),
+    H_b = compute_reverse_synaptic_term(I.expand(3, Q).contiguous(),
                                     torch.full((3, 1), alpha, dtype=torch.float64))
     assert torch.allclose(H_b, H.expand(3, Q), rtol=0, atol=1e-15)
 
     # alpha=1: the kernel is [1, 0, 0, ...], so the field is pinned at I[1]
     # for every j >= 1 rather than tracking the most recent input
-    H1 = mf.compute_reverse_synaptic_term(I, 1.0)
+    H1 = compute_reverse_synaptic_term(I, 1.0)
     assert torch.allclose(H1[1:], torch.full_like(H1[1:], I[1].item()))
 
 
@@ -62,7 +91,7 @@ def test_anchor_reverse_synaptic_term():
     alpha = 0.45
     I = torch.randn(K, dtype=torch.float64)        # I[j] = input at time t + j
 
-    S = mf.anchor_reverse_synaptic_term(I, alpha)
+    S = anchor_reverse_synaptic_term(I, alpha)
     assert S.shape == (K,)
     assert S[0] == 0                               # no future filtered at reverse age 0
 
@@ -77,11 +106,11 @@ def test_anchor_reverse_synaptic_term():
     assert torch.equal(S[K - 1], S[K - 2])
 
     # and it is emphatically NOT the raw buffer's field -- that one is anchored at t
-    raw = mf.compute_reverse_synaptic_term(I, alpha)
+    raw = compute_reverse_synaptic_term(I, alpha)
     assert not torch.allclose(S[1:K - 1], raw[1:K - 1])
 
     # batched: (B, K) buffer with a (B, 1) alpha is the same field row by row
-    S_b = mf.anchor_reverse_synaptic_term(I.expand(3, K).contiguous(),
+    S_b = anchor_reverse_synaptic_term(I.expand(3, K).contiguous(),
                                           torch.full((3, 1), alpha, dtype=torch.float64))
     assert torch.allclose(S_b, S.expand(3, K), rtol=0, atol=1e-15)
 
@@ -95,20 +124,30 @@ def test_reverse_field_anchoring_is_wired_through_the_trajectory():
     torch.set_default_dtype(torch.float64)
     try:
         dt = 0.5
-        net = mf.RDMIsingModel(4 / dt, 1, 30, 1, 12, 3, 0, dt, eps=0.01, device="cpu")
+        net = RDMIsingModel(4, 1, 30, 1, 12, 3, 0, dt, hazard="synchronous",
+                                eps=0.01, device="cpu")
         net.forward(300)
-        out = net.entropy_trajectory(40)
+        out = net.entropy_trajectory(40, pb=False)
 
         # a shifted anchoring changes H_rev (and hence sigma) but leaves H_fwd alone --
         # so a silent regression to the t-anchored field would show up right here
-        net2 = mf.RDMIsingModel(4 / dt, 1, 30, 1, 12, 3, 0, dt, eps=0.01, device="cpu")
+        net2 = RDMIsingModel(4, 1, 30, 1, 12, 3, 0, dt, hazard="synchronous",
+                                 eps=0.01, device="cpu")
         net2.forward(300)
-        real = mf.anchor_reverse_synaptic_term
-        mf.anchor_reverse_synaptic_term = mf.compute_reverse_synaptic_term   # the old bug
+        # The name has to be patched in the module that READS it, not in the rdme
+        # package namespace: the default path is the sliding one and step_epr resolves the
+        # name through rdme.epr's own globals, so patching the package re-export is a no-op
+        # and the test would pass vacuously. Both modules are patched so the check holds
+        # whichever path runs.
+        mods = [rdme.epr, rdme.single]
+        real = [m.anchor_reverse_synaptic_term for m in mods]
+        for m in mods:
+            m.anchor_reverse_synaptic_term = compute_reverse_synaptic_term   # the old bug
         try:
-            bad = net2.entropy_trajectory(40)
+            bad = net2.entropy_trajectory(40, pb=False)
         finally:
-            mf.anchor_reverse_synaptic_term = real
+            for m, r in zip(mods, real):
+                m.anchor_reverse_synaptic_term = r
 
         assert torch.allclose(out["H_fwd_tot"], bad["H_fwd_tot"])    # forward half untouched
         assert not torch.allclose(out["H_rev_tot"], bad["H_rev_tot"])
@@ -143,7 +182,7 @@ def test_compute_joint_distribution():
     R = -torch.rand(Q, dtype=torch.float64) * 3
     beta, theta = 2.0, 0.3
 
-    got = mf.compute_joint_distribution(p, buff_S, R, beta, theta)
+    got = joint_distribution(p, buff_S, R, beta, theta, HZ, LAM0, DT)
     expected = _naive_joint_distribution(p, buff_S, R, beta, theta)
     assert torch.allclose(got, expected, atol=1e-10)
 
@@ -163,12 +202,12 @@ def test_joint_distribution_survives_saturated_hazards(dtype):
     buff_S = torch.full((K, Q), 50.0, dtype=dtype)
     R = torch.zeros(Q, dtype=dtype)
 
-    joint = mf.compute_joint_distribution(p, buff_S, R, beta=1e4, theta=0.0)
+    joint = joint_distribution(p, buff_S, R, 1e4, 0.0, HZ, LAM0, DT)
     assert torch.isfinite(joint).all()
     assert torch.allclose(joint.sum(dim=1), p, atol=1e-6)
 
     # float64 must keep the historical bound exactly, so this is not a silent numerics change
-    assert mf.hazard_clamp(torch.float64) == 1.0 - 1e-12
+    assert dyn.hazard_clamp(torch.float64) == 1.0 - 1e-12
 
 
 def _naive_epr(p_joint, S_fwd, S_rev, R, beta, theta):
@@ -195,11 +234,12 @@ def test_compute_epr():
     R = -torch.rand(Q, dtype=torch.float64) * 2
     beta, theta, alpha = 1.8, 0.2, 0.3
 
-    p_joint = mf.compute_joint_distribution(p, buff_S, R, beta, theta)
+    p_joint = joint_distribution(p, buff_S, R, beta, theta, HZ, LAM0, DT)
     S_fwd = buff_S[0]
-    S_rev = mf.compute_reverse_synaptic_term(buff_in, alpha)
+    S_rev = compute_reverse_synaptic_term(buff_in, alpha)
 
-    epr = mf.compute_epr(p_joint, S_fwd, S_rev, R, beta, theta)
+    epr = epr_from_joint(p_joint, _phi(S_fwd, R, beta, theta),
+                             _phi(S_rev, R, beta, theta))
     assert epr.shape == (3,)
 
     sigma, H_fwd, H_rev = epr
@@ -210,9 +250,8 @@ def test_compute_epr():
     assert torch.allclose(H_rev, expected_S_rev)
 
 
-def test_compute_epr_from_buffers():
-    # regression test on the wiring alone: compute_epr_from_buffers should be exactly the
-    # composition of the three functions above, nothing more
+def test_epr_from_joint_matches_epr_from_parts():
+
     Q = K = 6
     p = torch.rand(Q, dtype=torch.float64); p /= p.sum()
     buff_S = torch.randn(K, Q, dtype=torch.float64) * 0.5
@@ -220,17 +259,22 @@ def test_compute_epr_from_buffers():
     R = -torch.rand(Q, dtype=torch.float64) * 2
     alpha, beta, theta = 0.35, 2.0, 0.25
 
-    got = mf.compute_epr_from_buffers(p, buff_S, buff_in, R, alpha, beta, theta)
+    S_rev = anchor_reverse_synaptic_term(buff_in, alpha)
+    J = joint_distribution(p, buff_S, R, beta, theta, HZ, LAM0, DT)
+    phi_f, phi_r = _phi(buff_S[0], R, beta, theta), _phi(S_rev, R, beta, theta)
 
-    S_rev = mf.anchor_reverse_synaptic_term(buff_in, alpha)
-    P_joint = mf.compute_joint_distribution(p, buff_S, R, beta, theta)
-    expected = mf.compute_epr(P_joint, buff_S[0], S_rev, R, beta, theta)
-
+    # epr_from_joint is a thin wrapper that pulls four marginals out of the joint and hands
+    # them to epr_from_parts; the sliding path reaches the same four by recursion, so a slip
+    # in which marginal goes where would make the two paths disagree everywhere else. This
+    # pins the wrapper itself.
+    got = epr_from_joint(J, phi_f, phi_r)
+    expected = epr_from_parts(J.sum(dim=-1), J.sum(dim=-2), J[:, 0], J[0, :],
+                                  phi_f, phi_r)
     assert torch.equal(got, expected)
 
+    # and sigma is definitionally the difference of the two halves
+    assert torch.allclose(got[0], got[2] - got[1], rtol=0, atol=1e-15)
 
-# Sliding-state EPR
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 @contextlib.contextmanager
 def _float64():
@@ -253,8 +297,8 @@ def test_init_epr_state_matches_joint():
         R = -torch.rand(Q) * 3
         beta, theta = 2.0, 0.3
 
-        st = mf.init_epr_state(p, buff_S, R, beta, theta)
-        assert torch.allclose(st.G, mf.compute_joint_distribution(p, buff_S, R, beta, theta).sum(dim=0))
+        st = init_epr_state(p, buff_S, R, beta, theta, HZ, LAM0, DT)
+        assert torch.allclose(st.G, joint_distribution(p, buff_S, R, beta, theta, HZ, LAM0, DT).sum(dim=0))
 
         # V(n) is the survival of the age-n cohort over the first K-2 steps, and phi_end the
         # hazard it meets at the window edge -- both on clamped (lumped-bin) ages
@@ -289,17 +333,17 @@ def test_step_epr_matches_reference_over_long_run(Q):
 
         R, alpha, beta, theta = net.R[0], net.alpha_int[0], net.beta[0], net.theta[0]
         ref = torch.stack([
-            mf.compute_epr_from_buffers(P[t], torch.stack(Y[t:t + Q]), torch.stack(IN[t:t + Q]),
+            _epr_from_buffers(P[t], torch.stack(Y[t:t + Q]), torch.stack(IN[t:t + Q]),
                                         R, alpha, beta, theta)
             for t in range(T)])
 
-        idx = mf.make_epr_indices(Q, Q, 'cpu')
+        idx = make_epr_indices(Q, Q, 'cpu')
         buff_S, buff_in = torch.stack(Y[:Q]).clone(), torch.stack(IN[:Q]).clone()
-        state = mf.init_epr_state(P[0], buff_S, R, beta, theta)
+        state = init_epr_state(P[0], buff_S, R, beta, theta, HZ, LAM0, DT)
         p, got = P[0].clone(), []
         for t in range(T):
-            epr, p, state = mf.step_epr(p, state, buff_S, buff_in, idx, t,
-                                        R, alpha, beta, theta)
+            epr, p, state = step_epr(p, state, buff_S, buff_in, idx, t,
+                                         R, alpha, beta, theta, HZ, LAM0, DT)
             got.append(epr)
             assert torch.allclose(p, P[t + 1], atol=1e-12), f"marginal drifted at t={t}"
             # retire the row just consumed (time t); time t+Q takes over its slot
@@ -308,9 +352,6 @@ def test_step_epr_matches_reference_over_long_run(Q):
         assert torch.allclose(torch.stack(got), ref, atol=1e-10)
 
 
-# entropy_trajectory: RDMNetwork
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 def _small_network(Qm, seed=0):
     """ A small, fully deterministic RDMNetwork (construction draws no randomness beyond
     w, which is reseeded here) sized only for fast tests -- Qm is passed explicitly rather
@@ -318,11 +359,11 @@ def _small_network(Qm, seed=0):
     torch.manual_seed(seed)
     M = len(Qm)
     w = torch.randn(M, M) * 0.5
-    return mf.RDMNetwork(
+    return RDMNetwork(
         M=M, w=w, N=[1000] * M,
         E=[0.3] * M, beta=[3.0] * M, theta=[0.4] * M,
         tau_int=[3.0] * M, tau_ref=[5.0] * M, K_ref=[2.0] * M,
-        Qm=Qm,
+        Qm=Qm, hazard="synchronous",
     )
 
 
@@ -348,7 +389,7 @@ def _ground_truth_epr(model, T):
             Q = Qm[i]
             buff_S = torch.stack(Y[i][t:t + Q])
             buff_in = torch.stack(IN[i][t:t + Q])
-            epr = mf.compute_epr_from_buffers(
+            epr = _epr_from_buffers(
                 P[i][t], buff_S, buff_in, model.R[i], model.alpha_int[i],
                 model.beta[i], model.theta[i])
             out["sigma"][t, i], out["H_fwd"][t, i], out["H_rev"][t, i] = epr
@@ -362,7 +403,7 @@ def _ground_truth_epr(model, T):
 def test_entropy_trajectory_matches_ground_truth(Qm):
     T = 30
     ref = _ground_truth_epr(_small_network(Qm), T)
-    got = _small_network(Qm).entropy_trajectory(T)
+    got = _small_network(Qm).entropy_trajectory(T, pb=False)
     for k in ("sigma", "H_fwd", "H_rev"):
         assert torch.allclose(ref[k], got[k], atol=1e-6), f"{k} diverged from ground truth"
 
@@ -374,16 +415,13 @@ def test_entropy_trajectory_rewinds_live_state():
     T = 20
     Qm = [9, 4]
     stepped, peeked = _small_network(Qm), _small_network(Qm)
-    peeked.entropy_trajectory(T)
+    peeked.entropy_trajectory(T, pb=False)
     stepped.forward(T)
     for i in range(len(Qm)):
         assert torch.allclose(peeked.p[i], stepped.p[i], atol=1e-6)
         assert torch.allclose(peeked.S[i], stepped.S[i], atol=1e-6)
     assert torch.allclose(peeked.m, stepped.m, atol=1e-6)
 
-
-# entropy_trajectory: RDMNetworkBatch
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 def _small_batch(Qm, B, seed=1):
     """ A small RDMNetworkBatch whose B batch elements carry distinct parameters, so a bug
@@ -395,11 +433,11 @@ def _small_batch(Qm, B, seed=1):
     beta  = torch.linspace(2.5, 4.0, B).unsqueeze(1).expand(B, M).contiguous()
     E     = torch.linspace(0.1, 0.5, B).unsqueeze(1).expand(B, M).contiguous()
     const = lambda v: torch.full((B, M), float(v))
-    return mf.RDMNetworkBatch(
+    return RDMNetworkBatch(
         M=M, w=w, N=[1000] * M,
         E=E, beta=beta, theta=const(0.4),
         tau_int=const(3.0), tau_ref=const(5.0), K_ref=const(2.0),
-        Qm=Qm,
+        Qm=Qm, hazard="synchronous",
     )
 
 
@@ -409,13 +447,13 @@ def test_batch_entropy_trajectory_matches_independent_networks():
     batch_out = batch.entropy_trajectory(T, pb=False)
 
     for b in range(B):
-        single = mf.RDMNetwork(
+        single = RDMNetwork(
             M=batch.M, w=batch.w[b], N=batch.N,
             E=batch.E[b].tolist(), beta=batch.beta[b].tolist(), theta=batch.theta[b].tolist(),
             tau_int=batch.tau_int[b].tolist(), tau_ref=batch.tau_ref[b].tolist(),
             K_ref=batch.K_ref[b].tolist(), Qm=Qm,
         )
-        single_out = single.entropy_trajectory(T)
+        single_out = single.entropy_trajectory(T, pb=False)
         for k in ("sigma", "H_fwd", "H_rev"):
             # the batch pins its accumulators to float64 (see _out_device_kwargs) while the
             # single network follows the ambient default dtype, so compare values in a
@@ -427,123 +465,9 @@ def test_batch_entropy_trajectory_matches_independent_networks():
 @pytest.mark.parametrize("chunk", [1, 2])
 def test_batch_entropy_trajectory_chunk_matches_unchunked(chunk):
     T, Qm, B = 15, [8, 5], 4
-    ref = _small_batch(Qm, B).entropy_trajectory(T, pb=False)
-    got = _small_batch(Qm, B).entropy_trajectory(T, pb=False, chunk=chunk)
+    # chunk splits the (B, Q, K) joint, so it is the joint path that has anything to chunk;
+    # the sliding path never builds that object and ignores the argument
+    ref = _small_batch(Qm, B).entropy_trajectory(T, method="joint", pb=False)
+    got = _small_batch(Qm, B).entropy_trajectory(T, method="joint", pb=False, chunk=chunk)
     for k in ref:
         assert torch.allclose(ref[k], got[k], atol=1e-5), f"{k} diverged at chunk={chunk}"
-
-
-# Time origin shared by the mean-field and spin entropy trajectories
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-def test_entropy_trajectories_share_a_time_origin():
-    """ All three entropy_trajectory variants must report index 0 for the state they are
-    called on, so a mean-field run and a spin run of the same model overlay step for step.
-    The spin ones used to discard a lead-in first (chunked: a burn_in that defaulted to
-    overlap = 512), which offset the curves by that many steps -- invisible in the
-    equilibration plots, which use trajectory() and have no lead-in, and easy to misread as
-    noise in an oscillatory regime where the offset aliases against the period. That lead-in
-    is gone: equilibrating is forward()'s job, so there is nothing left to get out of sync. """
-    from rdme.spin_model import SpinIsingModel
-
-    torch.manual_seed(3)
-    dt = 0.2
-    args = dict(J=4 / dt, E=1, beta=30, theta=1, tau_int=12, tau_ref=3, K_ref=0, dt=dt)
-    T = 60
-
-    def spin():
-        torch.manual_seed(3)
-        m = SpinIsingModel(N=2000, ic="silent", device="cpu",
-                           **{k: v for k, v in args.items()})
-        m.forward(50)
-        return m
-
-    # index 0 of each spin variant is the activity of the state it was called on
-    for run in (lambda m: m.entropy_trajectory(T, buffer=20),
-                lambda m: m.entropy_trajectory_chunked(T, chunk=64, overlap=16,
-                                                       check_overlap=False)):
-        m = spin()
-        m0 = m.activity().item()
-        assert run(m)["m_tot"][0].item() == pytest.approx(m0, abs=1e-6)
-
-    # and the mean field agrees: its index 0 is the overlap it was sitting at
-    net = mf.RDMIsingModel(**args, eps=0.01, device="cpu")
-    net.forward(50)
-    p0 = net.m[0].item()
-    assert net.entropy_trajectory(T)["m_tot"][0].item() == pytest.approx(p0, abs=1e-12)
-
-    # and no lead-in knob survives anywhere to reintroduce a silent offset
-    import inspect
-    for fn in (SpinIsingModel(N=1, ic="silent", device="cpu", **args).entropy_trajectory,
-               SpinIsingModel(N=1, ic="silent", device="cpu", **args).entropy_trajectory_chunked,
-               net.entropy_trajectory):
-        assert "burn_in" not in inspect.signature(fn).parameters
-
-
-def test_spin_epr_pairs_both_halves_of_the_same_transition():
-    """ sigma[t] is a property of the transition t -> t+1, per eq. (total-epr): the forward
-    half emits s[t+1] from hf[t], and the reverse half emits s[t] from hr[t+1]. The spin model
-    used to pair hr[t+2] with s[t+1] -- matching on the realized spike rather than on the bond
-    -- which sums to the same total EPR but shifts H_rev one step against H_fwd. """
-    from rdme.spin_model import SpinIsingModel
-
-    torch.manual_seed(7)
-    dt = 0.2
-    T = 80
-    m = SpinIsingModel(N=3000, J=4 / dt, E=1, beta=30, theta=1, tau_int=12, tau_ref=3,
-                       K_ref=0, dt=dt, device="cpu", ic="silent")
-    m.forward(400)
-    out = m.entropy_trajectory(T, buffer=60, s=True, fields=True)
-
-    softplus = torch.nn.functional.softplus
-    s_t = out["s"].float()                      # s[t], index-aligned with the report
-
-    # the reverse half is emitted against s[t] -- this is the pairing under test
-    H_rev = (-s_t * out["hr"] + softplus(out["hr"])).mean(dim=1)
-    assert torch.allclose(H_rev, out["H_rev"].float(), atol=1e-5)
-
-    # the forward half against s[t+1], which is s_t shifted by one
-    H_fwd = (-s_t[1:] * out["hf"][:-1] + softplus(out["hf"][:-1])).mean(dim=1)
-    assert torch.allclose(H_fwd, out["H_fwd"][:-1].float(), atol=1e-5)
-
-    # pairing the reverse half against s[t+1] instead is the old convention, and it is
-    # a genuinely different per-step series -- so the assertion above has teeth
-    old = (-s_t[1:] * out["hr"][:-1] + softplus(out["hr"][:-1])).mean(dim=1)
-    assert not torch.allclose(old, out["H_rev"][:-1].float(), atol=1e-3)
-
-    # identical up to float32 rounding: both come from the same ent_f/ent_r reductions
-    assert torch.allclose(out["sigma"], out["H_rev"] - out["H_fwd"], atol=1e-6)
-
-
-def test_spin_epr_chunked_matches_the_windowed_reference():
-    """ The chunked estimator is the same quantity as the plain one, so both had to take the
-    transition pairing together; a slip in either index would show up right here. """
-    from rdme.spin_model import SpinIsingModel
-
-    dt = 0.2
-    T = 60
-    kw = dict(N=4000, J=4 / dt, E=1, beta=30, theta=1, tau_int=12, tau_ref=3,
-              K_ref=0, dt=dt, device="cpu", ic="silent")
-
-    # both runs have to sample the SAME trajectory to be compared step by step, and the
-    # draws depend on the default dtype -- so pin it rather than inherit it from whichever
-    # test ran last
-    old_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(torch.float32)
-    try:
-        torch.manual_seed(5)
-        a = SpinIsingModel(**kw); a.forward(400)
-        torch.manual_seed(99)
-        ref = a.entropy_trajectory(T, buffer=80)
-
-        torch.manual_seed(5)
-        b = SpinIsingModel(**kw); b.forward(400)
-        torch.manual_seed(99)
-        got = b.entropy_trajectory_chunked(T, chunk=80, overlap=80, check_overlap=False)
-    finally:
-        torch.set_default_dtype(old_dtype)
-
-    # the trajectories are identical, so any gap is an index slip, not sampling noise
-    assert torch.allclose(ref["m_tot"].double(), got["m_tot"].double(), atol=1e-10)
-    for k in ("sigma", "H_fwd", "H_rev"):
-        assert torch.allclose(ref[k].double(), got[k].double(), atol=1e-4), k

@@ -1,7 +1,7 @@
 import torch
 import tqdm
 
-import rdme.shared as shrd
+import rdme.kernels as krn
 
 # Auxiliary functions
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -74,9 +74,9 @@ class SpinModel:
         self.theta, self.beta = theta, beta
         self.Nm = Nm
         
-        a_int = shrd.tau2alpha(tau_int, dt)
+        a_int = krn.tau2alpha(tau_int, dt)
         self.tau_int, self.a_int = tau_int, a_int
-        a_ref = shrd.tau2alpha(tau_ref, dt)
+        a_ref = krn.tau2alpha(tau_ref, dt)
         self.K_ref, self.tau_ref, self.a_ref = K_ref, tau_ref, a_ref
         
         self.device = w.device
@@ -235,6 +235,25 @@ class SpinModel:
         self.R[fired] = -self.K_ref_net[fired] # set refractory state to K_ref if fired
 
     @torch.inference_mode()
+    def pop_mean_matrix(self, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        """ (N, M) matrix whose columns are normalized population indicators, so
+        x @ pop_mean_matrix() averages a per-neuron quantity over each population.
+        The N-weighted sum of those columns is the plain all-neuron mean, which is how
+        the per-population and _tot entries of an entropy_trajectory agree. """
+        return (self.pop_expand / self.pop_sizes).t().to(dtype)
+
+    @torch.inference_mode()
+    def _snapshot(self) -> tuple[torch.Tensor, ...]:
+        """ The full evolving state: update() reads and writes exactly these four. """
+        return (self.s.clone(), self.n.clone(), self.S.clone(), self.R.clone())
+
+    @torch.inference_mode()
+    def _restore(self, snap: tuple[torch.Tensor, ...]) -> None:
+        """ Rewind to a snapshot, so a method that had to run past its reported window
+        leaves the model where the window ends rather than where the lookahead does. """
+        self.s, self.n, self.S, self.R = snap
+
+    @torch.inference_mode()
     def forward(self, T: int) -> None:
         """ Thermalize the system for T steps. """
         for _ in range(T):
@@ -291,6 +310,13 @@ class SpinModel:
         shifts H_rev one step against H_fwd, which shows up as a one-step offset in
         per-step plots and against RDMNetwork.entropy_trajectory.
 
+
+        Returns the same dict contract as RDMNetwork.entropy_trajectory: m (T, M)
+        per-population activity and m_tot (T,) its network aggregate;
+        sigma/H_fwd/H_rev (T, M) the per-population entropy-production decomposition
+        (sigma = H_rev - H_fwd) and sigma_tot/H_fwd_tot/H_rev_tot (T,) the same
+        quantities over the whole network.
+
         sigma[t] is the *sampled* log-ratio ln p(Gamma)/p(Gamma^dagger) per
         neuron per step. It fluctuates in sign; only its average is the EP
         rate. Do not substitute sigmoid(hf) for the realized spike -- hr
@@ -303,7 +329,9 @@ class SpinModel:
         state. `buffer` is the TAIL the reverse recursion needs, not a lead-in --
         nothing is discarded at the front, so equilibrate with forward() beforehand.
 
-        Runs T + buffer steps: analysis window | tail.
+        Runs T + buffer steps: analysis window | tail. The model is rewound onto the
+        end of the window afterwards, so it is left at index T rather than out on the
+        tail -- fdist() is then comparable against a mean-field p(n) run for the same T.
         """
         if buffer < 2:
             raise ValueError("buffer must be >= 2; in practice use several "
@@ -329,6 +357,9 @@ class SpinModel:
             I[t] = self.total_input()
             if fdist: P_fwd[t] = self.fdist(Q)
             self.update()
+            # the tail past the reported window is lookahead for the reverse recursion,
+            # not simulation the caller asked for -- remember where the window ends
+            if t + 1 == T: end_state = self._snapshot()
 
         S_rev = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
         R_rev = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
@@ -353,11 +384,20 @@ class SpinModel:
         ent_f = -s_next * hf_a + F.softplus(hf_a)
         ent_r = -s_cur  * hr_a + F.softplus(hr_a)
 
+        # same dict contract as RDMNetwork.entropy_trajectory: per-population (T, M)
+        # arrays, plus the N-weighted network aggregates under the _tot suffix
+        pm = self.pop_mean_matrix(ent_f.dtype)        # (N, M)
+        H_fwd_pop, H_rev_pop = ent_f @ pm, ent_r @ pm
+
         out = {
-            "m_tot":  s_trj[lo:hi].mean(dim=1, dtype=torch.float32),
-            "sigma": (ent_r - ent_f).mean(dim=1),
-            "H_fwd": ent_f.mean(dim=1),
-            "H_rev": ent_r.mean(dim=1),
+            "m":         s_cur @ pm,
+            "m_tot":     s_cur.mean(dim=1),
+            "sigma":     H_rev_pop - H_fwd_pop,
+            "H_fwd":     H_fwd_pop,
+            "H_rev":     H_rev_pop,
+            "sigma_tot": (ent_r - ent_f).mean(dim=1),
+            "H_fwd_tot": ent_f.mean(dim=1),
+            "H_rev_tot": ent_r.mean(dim=1),
         }
         if kur: out["kur"] = kur_buf[lo:hi]
         if ent: out["ent"] = ent_buf[lo:hi]
@@ -367,6 +407,11 @@ class SpinModel:
         if fields:
             out["hf"] = hf_a
             out["hr"] = hr_a
+
+        # rewind off the tail, so the live state matches reported index T -- the same
+        # contract RDMNetwork.entropy_trajectory honours, and what makes a post-hoc
+        # fdist() comparable against the mean field's p(n)
+        self._restore(end_state)
 
         return {k: v.cpu() for k, v in out.items()}
 
@@ -394,11 +439,18 @@ class SpinModel:
         Time origin: index 0 is the state this is called on, matching
         SpinModel.entropy_trajectory and RDMNetwork.entropy_trajectory, so the three
         line up step-for-step. Nothing is discarded at the front -- equilibrate with
-        forward() before the call.
+        forward() before the call -- and the model is rewound onto the end of the window
+        afterwards, so it is left at index T rather than out past the lookahead.
 
         Trajectories are stored in `store_dtype` (float32 is ample -- the
         estimator is sampling-noise dominated) while all reductions accumulate
         in float64.
+
+        Returns the same dict contract as RDMNetwork.entropy_trajectory: m (T, M)
+        per-population activity and m_tot (T,) its network aggregate;
+        sigma/H_fwd/H_rev (T, M) the per-population entropy-production decomposition
+        (sigma = H_rev - H_fwd) and sigma_tot/H_fwd_tot/H_rev_tot (T,) the same
+        quantities over the whole network.
         """
         if overlap < 4:
             raise ValueError("overlap must be >= 4")
@@ -416,14 +468,28 @@ class SpinModel:
         I_win = torch.zeros((W, N), device=dev, dtype=store_dtype)
         if fdist: fd_win  = torch.zeros((W, Q), device=dev, dtype=store_dtype)
 
+        pm = self.pop_mean_matrix(acc)                          # (N, M)
         out = {k: torch.zeros(T, device=dev, dtype=acc)
-               for k in ("m_tot", "sigma", "H_fwd", "H_rev")}
+               for k in ("m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot")}
+        out.update({k: torch.zeros(T, self.M, device=dev, dtype=acc)
+                    for k in ("m", "sigma", "H_fwd", "H_rev")})
         if fdist: out["fdist"] = torch.zeros((T, Q), device=dev, dtype=store_dtype)
         if s:     out["s"]   = torch.zeros((T, N), device=dev, dtype=torch.int8)
         if pot:   out["pot"] = torch.zeros((T, N), device=dev, dtype=store_dtype)
         if fields:
             out["hf"] = torch.zeros((T, N), device=dev, dtype=store_dtype)
             out["hr"] = torch.zeros((T, N), device=dev, dtype=store_dtype)
+
+        steps_done, end_state = 0, None
+
+        def advance():
+            """ One update, remembering the state at reported time T: the windows run past
+            the requested horizon (a full W on the first, then chunk at a time), and that
+            overshoot is lookahead, not simulation the caller asked for. """
+            nonlocal steps_done, end_state
+            self.update()
+            steps_done += 1
+            if steps_done == T: end_state = self._snapshot()
 
         def record(j):
             s_win[j] = self.s
@@ -441,14 +507,14 @@ class SpinModel:
 
             if first:
                 for j in range(W):
-                    record(j); self.update()
+                    record(j); advance()
                 first = False
             else:
                 for buf in (s_win, S_win, R_win, I_win):
                     buf[:overlap].copy_(buf[chunk:])
                 if fdist: fd_win[:overlap].copy_(fd_win[chunk:])
                 for j in range(overlap, W):
-                    record(j); self.update()
+                    record(j); advance()
 
             n_emit = min(chunk, T - emitted)
 
@@ -479,10 +545,17 @@ class SpinModel:
                     lp_f = sn * hf - F.softplus(hf)
                     lp_r = sc * hr - F.softplus(hr)
 
-                    out["sigma"][i] = (lp_f - lp_r).mean(dtype=acc)
-                    out["H_fwd"][i] = (-lp_f).mean(dtype=acc)
-                    out["H_rev"][i] = (-lp_r).mean(dtype=acc)
+                    out["sigma_tot"][i] = (lp_f - lp_r).mean(dtype=acc)
+                    out["H_fwd_tot"][i] = (-lp_f).mean(dtype=acc)
+                    out["H_rev_tot"][i] = (-lp_r).mean(dtype=acc)
                     out["m_tot"][i]     = s_win[k].mean(dtype=acc)
+
+                    # one stacked matvec for the three per-population reductions
+                    pops = torch.stack([sc, -lp_f, -lp_r]).to(acc) @ pm   # (3, M)
+                    out["m"][i]     = pops[0]
+                    out["H_fwd"][i] = pops[1]
+                    out["H_rev"][i] = pops[2]
+                    out["sigma"][i] = pops[2] - pops[1]
 
                     if s:      out["s"][i]     = s_win[k]
                     if pot:    out["pot"][i]   = S_win[k] + R_win[k]
@@ -492,6 +565,9 @@ class SpinModel:
             emitted += n_emit
             pbar.update(n_emit)
         pbar.close()
+
+        # rewind off the lookahead, so the live state matches reported index T
+        self._restore(end_state)
 
         return {k: v.cpu() for k, v in out.items()}
 
@@ -554,8 +630,11 @@ def SpinWilsonCowan(
     """ Construct a Wilson-Cowan SpinModel. """
 
     M = 2
-    N_I = int(N * (1 - E_ratio))
-    N_E = N - N_I
+    # split on E_ratio directly, as RDMWilsonCowan does: going through (1 - E_ratio)
+    # rounds the wrong way for ratios with no exact binary form (1 - 0.8 = 0.19999...,
+    # so N=4000 lands on 3201/799 instead of 3200/800)
+    N_E = int(E_ratio * N)
+    N_I = N - N_E
     Nm = torch.tensor([N_E, N_I], device=device)
     # w_XY is source-first (X -> Y); the stored matrix is target-first (row = target)
     w = torch.tensor([[w_EE, w_IE], [w_EI, w_II]], device=device, dtype=torch.float32)

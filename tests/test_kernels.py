@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-import rdme.shared as shrd
-from rdme.mean_field import RDMIsingModel
+import rdme.kernels as krn
+from rdme.single import RDMIsingModel
 from rdme.spin_model import SpinIsingModel
 
 
@@ -17,7 +17,8 @@ def test_refractory_kernel_matches_spin_model(dt):
     tau_ref, K_ref, tau_int = 3.0, 2.0, 12.0
 
     sm = SpinIsingModel(1, 0.0, 0.0, 1.0, 0.0, tau_int, tau_ref, K_ref, dt=dt, ic="silent")
-    mf = RDMIsingModel(0.0, 0.0, 1.0, 0.0, tau_int, tau_ref, K_ref, dt=dt)
+    mf = RDMIsingModel(0.0, 0.0, 1.0, 0.0, tau_int, tau_ref, K_ref, dt=dt,
+                       hazard="synchronous")
 
     n = torch.arange(mf.Qm[0], dtype=mf.R[0].dtype)
     eta_spin = -K_ref * (1.0 - sm.a_ref.item()) ** n
@@ -28,11 +29,11 @@ def test_refractory_kernel_matches_spin_model(dt):
 def test_refractory_kernel_deltaT_scaling():
     """ deltaT rescales the age axis: R(n; deltaT) == R(n*deltaT; 1). """
     Q, K, tau_r, dt = 50, 2.0, 3.0, 0.2
-    got = shrd.refractory_kernel(Q, K, tau_r, dt)
-    expected = shrd.refractory_kernel(Q, K, tau_r / dt)
+    got = krn.refractory_kernel(Q, K, tau_r, dt)
+    expected = krn.refractory_kernel(Q, K, tau_r / dt)
     assert torch.allclose(got, expected)
     # default is the dt=1 kernel, unchanged
-    assert torch.allclose(shrd.refractory_kernel(Q, K, tau_r),
+    assert torch.allclose(krn.refractory_kernel(Q, K, tau_r),
                           -K * torch.exp(-torch.arange(Q) / tau_r))
 
 
@@ -44,12 +45,18 @@ def test_stationary_activity_matches_spin_model():
     tau_int, tau_ref, K_ref = 12.0, 3.0, 2.0
 
     sm = SpinIsingModel(N, J / dt, E, beta, theta, tau_int, tau_ref, K_ref, dt=dt, ic="silent")
-    mf = RDMIsingModel(J / dt, E, beta, theta, tau_int, tau_ref, K_ref, dt=dt)
+    # srm takes J in physical units; the spin model does not, hence the /dt there only
+    mf = RDMIsingModel(J, E, beta, theta, tau_int, tau_ref, K_ref, dt=dt,
+                       hazard="synchronous")
     sm.forward(6000)
     mf.forward(6000)
 
     m_sm = torch.stack([(sm.update(), sm.activity())[1] for _ in range(2000)]).mean()
-    m_mf = torch.stack([(mf.update(), mf.activity())[1] for _ in range(2000)]).mean()
+    # srm's activity() is a RATE (m/dt), while the spin model's is the per-bin overlap, so
+    # one of the two has to be converted before they are comparable. This is the difference
+    # that makes the srm numbers dt-invariant and the spin model's not.
+    r_mf = torch.stack([(mf.update(), mf.activity())[1] for _ in range(2000)]).mean()
+    m_mf = r_mf * dt
 
     # finite-N sampling noise on m_sm is ~1e-3 relative at N=2e4
     assert m_mf == pytest.approx(m_sm.item(), rel=0.02)

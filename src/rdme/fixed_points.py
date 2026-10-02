@@ -4,29 +4,167 @@ from typing import Callable
 
 import torch
 
-""" Model-agnostic machinery for locating and classifying fixed points.
+from rdme.hazards import Hazard
+from rdme.dynamics import compute_total_input, hazard_clamp
 
-Nothing here knows about the RDM model: every entry point takes a residual
-callable G and works on whatever vector space G is defined on. The model-side
-half -- how to build G from the mean-field equations, and how to lift a root
-back to a full (p, S) state -- lives in rdme.mean_field.
+""" Fixed points: the closed forms at stationarity, the model's overlap map, and the generic
+root finders that locate its roots.
 
-Two solvers are provided, mirroring App. "Root finding": `bracket_roots` for
-scalar problems (M=1), where a sign scan over an interval is exhaustive up to
-the grid resolution, and `newton_roots` for the general case (M>1), where roots
-are collected from many starting points. Both return deduplicated roots, and
-`jacobian_eigvals` / `spectral_radius` classify them from a state-space map.
+Organised by topic rather than by how model-specific each piece is, so everything about a fixed
+point is in one place. The boundary still matters and is marked by the section headers below:
+the solvers know nothing about this model -- they take a residual callable and a tensor, and
+are tested against cubics and closed-form roots -- while the maps above them evaluate a hazard.
 
-Residual convention: G(m) = m - F(m), with G taking and returning a (M,) tensor
-(a length-1 vector for M=1, not a bare scalar). It may take further positional
-arguments, which the Newton path carries alongside m with a matching leading
-axis: that is how a whole parameter sweep is solved in one call, with one Newton
-trajectory per (parameter set, starting point) pair. Differentiation and root
-finding are always with respect to the first argument only.
-"""
+The closed forms are themselves kernel-independent and take the hazard as data: the field never
+sees it, and the survival and the age distribution take fprobs as an argument. Only the two maps
+take a Hazard. """
+
+
+# Closed forms at stationarity
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# At a fixed point the input is constant, so the whole age-resolved state follows from it: the
+# synaptic term unrolls to a geometric sum, the hazard is then a pure function of age, and the
+# stationary age distribution is its normalized survival.
+
+def compute_stationary_forward_field(
+        I: torch.Tensor,               # (...) constant total input to the population
+        alpha: float | torch.Tensor,   # integration kernel scaling factor
+        Q: int,                        # number of age bins
+        ) -> torch.Tensor:             # (..., Q) S_n at constant input
+    """ The synaptic term at a fixed point, in closed form.
+
+    With I frozen, S_n = alpha*I + (1-alpha)*S_{n-1} and S_0 = 0 unrolls to the geometric
+    sum S_n = I*[1 - (1-alpha)^n]: the same saturating profile an isolated neuron has under
+    a constant external drive, with the drive replaced by the self-consistent input.
+
+    This is the exact fixed point of update_synaptic_term, boundary bin included -- that
+    update shifts rather than lumps, so its last bin is just the recursion at n = Q-1. """
+    I = torch.as_tensor(I)
+    decay = torch.as_tensor(1.0 - alpha, device=I.device, dtype=I.dtype)
+    n = torch.arange(Q, device=I.device, dtype=I.dtype)
+    return I.unsqueeze(-1) * (1.0 - decay.unsqueeze(-1) ** n)
+
+
+def compute_stationary_survival(fprobs: torch.Tensor,   # (..., Q) age-resolved hazard
+                     log: bool = False,
+                     ) -> torch.Tensor:      # (..., Q) survival from age 0
+    """ S_0(n) = prod_{j<n} (1 - Phi_j), with the empty product S_0(0) = 1.
+
+    Accumulated in log space for the same reason the EPR path is: at large beta the hazard
+    saturates and a long product of (1-Phi) underflows to zero, which would send the
+    normalization of the stationary distribution to a ratio of zeros. The hazard is clamped
+    below one first, with a dtype-dependent bound (see hazard_clamp). """
+    log1m = torch.log1p(-fprobs.clamp(max=hazard_clamp(fprobs.dtype)))
+    cum = torch.cumsum(log1m[..., :-1], dim=-1)
+    log_surv = torch.cat([torch.zeros_like(cum[..., :1]), cum], dim=-1)
+    return log_surv if log else torch.exp(log_surv)
+
+
+def compute_stationary_age_distribution(
+        fprobs: torch.Tensor,                      # (..., Q) age-resolved hazard
+        ) -> tuple[torch.Tensor, torch.Tensor]:    # (..., Q) p*, (...) m*
+    """ Stationary age distribution and firing rate at a frozen, age-resolved hazard.
+
+    Iterating the aging branch of update_age_distribution gives p*(n) = p*(0) * S_0(n) on
+    the interior bins, while the lumped bin balances its own outflow against the inflow
+    from n = Q-2, giving p*(Q-1) = p*(0) * S_0(Q-1) / Phi_{Q-1}: the exact resummation of
+    the geometric tail the truncation cuts off, not an approximation of it. Normalization
+    then fixes p*(0), which is the firing rate m* itself, since births equal spikes.
+
+    The reset branch is not an extra condition -- sum_n p*(n) Phi_n = m* holds identically
+    by telescoping -- so this single pass is the whole stationary solution. In the
+    untruncated limit the boundary term drops and m* becomes the renewal firing rate
+    1/sum_n S_0(n) of an isolated neuron. """
+    surv = compute_stationary_survival(fprobs)
+    tail = surv[..., -1] / fprobs[..., -1]                       # lumped bin, geometric tail
+    m = 1.0 / (surv[..., :-1].sum(dim=-1) + tail)
+    p = torch.cat([surv[..., :-1], tail.unsqueeze(-1)], dim=-1) * m.unsqueeze(-1)
+    return p, m
+
+
+def fp_guess_lattice(M: int,
+                     n_per_axis: int = 5,
+                     lo: float = 0.0,
+                     hi: float = 1.0,
+                     device: str | torch.device = 'cpu',
+                     ) -> torch.Tensor:    # (n_per_axis**M, M) starting points
+    """ A regular lattice of Newton starting points covering the overlap box [lo, hi]^M.
+
+    The endpoints are shrunk inwards by half a cell: m = 0 and m = 1 are the edges of the
+    physical range, where the hazard is most nearly degenerate, and a Newton step from
+    exactly there tends to be thrown straight back out by the clamp. n_per_axis**M grows
+    fast, but M is one or two for every model in this module. """
+    step = (hi - lo) / (2 * n_per_axis)
+    axis = torch.linspace(lo + step, hi - step, n_per_axis, device=device)
+    return torch.stack(torch.meshgrid(*([axis] * M), indexing='ij'), dim=-1).reshape(-1, M)
+
+
+# The model's maps
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# Composing the two closed forms above gives the overlap map F, whose roots m = F(m) are the
+# fixed points -- one O(sum_a Q^a) pass per evaluation, no time integration.
+
+def fp_overlap_map(m: torch.Tensor,        # (M,) trial overlaps
+                   w: torch.Tensor,        # (M, M)
+                   E: torch.Tensor,        # (M,)
+                   alpha: torch.Tensor,    # (M,)
+                   beta: torch.Tensor,     # (M,)
+                   theta: torch.Tensor,    # (M,)
+                   R: list[torch.Tensor],  # M tensors, (Qm[i],)
+                   hazard: Hazard,
+                   lam0: float,
+                   dt: float,
+                   ) -> torch.Tensor:      # (M,) F(m)
+    """ One evaluation of the overlap map F: trial overlaps -> stationary overlaps.
+
+    The hazard-parametrised counterpart of mean_field.fp_overlap_map. Only the hazard step
+    differs: compute_stationary_forward_field and compute_stationary_age_distribution are
+    reused from there unchanged, because both already take the hazard as data -- the first
+    never sees it, and the second takes fprobs as an argument.
+
+    Note this works in overlaps m, not rates, so that the residual lives on the same scale as
+    the generic Newton and bracketing routines below (which clamp to
+    [0, 1]) applies unchanged. Rates are m/dt throughout the class API. """
+    I = compute_total_input(m / dt, w, E)       # w is unscaled here, so feed it the rate
+    rates = []
+    for i, R_i in enumerate(R):
+        S_i = compute_stationary_forward_field(I[..., i], alpha[..., i], R_i.shape[-1])
+        h_i = S_i + R_i - theta[..., i, None]
+        phi_i = hazard.phi(h_i, beta[..., i, None], lam0, dt)
+        rates.append(compute_stationary_age_distribution(phi_i)[1])
+    return torch.stack(rates, dim=-1)
+
+
+def fp_state(m: torch.Tensor,
+             w: torch.Tensor,
+             E: torch.Tensor,
+             alpha: torch.Tensor,
+             beta: torch.Tensor,
+             theta: torch.Tensor,
+             R: list[torch.Tensor],
+             hazard: Hazard,
+             lam0: float,
+             dt: float,
+             ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """ The full stationary state (p, S) implied by a set of overlaps. """
+    I = compute_total_input(m / dt, w, E)
+    p_out, S_out = [], []
+    for i, R_i in enumerate(R):
+        S_i = compute_stationary_forward_field(I[..., i], alpha[..., i], R_i.shape[-1])
+        h_i = S_i + R_i - theta[..., i, None]
+        phi_i = hazard.phi(h_i, beta[..., i, None], lam0, dt)
+        p_out.append(compute_stationary_age_distribution(phi_i)[0])
+        S_out.append(S_i)
+    return p_out, S_out
+
 
 # Root finding: Newton
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# Everything from here down is model-agnostic: it takes a residual G(m) and never asks what
+# produced it. Residual convention: G(m) = m - F(m), with G taking and returning an (M,) tensor.
 
 def newton_step(residual: Callable[..., torch.Tensor],
                 m: torch.Tensor,             # (M,) current iterate
@@ -225,7 +363,7 @@ def spectral_radius(eigvals: torch.Tensor) -> torch.Tensor:
     return eigvals.abs().max(dim=-1).values
 
 
-# Auxiliary functions
+# Auxiliary
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 def deduplicate(roots: torch.Tensor,       # (R, M)
