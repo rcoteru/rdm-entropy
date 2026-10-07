@@ -27,16 +27,16 @@ if run_sim:
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    J       = torch.linspace(0, 3, 101)
+    J       = torch.linspace(0, 17.0, 101)
     E       = torch.linspace(0.5, 1.5, 101)
     beta    = 30.0
     theta   = 1.0
     tau_int = 20.0
     tau_ref = 3.0
     K_ref   = 0.0
-    dt      = 0.2
+    dt      = 0.5
 
-    equi  = 20000
+    equi  = 10000
     steps = 10000
     chunk_size = 1024
 
@@ -50,9 +50,9 @@ if run_sim:
         # units of steps, not ms. That predates this port and is preserved exactly: J/dt with
         # dt defaulting to 1.0 reproduces the previous numbers bit for bit. Passing J and
         # dt=dt instead would be the consistent version, and would change the results.
-        mf = RDMIsingModelBatch(J=J/dt, E=E, beta=beta, theta=theta,
+        mf = RDMIsingModelBatch(J=J, E=E, beta=beta, theta=theta,
                                 tau_int=tau_int, tau_ref=tau_ref, K_ref=K_ref,
-                                device=device, hazard="synchronous")
+                                dt=dt, dt0=dt, device=device, hazard="async", eps=0.01)
         print(f"Running {mf.B} mean-fields. Grid axes: "
               f"{ {k: len(v) for k, v in mf.grid_axes.items()} }.")
         print(f"Batch steps: {equi+steps} per mean-field. ({equi} equilibration + {steps} recording)")
@@ -76,6 +76,8 @@ if run_sim:
 
 if run_plot:
 
+    hlp.pub_style()
+
     for f in (CACHE_TRAJ_FILE, CACHE_SIM_FILE):
         if not f.exists():
             raise FileNotFoundError(f"{f} not found. Run simulation first.")
@@ -83,9 +85,10 @@ if run_plot:
     traj = torch.load(CACHE_TRAJ_FILE, weights_only=True)
     mf   = RDMNetworkBatch.load(CACHE_SIM_FILE, device="cpu")
 
-    # grid_axes holds the vectors as they were passed in (J was pre-scaled by 1/dt)
+    # grid_axes holds the vectors as they were passed in J, need to multiply by dt 
+    # to get the physical units for plotting
     dt   = traj["dt"].item()
-    J, E = mf.grid_axes["J"] * dt, mf.grid_axes["E"]
+    J, E = mf.grid_axes["J"]*dt, mf.grid_axes["E"]
     extent = (E.min().item(), E.max().item(), J.min().item(), J.max().item())
 
     # trajectories already come back grid-shaped: (n_J, n_E, T)
@@ -141,32 +144,5 @@ if run_plot:
             ax.fill_between(E, sigma_avg[idx] - sigma_std[idx], sigma_avg[idx] + sigma_std[idx], alpha=0.3)
         ax.set_xlabel('E (External Input)'); ax.set_ylabel('Mean Sigma')
         ax.legend(); ax.grid()
-
-    if True: # full (J, E) maps: activity, sigma, forward/reverse entropy
-
-        fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, sharex=True, figsize=(12, 12))
-
-        ax1.set_title('Activity')
-        im1 = ax1.imshow(m_avg, extent=extent, origin='lower', aspect='auto')
-        fig.colorbar(im1, ax=ax1, label='Mean Activity')
-        ax1.grid()
-
-        ax2.set_title('Sigma')
-        im2 = ax2.imshow(sigma_avg, extent=extent, origin='lower', aspect='auto')
-        fig.colorbar(im2, ax=ax2, label='Mean Sigma')
-        ax2.grid()
-
-        ax3.set_title('Forward Entropy')
-        H_fwd_avg = traj["H_fwd_tot"].mean(dim=-1)
-        im3 = ax3.imshow(H_fwd_avg, extent=extent, origin='lower', aspect='auto')
-        fig.colorbar(im3, ax=ax3, label='Mean Forward Entropy')
-        ax3.grid()
-
-        ax4.set_title('Reverse Entropy')
-        H_rev_avg = traj["H_rev_tot"].mean(dim=-1)
-        im4 = ax4.imshow(H_rev_avg, extent=extent, origin='lower', aspect='auto')
-        fig.colorbar(im4, ax=ax4, label='Mean Reverse Entropy')
-        ax4.set_xlabel('E (External Input)')
-        ax4.grid()
 
     plt.show()

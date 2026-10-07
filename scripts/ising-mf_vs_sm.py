@@ -18,14 +18,14 @@ torch.set_default_dtype(torch.float64)
 N = 40000
 Q = 100
 
-# integration-based oscillatory regime
-J = 4    # coupling strength; adjust to test different regimes
-E = 1    # external field; adjust to test different regimes
-beta = 30
-theta = 1
-tau_int = 12
-tau_ref = 3
-K_ref = 0
+# # integration-based oscillatory regime
+# J = 4    # coupling strength; adjust to test different regimes
+# E = 1    # external field; adjust to test different regimes
+# beta = 30
+# theta = 1
+# tau_int = 12
+# tau_ref = 3
+# K_ref = 0
 
 # refraction-based oscillatory regime
 # J = 4   # coupling strength; adjust to test different regimes
@@ -36,22 +36,33 @@ K_ref = 0
 # tau_ref = 3
 # K_ref = 4
 
+# ??? 
+J = 18   # coupling strength; adjust to test different regimes
+E = 1   # external field; adjust to test different regimes
+beta = 30
+theta = 1
+tau_int = 20
+tau_ref = 3
+K_ref = 0
+
+
 steps1 = 5000
 steps2 = 10000
-dt = 0.05
+hazard = "escape" # sync, async or escape
+dt = 0.5
 
 # Model initialization
 # ~~~~~~~~~~~~~~~~~~~~
 torch.set_default_dtype(torch.float64)
 
-sm = SpinIsingModel(N, J/dt, E, beta, theta, 
-            tau_int, tau_ref=tau_ref, K_ref=K_ref, 
-            dt=dt, device=device, ic="silent")
+# Both models take J in physical units -- no /dt anywhere, both build the input from the
+# rate. hazard="synchronous" is the sigmoid of the original model.
 
-# srm takes J in physical units -- no /dt here, the input is built from the rate.
-# hazard="synchronous" is the sigmoid of the original model.
+sm = SpinIsingModel(N, J, E, beta, theta, 
+            tau_int, tau_ref=tau_ref, K_ref=K_ref, 
+            dt0=dt, dt=dt, hazard=hazard, device=device, ic="silent")
 mf = RDMIsingModel(J, E, beta, theta,
-        tau_int, tau_ref, K_ref, dt, hazard="sync", eps=0.01, device=device)
+        tau_int, tau_ref, K_ref, dt0=dt, dt=dt, hazard=hazard, eps=0.01, device=device)
 print(mf.Qm)
 
 # mf.P = sm.fdist(Q) # initialize mean-field distribution to match spin model
@@ -155,8 +166,8 @@ if True: # entropy trajectories
 
     # print trajetcory averages
     skip = Q # skip initial and final transient
-    print(f"Spin Model: <sigma> = {sm_traj2['sigma'][skip:-skip].mean()/dt:.8f} nats/ms, <H_fwd> = {sm_traj2['H_fwd'][skip:-skip].mean():.8f}, <H_rev> = {sm_traj2['H_rev'][skip:-skip].mean():.8f}")
-    print(f"Mean Field: <sigma> = {mf_traj2['sigma'][skip:-skip].mean()/dt:.8f} nats/ms, <H_fwd> = {mf_traj2['H_fwd'][skip:-skip].mean():.8f}, <H_rev> = {mf_traj2['H_rev'][skip:-skip].mean():.8f}")
+    print(f"Spin Model: <sigma> = {sm_traj2['sigma'][skip:-skip].mean():.8f} nats, <H_fwd> = {sm_traj2['H_fwd'][skip:-skip].mean():.8f}, <H_rev> = {sm_traj2['H_rev'][skip:-skip].mean():.8f}")
+    print(f"Mean Field: <sigma> = {mf_traj2['sigma'][skip:-skip].mean():.8f} nats, <H_fwd> = {mf_traj2['H_fwd'][skip:-skip].mean():.8f}, <H_rev> = {mf_traj2['H_rev'][skip:-skip].mean():.8f}")
 
     plt.tight_layout()
 

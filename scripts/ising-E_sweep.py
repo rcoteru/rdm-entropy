@@ -30,14 +30,14 @@ if run_sim:
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    J       = 10
+    J       = 18.0
     E       = torch.linspace(0.7, 2.0, 300)
-    beta    = 40.0
+    beta    = 30.0
     theta   = 1.0
     tau_int = 20.0
     tau_ref = 3.0
     K_ref   = 0.0
-    dt      = 0.2
+    dt0     = 0.5
 
     equi  = 20000
     steps = 30000
@@ -49,12 +49,12 @@ if run_sim:
         # of the original model
         mf = RDMIsingModelBatch(J=J, E=E, beta=beta, theta=theta,
                                 tau_int=tau_int, tau_ref=tau_ref, K_ref=K_ref,
-                                device=device, dt=dt, hazard="synchronous", eps=0.01)
+                                device=device, dt0=dt0, dt=dt0, hazard="synchronous", eps=0.01)
         print(f"Running {mf.B} mean-fields for {equi+steps} steps on {device}...")
         t0 = time.time()
         mf.forward(equi, pb=True)
         traj = mf.entropy_trajectory(steps, pb=True)
-        traj["dt"] = torch.tensor(dt)
+        traj["dt"] = torch.tensor(dt0)
         print(f"Done in {time.time() - t0:.2f}s")
 
         CACHE_DIR.mkdir(exist_ok=True)
@@ -77,8 +77,8 @@ if run_fp:
     if not CACHE_SIM_FILE.exists():
         raise FileNotFoundError(f"{CACHE_SIM_FILE} not found. Run the simulation first.")
 
-    n_lead   = 8    # leading eigenvalues kept per fixed point
-    n_E_fp   = 50   # E values to analyse; the cost is dominated by the eigendecomposition
+    n_lead   = 4    # leading eigenvalues kept per fixed point
+    n_E_fp   = 100  # E values to analyse; the cost is dominated by the eigendecomposition
     n_scan   = 401  # resolution of the sign scan that brackets the roots
 
     if CACHE_FP_FILE.exists() and not overwrite:

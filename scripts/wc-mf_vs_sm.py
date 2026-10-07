@@ -69,13 +69,13 @@ steps2 = 20000
 # ~~~~~~~~~~~~~~~~~~~~
 torch.set_default_dtype(torch.float64)
 
-sm = SpinWilsonCowan(N, E_ratio, w_EE/dt, w_EI/dt, w_IE/dt, w_II/dt, 
+sm = SpinWilsonCowan(N, E_ratio, w_EE, w_EI, w_IE, w_II, 
                     E_exc, E_inh, beta_E, beta_I, theta_E, theta_I, 
                     tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I, 
                     dt=dt, device=device, ic="silent")
 
-# srm takes the weights in physical units -- no /dt, since the input is built from the
-# rate -- and hazard="synchronous" is the sigmoid of the original model.
+# Both models take the weights in physical units -- no /dt, since both build the input
+# from the rate -- and hazard="synchronous" is the sigmoid of the original model.
 mf = RDMWilsonCowan(E_ratio, w_EE, w_EI, w_IE, w_II, 
                     E_exc, E_inh, beta_E, beta_I, theta_E, theta_I, 
                     tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I,

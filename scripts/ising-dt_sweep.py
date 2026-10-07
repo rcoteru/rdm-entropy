@@ -10,9 +10,9 @@ from rdme.spin_model import SpinIsingModel
 # ~~~~~~~~~~~~~~~~~~~~~
 #
 # Sweep the integration step dt and see how the final (non-transient) averages
-# of activity and of the entropy-production quantities change. J is rescaled as
-# J/dt (as in ising-mf_vs_sm.py) so the per-ms coupling stays fixed; the number
-# of steps is chosen so every run covers the same simulated time in ms.
+# of activity and of the entropy-production quantities change. J is a per-ms
+# coupling and both models rescale it internally, so it is held fixed here; the
+# number of steps is chosen so every run covers the same simulated time in ms.
 #
 # The hazard is the logistic sigmoid(h), which fixes the firing probability per
 # *bin* rather than per unit time: the escape rate it implies is softplus(h)/dt, so
@@ -25,7 +25,7 @@ torch.set_default_dtype(torch.float64)
 
 N = 20000
 
-J = 4      # coupling strength (per ms, before the 1/dt rescaling)
+J = 4      # coupling strength, in physical units (per ms)
 E = 1      # external field
 beta = 30
 theta = 1
@@ -61,9 +61,9 @@ for dt in dt_values:
 
     # --- mean field ---
     t0 = time.time()
-    # hazard="synchronous" is the sigmoid of the original model. Note srm takes J in
-    # physical units: the 1/dt the old call site applied is now internal, since the input is
-    # built from the rate rather than the per-bin overlap.
+    # hazard="synchronous" is the sigmoid of the original model. Both models take J in
+    # physical units: the 1/dt the old call sites applied is now internal to both, since
+    # each builds the input from the rate rather than the per-bin overlap.
     mf = RDMIsingModel(J, E, beta, theta,
                        tau_int, tau_ref, K_ref, dt, hazard="synchronous",
                        eps=0.01, device=device)
@@ -80,7 +80,7 @@ for dt in dt_values:
     # --- spin model ---
     if run_spin_model:
         t0 = time.time()
-        sm = SpinIsingModel(N, J / dt, E, beta, theta,
+        sm = SpinIsingModel(N, J, E, beta, theta,
                             tau_int, tau_ref=tau_ref, K_ref=K_ref,
                             dt=dt, device=device, ic="silent")
         sm.trajectory(T=steps_equi)

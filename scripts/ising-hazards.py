@@ -198,9 +198,9 @@ if run_plot:
           f"(J = {DRIVEN['J']}, E = {DRIVEN['E']}).")
     a, e = res["sep"]["async"], res["sep"]["escape"]
     gap = (a - e).abs() / a
-    print(f"    {'dt0':>7} {'dt0/tau_ref':>12} {'async':>10} {'escape':>10} {'rel gap':>9}")
+    print(f"    {'dt0':>7} {'dt0/tau_int':>12} {'async':>10} {'escape':>10} {'rel gap':>9}")
     for j, q in enumerate(res["sep_dt0s"]):
-        print(f"    {float(q):7.2f} {float(q)/KERNELS['tau_ref']:12.2f} {float(a[j]):10.5f} "
+        print(f"    {float(q):7.2f} {float(q)/KERNELS['tau_int']:12.2f} {float(a[j]):10.5f} "
               f"{float(e[j]):10.5f} {float(gap[j]):9.2%}")
 
     print(f"\n[3] entropy production vs dt at an oscillating point "
@@ -240,12 +240,12 @@ if run_plot:
     ax1.set_title(r'Convergence at fixed $\lambda_0$')
     ax1.legend(); ax1.grid(alpha=0.3)
 
-    ax2.plot(res["sep_dt0s"] / KERNELS['tau_ref'], a, 'o-', color=COLORS["async"],
+    ax2.plot(res["sep_dt0s"] / KERNELS['tau_int'], a, 'o-', color=COLORS["async"],
              label='async', linewidth=2, markersize=7)
-    ax2.plot(res["sep_dt0s"] / KERNELS['tau_ref'], e, 'o-', color=COLORS["escape"],
+    ax2.plot(res["sep_dt0s"] / KERNELS['tau_int'], e, 'o-', color=COLORS["escape"],
              label='escape', linewidth=2, markersize=7)
     ax2.set_xscale('log')
-    ax2.set_xlabel(r'$\Delta t_0 / \tau_{\mathrm{ref}}$')
+    ax2.set_xlabel(r'$\Delta t_0 / \tau_{\mathrm{int}}$')
     ax2.set_ylabel(r'mean $r$ [1/ms]')
     ax2.set_title('The two continuum models separate\nas the quantum slows')
     ax2.legend(); ax2.grid(alpha=0.3)

@@ -57,7 +57,7 @@ CACHE_FILE = CACHE_DIR / f"{bname}.pt"
 
 run_sim   = True
 run_plot  = True
-overwrite = True
+overwrite = False
 
 torch.set_default_dtype(torch.float64)
 
