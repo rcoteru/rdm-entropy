@@ -10,7 +10,8 @@ import tqdm
 from rdme.dynamics import (compute_total_input, compute_firing_rate,
                                update_synaptic_term, update_age_distribution)
 from rdme.epr import (joint_distribution, epr_from_joint, make_epr_indices,
-                          init_epr_state, step_epr, anchor_reverse_synaptic_term)
+                          init_epr_state, step_epr, anchor_reverse_synaptic_term,
+                          hazard_field, EPRState)
 from rdme.fixed_points import fp_overlap_map, fp_state, fp_guess_lattice
 from rdme.lyapunov import update_tangent, init_tangent_blocks
 
@@ -535,6 +536,7 @@ class RDMNetworkBatch:
                            method: str = "sliding",
                            pb: bool = True,
                            chunk: int | None = None,
+                           inplace: bool = False,
                            ) -> dict[str, torch.Tensor]:
         """ Per-population entropy production over T reported steps, for the whole batch.
 
@@ -545,8 +547,20 @@ class RDMNetworkBatch:
         joint is the only (B, Q, Q) object either path would ever allocate.
 
         `chunk` caps how many batch elements go through the joint at once, trading speed for
-        peak memory; it is ignored by the sliding path, which never builds the joint and so has
-        nothing to chunk. Results are unaffected.
+        peak memory. The joint path builds one every step; the sliding path builds exactly one,
+        in init_epr_state, and then never again -- but that single (B, Q, Q) build is the peak
+        of the whole run, so `chunk` caps it too rather than being ignored there. Results are
+        unaffected either way: every operation in the joint is elementwise or reduces over the
+        trailing age axes, so the batch axis carries no information across elements. (Not
+        bit-for-bit, mind: a reduction over a shorter axis may reassociate. `inplace` is the
+        one that promises bits.)
+
+        `inplace` is the other memory knob, and the one that matters at large B: it lets the
+        hazard and survival chains in rdme.epr reuse their own temporaries instead of
+        allocating a fresh (B, Q, Q) buffer per operation, and stops init_epr_state from
+        pinning one such buffer for the whole run by returning phi_end as a view into it. The
+        default is off, so the out-of-place path stays the oracle: both branches do the same
+        arithmetic in the same order and agree bit for bit, which the tests assert directly.
 
         The reverse field needs the input Qm[i] steps into the FUTURE, so the run opens with a
         fill phase of Q_max = max(Qm) shared ticks that is not reported. Populations share one
@@ -584,9 +598,18 @@ class RDMNetworkBatch:
             self.update()
 
         idx = [make_epr_indices(Qm[i], Qm[i], device) for i in range(M)]
-        state = [init_epr_state(p_cur[i], buff_S[i], self.R[i], self.beta[:, i:i+1],
-                                self.theta[:, i:i+1], hz, lam0, dt)
-                 if method == "sliding" else None for i in range(M)]
+
+        def _init_state(i):
+            """ The sliding state for population i, in batch chunks. Each field of EPRState is
+            a per-element quantity, so the chunks concatenate back along the batch axis. """
+            cs = B if chunk is None else chunk
+            parts = [init_epr_state(p_cur[i][sub], buff_S[i][sub], self.R[i][sub],
+                                    self.beta[sub, i:i+1], self.theta[sub, i:i+1],
+                                    hz, lam0, dt, inplace=inplace)
+                     for sub in (slice(lo, min(lo + cs, B)) for lo in range(0, B, cs))]
+            return EPRState(*(torch.cat(f, dim=0) for f in zip(*parts)))
+
+        state = [_init_state(i) if method == "sliding" else None for i in range(M)]
         head = 0
 
         for t in tqdm.tqdm(range(T), disable=not pb):
@@ -597,22 +620,32 @@ class RDMNetworkBatch:
                 if method == "sliding":
                     e, p_cur[i], state[i] = step_epr(
                         p_cur[i], state[i], buff_S[i], buff_I[i], idx[i], head,
-                        self.R[i], self.alpha_int[:, i:i+1], bet, the, hz, lam0, dt)
+                        self.R[i], self.alpha_int[:, i:i+1], bet, the, hz, lam0, dt,
+                        inplace=inplace)
                 else:
                     sl = idx[i].slots[head % Qm[i]]
-                    Sb = buff_S[i][:, sl]                      # logical order, (B, K, Q)
-                    phi_f = hz.phi(Sb[:, 0] + self.R[i] - the, bet, lam0, dt)
+                    # inplace also reorders the gather: buff_S[:, sl] is advanced indexing, so
+                    # it COPIES the whole (B, K, Q) ring, defeating the chunking it feeds. Per
+                    # chunk it is the same rows in the same order, just Q^2 * cs at a time.
+                    Sb = None if inplace else buff_S[i][:, sl]   # logical order, (B, K, Q)
+                    S0 = buff_S[i][:, sl[0]]                     # (B, Q) view, row j = 0
+                    phi_f = hz.phi(hazard_field(S0, self.R[i], the, inplace), bet, lam0, dt,
+                                   inplace=inplace)
                     S_rev = anchor_reverse_synaptic_term(buff_I[i][:, sl],
                                                          self.alpha_int[:, i:i+1])
-                    phi_r = hz.phi(S_rev + self.R[i] - the, bet, lam0, dt)
+                    phi_r = hz.phi(hazard_field(S_rev, self.R[i], the, inplace), bet, lam0, dt,
+                                   inplace=inplace)
                     # the joint is the one (B, Q, Q) object here, so it is what `chunk` splits
                     cs = B if chunk is None else chunk
                     parts = []
                     for lo in range(0, B, cs):
                         sub = slice(lo, min(lo + cs, B))
-                        J = joint_distribution(p_cur[i][sub], Sb[sub], self.R[i][sub],
-                                               bet[sub], the[sub], hz, lam0, dt)
+                        Sb_sub = buff_S[i][sub][:, sl] if inplace else Sb[sub]
+                        J = joint_distribution(p_cur[i][sub], Sb_sub, self.R[i][sub],
+                                               bet[sub], the[sub], hz, lam0, dt,
+                                               inplace=inplace)
                         parts.append(epr_from_joint(J, phi_f[sub], phi_r[sub]))
+                        del J, Sb_sub
                     e = torch.cat(parts, dim=0)
                     p_cur[i] = update_age_distribution(p_cur[i], phi_f)
 
