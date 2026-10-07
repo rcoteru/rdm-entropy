@@ -9,7 +9,7 @@ from rdme.dynamics import (compute_total_input, compute_firing_rate,
                                update_synaptic_term, update_age_distribution,
                                check_age_normalization)
 from rdme.epr import (anchor_reverse_synaptic_term, joint_distribution, epr_from_joint,
-                          make_epr_indices, init_epr_state, step_epr)
+                          make_epr_indices, init_epr_state, step_epr, hazard_field)
 from rdme.fixed_points import fp_overlap_map, fp_state, fp_guess_lattice
 from rdme.lyapunov import update_tangent, init_tangent_blocks
 
@@ -391,6 +391,7 @@ class RDMNetwork:
     def entropy_trajectory(self, T: int,
                            method: str = "sliding",
                            pb: bool = True,
+                           inplace: bool = False,
                            ) -> dict[str, torch.Tensor]:
         """ Per-population entropy production over T reported steps.
 
@@ -409,6 +410,11 @@ class RDMNetwork:
         clock but have their own Qm, so a population with Qm[i] < Q_max accumulates its
         leftover snapshots in a FIFO that the main loop keeps pushing to and popping from,
         leaving its tail-writes a fixed Q_max - Qm[i] steps behind.
+
+        `inplace` hands the hazard and survival chains in rdme.epr permission to reuse their
+        own temporaries rather than allocating one per operation; off by default, so the
+        out-of-place path stays the oracle and the two agree bit for bit. It matters far more
+        on RDMNetworkBatch, where those temporaries carry a batch axis.
 
         Returns CPU tensors: r/m (T, M) rates and overlaps, r_tot/m_tot (T,); sigma/H_fwd/H_rev
         (T, M) and their N-weighted aggregates. sigma is per bin; divide by dt for the rate,
@@ -443,7 +449,7 @@ class RDMNetwork:
         # so retiring a row is one slot write rather than a (Qm, Qm) shift.
         idx = [make_epr_indices(Qm[i], Qm[i], device) for i in range(M)]
         state = [init_epr_state(p_cur[i], buff_S[i], self.R[i], self.beta[i], self.theta[i],
-                                hz, lam0, dt) if method == "sliding" else None
+                                hz, lam0, dt, inplace=inplace) if method == "sliding" else None
                  for i in range(M)]
         head = 0
 
@@ -457,17 +463,17 @@ class RDMNetwork:
                     e, p_cur[i], state[i] = step_epr(
                         p_cur[i], state[i], buff_S[i], buff_I[i], idx[i], head,
                         self.R[i], self.alpha_int[i], self.beta[i], self.theta[i],
-                        hz, lam0, dt)
+                        hz, lam0, dt, inplace=inplace)
                 else:
                     sl = idx[i].slots[head % Qm[i]]
                     Sb = buff_S[i][sl]                         # logical order, O(Q^2) gather
                     J = joint_distribution(p_cur[i], Sb, self.R[i], self.beta[i],
-                                           self.theta[i], hz, lam0, dt)
-                    phi_f = hz.phi(Sb[0] + self.R[i] - self.theta[i],
-                                   self.beta[i], lam0, dt)
+                                           self.theta[i], hz, lam0, dt, inplace=inplace)
+                    phi_f = hz.phi(hazard_field(Sb[0], self.R[i], self.theta[i], inplace),
+                                   self.beta[i], lam0, dt, inplace=inplace)
                     S_rev = anchor_reverse_synaptic_term(buff_I[i][sl], self.alpha_int[i])
-                    phi_r = hz.phi(S_rev + self.R[i] - self.theta[i],
-                                   self.beta[i], lam0, dt)
+                    phi_r = hz.phi(hazard_field(S_rev, self.R[i], self.theta[i], inplace),
+                                   self.beta[i], lam0, dt, inplace=inplace)
                     e = epr_from_joint(J, phi_f, phi_r)
                     p_cur[i] = update_age_distribution(p_cur[i], phi_f)
 

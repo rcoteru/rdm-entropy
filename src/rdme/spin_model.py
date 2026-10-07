@@ -2,6 +2,7 @@ import torch
 import tqdm
 
 import rdme.kernels as krn
+from rdme.hazards import HAZARDS
 
 # Auxiliary functions
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -23,6 +24,9 @@ class SpinModel:
     M: int # number of populations
     Nm: torch.Tensor   # (M,) number of neurons in each population, sum(Nm) = N
     dt: float # time step size, in ms
+    dt0: float # the model's time quantum; lam0 = 1/dt0
+    lam0: float # rate calibration
+    hazard: str # key into rdme.hazards.HAZARDS
 
     s: torch.Tensor # (N,) current state
     n: torch.Tensor # (N,) neuron ages dtype int8
@@ -51,8 +55,20 @@ class SpinModel:
     def __init__(self, s: torch.Tensor, n: torch.Tensor, S: torch.Tensor, R: torch.Tensor,
              w: torch.Tensor, E: torch.Tensor, beta: torch.Tensor, theta: torch.Tensor,
              tau_int: torch.Tensor, K_ref: torch.Tensor, tau_ref: torch.Tensor, 
-             Nm: torch.Tensor, n_obs: int = 3, dt: float = 1.0):
-    
+             Nm: torch.Tensor, n_obs: int = 3, dt: float = 1.0,
+             dt0: float | None = None, hazard: str = "escape"):
+
+        """ dt is the simulation step and dt0 the model's time quantum, exactly as in
+        RDMNetwork: the hazard is calibrated by lam0 = 1/dt0, which does NOT move when dt is
+        refined. dt0 defaults to dt, i.e. to lam0*dt = 1, where all three hazards collapse onto
+        the sigmoid this class used to hardcode -- so the default reproduces the old dynamics
+        and only an explicit dt0 selects a different member of the family.
+
+        w is in PHYSICAL units and is NOT pre-divided by dt, matching RDMNetwork: the input
+        is built from the rate m/dt, so the scaling lives in total_input rather than at the
+        call site. (It used to be the caller's job, which meant every script wrote J/dt and a
+        comparison against the mean field had to carry two weight sets for one network.) """
+
         N = s.shape[0]
         M = Nm.shape[0]
         
@@ -68,7 +84,18 @@ class SpinModel:
         assert K_ref.shape == (M,), f"K_ref must have shape ({M},)."
         assert Nm.sum().item() == N, f"Sum of Nm must equal N={N}, got {Nm.sum().item()}"
         
+        if hazard not in HAZARDS:
+            raise ValueError(f"hazard must be one of {sorted(HAZARDS)}, got {hazard!r}")
+
         self.N, self.M, self.dt = N, M, dt
+        self.hazard = hazard
+        self.dt0 = dt if dt0 is None else dt0
+        self.lam0 = 1.0 / self.dt0
+        if HAZARDS[hazard].bounded_step and self.lam0 * dt > 1.0 + 1e-12:
+            # Phi = lam0*dt*sigma would exceed 1: a firing probability above one
+            raise ValueError(
+                f"hazard {hazard!r} requires lam0*dt <= 1, got lam0*dt = {self.lam0 * dt:.4g} "
+                f"(dt={dt}, dt0={self.dt0}). Refine dt, or raise dt0.")
         self.s, self.n, self.S, self.R = s, n, S, R
         self.w, self.E = w, E
         self.theta, self.beta = theta, beta
@@ -108,7 +135,8 @@ class SpinModel:
     def random_start(cls, Nm: torch.Tensor, w: torch.Tensor, E: torch.Tensor, 
                     beta: torch.Tensor, theta: torch.Tensor, 
                     tau_int: torch.Tensor, tau_ref: torch.Tensor, K_ref: torch.Tensor, 
-                    n_obs: int = 1, dt: float = 1.0) -> SpinModel:
+                    n_obs: int = 1, dt: float = 1.0, dt0: float | None = None,
+                    hazard: str = "escape") -> SpinModel:
         device = w.device
         N = int(Nm.sum().item())
         #TODO: start this more reasonably, e.g. by sampling from the fixed point distribution for the given parameters
@@ -118,13 +146,14 @@ class SpinModel:
         S = torch.zeros((N,), device=device, dtype=torch.float32)
         R = torch.zeros((N,), device=device, dtype=torch.float32)
         return cls(s, n, S, R, w, E, beta, theta, tau_int, K_ref, tau_ref, 
-                Nm, n_obs=n_obs, dt=dt)
+                Nm, n_obs=n_obs, dt=dt, dt0=dt0, hazard=hazard)
 
     @classmethod
     def silent_start(cls, Nm: torch.Tensor, w: torch.Tensor, E: torch.Tensor, 
                     beta: torch.Tensor, theta: torch.Tensor, 
                     tau_int: torch.Tensor, tau_ref: torch.Tensor, K_ref: torch.Tensor, 
-                    n_obs: int = 1, dt: float = 1.0) -> SpinModel:
+                    n_obs: int = 1, dt: float = 1.0, dt0: float | None = None,
+                    hazard: str = "escape") -> SpinModel:
         device = w.device
         N = int(Nm.sum().item())
         s = torch.zeros((N,), device=device)
@@ -132,7 +161,7 @@ class SpinModel:
         S = torch.zeros((N,), device=device, dtype=torch.float32)
         R = torch.zeros((N,), device=device, dtype=torch.float32)
         return cls(s, n, S, R, w, E, beta, theta, tau_int, K_ref, tau_ref, 
-                Nm, n_obs=n_obs, dt=dt)
+                Nm, n_obs=n_obs, dt=dt, dt0=dt0, hazard=hazard)
     
     
     # Observables and derived quantities
@@ -170,14 +199,20 @@ class SpinModel:
         return self.pop_expand.t() @ a_pop  # (N, M) @ (M,) -> (N,)
 
     @torch.inference_mode()
+    def rates(self) -> torch.Tensor:
+        """ Population firing rates r = m/dt, in 1/ms, shape (M,). The dt-invariant
+        observable: compare these across resolutions, never the per-step activities. """
+        return self.population_activity() / self.dt
+
+    @torch.inference_mode()
     def total_input(self) -> torch.Tensor:
-        """ Computes the I at current time, i.e. I^a_t = sum_b w[a, b] m^b_t + E^a_t.
+        """ I at the current time, I^a_t = sum_b w^{ab} r^b_t + E^a, built from the RATE
+        r = m/dt -- which is why w carries no 1/dt here, exactly as in RDMNetwork.
 
         Row = target, column = source, matching w^{ab} ("from b onto a") in the theory
         and compute_total_input in mean_field. The source-first w_XY names the model
         constructors take are transposed into this layout there, not here. """
-        activities = self.population_activity()
-        pop_I = self.w @ activities + self.E
+        pop_I = self.w @ self.rates() + self.E
         return self.pop_to_network(pop_I)
 
     @torch.inference_mode()
@@ -186,8 +221,29 @@ class SpinModel:
 
     @torch.inference_mode()
     def firing_prob(self) -> torch.Tensor:
-        """ Computes the firing probability at current time, i.e. P(s_i(t+1)=1) = sigmoid(beta*(H_i(t)+X_i(t)-theta)). """
-        return torch.sigmoid(self.beta_net * (self.field() - self.theta_net))
+        """ Per-step firing probability P(s_i(t+1)=1) = Phi(beta*(H_i(t)+X_i(t)-theta)), with
+        Phi the chosen hazard. At the default dt0 = dt this is the sigmoid for all three. """
+        return self._phi(self.field() - self.theta_net)
+
+    @torch.inference_mode()
+    def hazard_rate(self) -> torch.Tensor:
+        """ The firing rate lambda(h) the hazard represents, in 1/ms, shape (N,).
+
+        The quantity the hazards actually differ by as dt -> 0; firing_prob is its rendering on
+        this step. For hazard="synchronous" it is Phi/dt, which has no limit. """
+        return HAZARDS[self.hazard].rate(self.field() - self.theta_net, self.beta_net,
+                                         self.lam0, self.dt)
+
+    def _phi(self, h: torch.Tensor) -> torch.Tensor:
+        """ The hazard applied to a raw field h = S + R - theta (beta not yet folded in). """
+        return HAZARDS[self.hazard].phi(h, self.beta_net, self.lam0, self.dt)
+
+    def _neg_log_prob(self, s: torch.Tensor, hb: torch.Tensor) -> torch.Tensor:
+        """ -ln p(s | h) for the current hazard, given a field hb that ALREADY carries beta.
+
+        beta=1 is passed on because the EPR passes expand the gain into the stored fields once
+        rather than per bond; the hazard only ever sees beta*h, so this is the same number. """
+        return HAZARDS[self.hazard].neg_log_prob(s, hb, 1.0, self.lam0, self.dt)
 
     @torch.inference_mode()
     def fdist(self, Q: int) -> torch.Tensor:
@@ -338,7 +394,6 @@ class SpinModel:
                              "times max(tau_int, tau_ref).")
 
         dev = self.device
-        F = torch.nn.functional
         L = T + buffer
         lo, hi = 0, T
 
@@ -381,8 +436,10 @@ class SpinModel:
         s_next = s_trj[lo + 1:hi + 1].float()     # the realized spike s[t+1]
         s_cur  = s_trj[lo:hi].float()             # the realized spike s[t]
 
-        ent_f = -s_next * hf_a + F.softplus(hf_a)
-        ent_r = -s_cur  * hr_a + F.softplus(hr_a)
+        # -ln p(s | h) under the chosen hazard. At hazard="synchronous" this is the
+        # -s*h + softplus(h) of the logistic kernel, which is all this used to compute.
+        ent_f = self._neg_log_prob(s_next, hf_a)
+        ent_r = self._neg_log_prob(s_cur,  hr_a)
 
         # same dict contract as RDMNetwork.entropy_trajectory: per-population (T, M)
         # arrays, plus the N-weighted network aggregates under the _tot suffix
@@ -458,7 +515,6 @@ class SpinModel:
             raise ValueError("chunk must be >= overlap (the slide would self-overlap)")
 
         dev, N = self.device, self.N
-        F = torch.nn.functional
         W = chunk + overlap
         acc = torch.float64
 
@@ -542,8 +598,8 @@ class SpinModel:
                     sn = s_win[k + 1].to(store_dtype)   # s[t+1], forward emission
                     sc = s_win[k].to(store_dtype)       # s[t],   reverse emission
 
-                    lp_f = sn * hf - F.softplus(hf)
-                    lp_r = sc * hr - F.softplus(hr)
+                    lp_f = -self._neg_log_prob(sn, hf)
+                    lp_r = -self._neg_log_prob(sc, hr)
 
                     out["sigma_tot"][i] = (lp_f - lp_r).mean(dtype=acc)
                     out["H_fwd_tot"][i] = (-lp_f).mean(dtype=acc)
@@ -577,10 +633,10 @@ class SpinModel:
 
 def SpinIsingModel(N: int, J: float, E: float, beta: float, theta: float,
                tau_int: float, tau_ref: float, K_ref: float,
-               dt: float = 1.0, device: str = "cpu",
-               ic: str = "random") -> SpinModel:
+               dt: float = 1.0, dt0: float | None = None, hazard: str = "escape",
+               device: str = "cpu", ic: str = "random") -> SpinModel:
     
-    """ Construct an Ising SpinModel. """
+    """ Construct an Ising SpinModel. J is in physical units -- do not pass J/dt. """
 
     M = 1
     Nm = torch.tensor([N], device=device)
@@ -595,11 +651,11 @@ def SpinIsingModel(N: int, J: float, E: float, beta: float, theta: float,
     if ic == "random":
         return SpinModel.random_start(Nm=Nm, w=w, E=E_vec, beta=beta_vec, theta=theta_vec,
                                       tau_int=tau_int_vec, tau_ref=tau_ref_vec, K_ref=K_ref_vec,
-                                      n_obs=1, dt=dt)
+                                      n_obs=1, dt=dt, dt0=dt0, hazard=hazard)
     elif ic == "silent":
         return SpinModel.silent_start(Nm=Nm, w=w, E=E_vec, beta=beta_vec, theta=theta_vec,
                                   tau_int=tau_int_vec, tau_ref=tau_ref_vec, K_ref=K_ref_vec,
-                                  n_obs=1, dt=dt)
+                                  n_obs=1, dt=dt, dt0=dt0, hazard=hazard)
     else:
         raise ValueError(f"Unknown initial condition '{ic}'")
 
@@ -623,11 +679,12 @@ def SpinWilsonCowan(
         tau_ref_I: float,
  
         K_ref1: float, K_ref2: float,
-        dt: float = 1.0, n_obs: int = 1, 
-        device: str = "cpu", ic: str = "random"
+        dt: float = 1.0, dt0: float | None = None, hazard: str = "escape",
+        n_obs: int = 1, device: str = "cpu", ic: str = "random"
         ) -> SpinModel:
     
-    """ Construct a Wilson-Cowan SpinModel. """
+    """ Construct a Wilson-Cowan SpinModel. Weights are in physical units: pass w_EE, not
+    w_EE/dt. """
 
     M = 2
     # split on E_ratio directly, as RDMWilsonCowan does: going through (1 - E_ratio)
@@ -651,7 +708,7 @@ def SpinWilsonCowan(
                                       tau_int=tau_int_vec,
                                       tau_ref=tau_ref_vec,
                                       K_ref=K_ref_vec,
-                                      n_obs=n_obs, dt=dt)
+                                      n_obs=n_obs, dt=dt, dt0=dt0, hazard=hazard)
     elif ic == "silent":
         return SpinModel.silent_start(Nm=Nm, w=w, E=E_vec,
                                       beta=beta_vec,
@@ -659,6 +716,6 @@ def SpinWilsonCowan(
                                       tau_int=tau_int_vec,
                                       tau_ref=tau_ref_vec,
                                       K_ref=K_ref_vec,
-                                      n_obs=n_obs, dt=dt)
+                                      n_obs=n_obs, dt=dt, dt0=dt0, hazard=hazard)
     else:
         raise ValueError(f"Unknown initial condition '{ic}'")
