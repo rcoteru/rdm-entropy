@@ -44,8 +44,7 @@ def test_stationary_activity_matches_spin_model():
     N, J, E, beta, theta, dt = 20000, 1.0, 0.0, 20.0, 0.0, 0.2
     tau_int, tau_ref, K_ref = 12.0, 3.0, 2.0
 
-    sm = SpinIsingModel(N, J / dt, E, beta, theta, tau_int, tau_ref, K_ref, dt=dt, ic="silent")
-    # srm takes J in physical units; the spin model does not, hence the /dt there only
+    sm = SpinIsingModel(N, J, E, beta, theta, tau_int, tau_ref, K_ref, dt=dt, ic="silent")
     mf = RDMIsingModel(J, E, beta, theta, tau_int, tau_ref, K_ref, dt=dt,
                        hazard="synchronous")
     sm.forward(6000)

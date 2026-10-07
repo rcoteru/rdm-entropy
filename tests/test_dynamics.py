@@ -167,8 +167,8 @@ def test_inplace_branches_match_out_of_place(shape):
     S_ip  = S.clone(); dyn.update_synaptic_term(S_ip, alpha, I, inplace=True)
     assert torch.equal(S_ref, S_ip)
 
-    # (the hazard has no in-place branch: measured, one would save ~2% of a step, and the
-    # one rdme.mean_field carried was never called with inplace=True in production)
+    # (the hazards grew their own in-place branches later, for the entropy production rather
+    # than for the step: see test_epr.test_hazard_inplace_branches_are_bitwise_identical)
 
 
 @pytest.mark.parametrize("shape", [(9,), (4, 9)])

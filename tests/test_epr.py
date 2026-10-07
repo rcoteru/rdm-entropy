@@ -423,7 +423,7 @@ def test_entropy_trajectory_rewinds_live_state():
     assert torch.allclose(peeked.m, stepped.m, atol=1e-6)
 
 
-def _small_batch(Qm, B, seed=1):
+def _small_batch(Qm, B, seed=1, hazard="synchronous"):
     """ A small RDMNetworkBatch whose B batch elements carry distinct parameters, so a bug
     that only shows up when elements diverge (e.g. a broadcast collapsing the batch axis)
     has something to trip on. """
@@ -437,7 +437,7 @@ def _small_batch(Qm, B, seed=1):
         M=M, w=w, N=[1000] * M,
         E=E, beta=beta, theta=const(0.4),
         tau_int=const(3.0), tau_ref=const(5.0), K_ref=const(2.0),
-        Qm=Qm, hazard="synchronous",
+        Qm=Qm, hazard=hazard,
     )
 
 
@@ -463,11 +463,118 @@ def test_batch_entropy_trajectory_matches_independent_networks():
 
 
 @pytest.mark.parametrize("chunk", [1, 2])
-def test_batch_entropy_trajectory_chunk_matches_unchunked(chunk):
+@pytest.mark.parametrize("method", ["joint", "sliding"])
+def test_batch_entropy_trajectory_chunk_matches_unchunked(chunk, method):
     T, Qm, B = 15, [8, 5], 4
-    # chunk splits the (B, Q, K) joint, so it is the joint path that has anything to chunk;
-    # the sliding path never builds that object and ignores the argument
-    ref = _small_batch(Qm, B).entropy_trajectory(T, method="joint", pb=False)
-    got = _small_batch(Qm, B).entropy_trajectory(T, method="joint", pb=False, chunk=chunk)
+    # the joint path builds a (B, Q, K) joint every step and the sliding path builds exactly
+    # one, in init_epr_state; chunk splits whichever it is, and since every operation in the
+    # joint is elementwise or reduces over the trailing age axes, the split is exact
+    ref = _small_batch(Qm, B).entropy_trajectory(T, method=method, pb=False)
+    got = _small_batch(Qm, B).entropy_trajectory(T, method=method, pb=False, chunk=chunk)
     for k in ref:
+        # allclose, not equal: splitting the batch axis also splits the reductions over it,
+        # and a sum of a different length is free to reassociate. Only `inplace` promises bits
         assert torch.allclose(ref[k], got[k], atol=1e-5), f"{k} diverged at chunk={chunk}"
+
+
+# In-place branches
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# The out-of-place path is the definition; `inplace` only folds away temporaries. The contract
+# is therefore stronger than agreement to a tolerance: the same arithmetic in the same ORDER,
+# hence bit for bit, which is what these assert. Anything weaker would let a rewrite that is
+# merely close pass, and the EPR is a difference of two entropies that very nearly cancel.
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("name", ["synchronous", "async", "escape"])
+@pytest.mark.parametrize("lam0,dt", [(1.0, 1.0), (0.3, 0.5), (2.0, 0.25)])
+def test_hazard_inplace_branches_are_bitwise_identical(name, dtype, lam0, dt):
+    """ All five kernel members, over a field that spans the saturated tails where the closed
+    forms are the whole point of carrying them separately. """
+    torch.manual_seed(0)
+    hz = hzd.HAZARDS[name]
+    h = (torch.randn(6, 11, dtype=dtype) * 12.0)
+    h[0] = 60.0                                  # saturated: Phi rounds to 1
+    h[1] = -60.0                                 # silent: Phi underflows
+    beta = torch.rand(6, 1, dtype=dtype) * 30.0
+
+    for fn in (hz.phi, hz.dphi, hz.rate, hz.logphi, hz.log1m_phi):
+        ref = fn(h.clone(), beta, lam0, dt)
+        got = fn(h.clone(), beta, lam0, dt, inplace=True)
+        assert torch.equal(ref.nan_to_num(), got.nan_to_num()), f"{name}.{fn.__name__}"
+
+    s = (torch.rand(6, 11, dtype=dtype) > 0.5).to(dtype)
+    ref = hz.neg_log_prob(s, h.clone(), beta, lam0, dt)
+    got = hz.neg_log_prob(s, h.clone(), beta, lam0, dt, inplace=True)
+    assert torch.equal(ref.nan_to_num(), got.nan_to_num())
+
+
+@pytest.mark.parametrize("name", ["synchronous", "async", "escape"])
+def test_hazard_inplace_leaves_the_result_but_not_the_field(name):
+    """ The flag is a licence to destroy h and nothing more: the result is correct, and the
+    caller is on notice that h is gone. Pinned here so a future rewrite that quietly starts
+    writing through to a CALLER-owned buffer somewhere else is caught by the epr tests. """
+    hz = hzd.HAZARDS[name]
+    h = torch.randn(5, 7, dtype=torch.float64) * 5.0
+    ref = hz.phi(h.clone(), 2.0, 0.5, 0.5)
+    scratch = h.clone()
+    assert torch.equal(hz.phi(scratch, 2.0, 0.5, 0.5, inplace=True), ref)
+
+
+def test_joint_distribution_inplace_matches_and_leaves_inputs_alone():
+    torch.manual_seed(1)
+    Q = K = 7
+    p = torch.rand(3, Q, dtype=torch.float64); p /= p.sum(dim=-1, keepdim=True)
+    buff_S = torch.randn(3, K, Q, dtype=torch.float64)
+    R = torch.randn(3, Q, dtype=torch.float64)
+    beta = torch.rand(3, 1, dtype=torch.float64) * 20
+    theta = torch.rand(3, 1, dtype=torch.float64)
+    keep = (p.clone(), buff_S.clone(), R.clone())
+
+    for name in ("synchronous", "async", "escape"):
+        hz = hzd.HAZARDS[name]
+        ref = rdme.epr.joint_distribution(p, buff_S, R, beta, theta, hz, 0.5, 0.5)
+        got = rdme.epr.joint_distribution(p, buff_S, R, beta, theta, hz, 0.5, 0.5,
+                                          inplace=True)
+        assert torch.equal(ref, got), name
+        for a, b in zip((p, buff_S, R), keep):
+            assert torch.equal(a, b), f"{name} wrote through to a caller buffer"
+
+
+@pytest.mark.parametrize("method", ["joint", "sliding"])
+@pytest.mark.parametrize("hazard", ["synchronous", "async", "escape"])
+def test_entropy_trajectory_inplace_is_bitwise_identical(method, hazard):
+    """ End to end, which is what the flag is actually used through: every output, and the
+    live state the run rewinds to, must match the oracle exactly.
+
+    No chunking here -- that is the other knob and it reassociates reductions, so mixing the
+    two would hide which of them moved a bit. """
+    T, Qm, B = 12, [6, 5], 3
+    ref_mf, got_mf = _small_batch(Qm, B, hazard=hazard), _small_batch(Qm, B, hazard=hazard)
+    ref = ref_mf.entropy_trajectory(T, method=method, pb=False)
+    got = got_mf.entropy_trajectory(T, method=method, pb=False, inplace=True)
+    for k in ref:
+        assert torch.equal(ref[k], got[k]), f"{k} diverged under inplace ({method}, {hazard})"
+    for i in range(len(Qm)):
+        assert torch.equal(ref_mf.p[i], got_mf.p[i])
+        assert torch.equal(ref_mf.S[i], got_mf.S[i])
+
+
+def test_init_epr_state_inplace_does_not_pin_the_joint():
+    """ phi_end is a slice of the (..., Q, K) gather. Returned as a view it keeps that whole
+    buffer alive for the rest of the trajectory -- 2.6 GiB on a 101x101 grid at Q=185 -- so
+    the in-place branch clones it. Guarding the storage size, not the values, because the
+    values are identical either way and that is exactly what makes the leak invisible. """
+    Q = K = 6
+    p = torch.rand(4, Q, dtype=torch.float64); p /= p.sum(dim=-1, keepdim=True)
+    buff_S = torch.randn(4, K, Q, dtype=torch.float64)
+    R, hz = torch.randn(4, Q, dtype=torch.float64), hzd.HAZARDS["async"]
+    beta, theta = torch.full((4, 1), 20.0), torch.full((4, 1), 1.0)
+
+    ref = rdme.epr.init_epr_state(p, buff_S, R, beta, theta, hz, 0.5, 0.5)
+    got = rdme.epr.init_epr_state(p, buff_S, R, beta, theta, hz, 0.5, 0.5, inplace=True)
+    assert torch.equal(ref.G, got.G) and torch.equal(ref.logV, got.logV)
+    assert torch.equal(ref.phi_end, got.phi_end)
+    assert got.phi_end.untyped_storage().nbytes() == got.phi_end.numel() * 8
+    assert ref.phi_end.untyped_storage().nbytes() == 4 * Q * K * 8   # the view it replaces
