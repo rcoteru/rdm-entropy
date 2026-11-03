@@ -42,6 +42,31 @@ def cycle_window(x: torch.Tensor, rel_tol: float = 1e-9) -> tuple[int, int, int]
     return int(up[0]), int(up[-1]), len(up) - 1
 
 
+# Durations
+# ~~~~~~~~~
+
+def n_steps(ms: float, dt: float, *, name: str = "duration") -> int:
+    """ Steps for a physical duration of `ms` milliseconds at solver step `dt`.
+
+    Runs are specified in ms, not in steps. A step count is a statement about the solver and
+    says nothing about the system: the same 20000 steps is 20000 ms at dt = 1 and 4000 ms at
+    dt = 0.2, so a dt refinement done on a fixed step count silently shortens the window it
+    measures, and two scripts at different dt cannot be compared by the numbers at the top of
+    them. In ms, equilibration is "long enough for the slowest timescale in the model" and the
+    recording is "this many periods", which are the statements actually meant.
+
+    Rounds to the nearest step, so a duration that is not a multiple of dt costs at most half a
+    step; the realized duration is `n_steps(ms, dt) * dt`, which is what a dump should report
+    if the difference ever matters. Raises below one step, which is a duration that was meant
+    in ms and given in steps, or a dt that is coarser than the window. """
+    if not ms > 0 or not dt > 0:
+        raise ValueError(f"{name} and dt must be positive, got {name}={ms}, dt={dt}")
+    n = int(round(ms / dt))
+    if n < 1:
+        raise ValueError(f"{name}={ms} ms is shorter than one step of dt={dt} ms")
+    return n
+
+
 # Cache naming
 # ~~~~~~~~~~~~
 

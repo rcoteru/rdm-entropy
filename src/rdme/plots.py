@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import datetime as _datetime
+import os
+import re
+import sys
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -266,7 +271,7 @@ def sweep_figures(axis: torch.Tensor,            # (B,) the swept parameter
                   banner: str = "",              # parameter string for the suptitles
                   fp: Mapping[str, object] | None = None,   # fixed_points.branch_scan output
                   means: Mapping[str, object] | None = None,  # {'sigma_tot': (B,), ...}
-                  n_points: int = 1000,          # tail points per cell in the scatter
+                  tail_ms: float = 1000.0,       # tail of each cell shown in the scatter, in ms
                   max_freq: float | None = 0.2,  # spectrogram y-limit (1/ms); None = Nyquist
                   ) -> dict[str, Figure]:
     """ Bifurcation, stability and entropy-production figures over one swept axis.
@@ -275,6 +280,11 @@ def sweep_figures(axis: torch.Tensor,            # (B,) the swept parameter
     spectrogram needs all of it. Everything else is a time average, so `means` takes the
     reduced quantities instead. `fp` may be None, in which case the panels that need the
     fixed points say so rather than vanishing -- a missing branch diagram should be visible.
+
+    `tail_ms` is in ms rather than in points because the scatter is there to show the spread of
+    the attractor, which is a number of periods: a fixed point count covers a different stretch
+    of the orbit at every dt, so the same figure at two solver steps would be showing two
+    different things.
 
     Returns the figures by name so the caller can adjust or save them. """
     from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -315,7 +325,9 @@ def sweep_figures(axis: torch.Tensor,            # (B,) the swept parameter
 
     figs["bifurcation"], (ax_scatter, ax_branch) = new_figure('Bifurcation', 2, 8)
 
-    ax_scatter.set_title(f'Simulated activity (last {n_points} points per cell)')
+    n_points = max(1, min(m_tot.shape[1], int(round(tail_ms / dt))))
+    ax_scatter.set_title(f'Simulated activity (last {n_points * dt:g} ms per cell, '
+                         f'{n_points} points at dt={dt:g})')
     tail = m_tot[:, -n_points:]
     ax_scatter.scatter(np.repeat(axis, tail.shape[1]), tail.reshape(-1)/dt,
                        s=1, alpha=0.2, color='k', linewidths=0)
@@ -399,6 +411,127 @@ def sweep_figures(axis: torch.Tensor,            # (B,) the swept parameter
         ax_H.set_ylabel('H  (nats/ms)')
         ax_H.legend()
 
-    for fig in figs.values():
+    for name, fig in figs.items():
+        fig.set_label(name)              # the slug `save` will write the file under
         fig.tight_layout(rect=(0, 0, 1, 0.97))
     return figs
+
+
+# Saving
+# ~~~~~~
+#
+# Every script saves its figures, to `<the script's folder>/figures/`, named
+# `<date>_<script>_<slug>.png`. The script's own folder rather than a path built from this
+# module's location, so a script run from anywhere puts its figures next to itself; the date
+# and the script stem rather than a counter, so a filename says which run drew it and stays
+# unique across the repo, which is what Obsidian needs to resolve an embed by filename alone.
+#
+# A re-run on the same day overwrites: the figure belongs to the code that drew it, and the
+# dump is where a superseded result is kept, not the figure directory.
+#
+# PNG is the default on purpose. These are screen figures for dumps and notes; the paper's
+# figures are drawn in `paper/` and saved as PDF there.
+
+FIG_EXT = "png"
+FIG_DIR_ENV = "RDME_FIG_DIR"             # overrides the directory, for a one-off run
+
+
+def _running_script() -> Path | None:
+    """ The script being run, or None under a REPL, a notebook or `python -c`. """
+    argv0 = sys.argv[0] if sys.argv else ""
+    if not argv0:
+        return None
+    path = Path(argv0).resolve()
+    return path if path.suffix == ".py" and path.is_file() else None
+
+
+def figure_dir(*, dir: str | Path | None = None) -> Path:
+    """ Where figures go: `<the running script's folder>/figures`.
+
+    `dir` or $RDME_FIG_DIR override it. With no script to locate (a REPL), falls back to the
+    `scripts/figures` of the checkout this module is imported from. """
+    if dir is not None:
+        return Path(dir)
+    if os.environ.get(FIG_DIR_ENV):
+        return Path(os.environ[FIG_DIR_ENV])
+    script = _running_script()
+    if script is not None:
+        return script.parent / "figures"
+    return Path(__file__).resolve().parents[2] / "scripts" / "figures"
+
+
+def _slugify(text: str, *, max_len: int = 48) -> str:
+    """ Free text to a filename-safe slug: `Entropy production  Σ` -> `entropy-production`. """
+    text = text.split("\u2014")[0]                     # a suptitle's parameter banner, dropped
+    text = re.sub(r"\$[^$]*\$", " ", text)             # drop inline math wholesale
+    text = re.sub(r"[^0-9A-Za-z]+", "-", text).strip("-").lower()
+    return text[:max_len].strip("-")
+
+
+def _suptitle(fig: Figure) -> str:
+    """ The figure's suptitle, across matplotlib versions (`get_suptitle` is 3.8 and up). """
+    if hasattr(fig, "get_suptitle"):
+        return fig.get_suptitle() or ""
+    return fig._suptitle.get_text() if getattr(fig, "_suptitle", None) else ""
+
+
+def _auto_slug(fig: Figure) -> str:
+    """ A figure's own name for itself: its label, else its suptitle, else a single axes'
+    title, else its number. Labelling a figure (`fig.set_label("...")`) is how a script
+    chooses the filename without passing names to `save`. """
+    candidates = (fig.get_label(), _suptitle(fig),
+                  fig.axes[0].get_title() if len(fig.axes) == 1 else "")
+    return next((slug for slug in map(_slugify, candidates) if slug), f"fig{fig.number}")
+
+
+def save(figs: Mapping[str, Figure] | Sequence[Figure] | Figure | None = None,
+         *,
+         script: str | None = None,
+         date: str | None = None,
+         dir: str | Path | None = None,
+         ext: str = FIG_EXT,
+         dpi: float | None = None,
+         verbose: bool = True,
+         **kw) -> list[Path]:
+    """ Save figures to `<figure_dir()>/<date>_<script>_<slug>.<ext>` and return the paths.
+
+    `figs` maps slug to figure, or is a figure or a list of them whose slugs are taken from
+    `_auto_slug`; leaving it out saves every open figure, which is what a script that draws
+    with bare `plt` calls wants. Slugs that collide within one run get `-2`, `-3` appended
+    rather than overwriting each other. Extra keywords go to `savefig`. """
+    if figs is None:
+        figs = [plt.figure(n) for n in plt.get_fignums()]
+    if isinstance(figs, Figure):
+        figs = [figs]
+    items = (list(figs.items()) if isinstance(figs, Mapping)
+             else [(_auto_slug(f), f) for f in figs])
+
+    script = script or (_running_script().stem if _running_script() else "session")
+    date = date or _datetime.date.today().isoformat()
+    out = figure_dir(dir=dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    paths, seen = [], {}
+    for slug, fig in items:
+        slug = _slugify(slug) or "fig"
+        seen[slug] = seen.get(slug, 0) + 1
+        if seen[slug] > 1:
+            slug = f"{slug}-{seen[slug]}"
+        path = out / f"{date}_{script}_{slug}.{ext}"
+        fig.savefig(path, dpi=dpi, **kw)
+        paths.append(path)
+
+    if verbose and paths:
+        print(f"Saved {len(paths)} figure(s) to {out}:")
+        for path in paths:
+            print(f"  {path.name}")
+    return paths
+
+
+def show(figs: Mapping[str, Figure] | Sequence[Figure] | Figure | None = None,
+         *, block: bool = True, **kw) -> list[Path]:
+    """ `save` and then `plt.show()` -- the last line of a script, in place of `plt.show()`,
+    so that no run leaves its figures only on the screen. """
+    paths = save(figs, **kw)
+    plt.show(block=block)
+    return paths

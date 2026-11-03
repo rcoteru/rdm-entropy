@@ -38,9 +38,9 @@ REGIMES: dict[str, dict] = {
     #
     # tau_ref is kept identical in both although it is inert at K_ref = 0, so the two dicts
     # differ in exactly one number.
-    "ref_lowbeta":   dict(J=15, E=0, beta=6, theta=0.5,
-                          tau_int=15, tau_ref=15, K_ref=25,
-                          dt=1.0, hazard="async"),
+    "ref_lowbeta":   dict(J=30, E=0, beta=6, theta=0.5,
+                          tau_int=20, tau_ref=15, K_ref=15,
+                          dt=0.5, hazard="poisson"),
 
     "noref_lowbeta": dict(J=20, E=0, beta=8, theta=0.5,
                           tau_int=15, tau_ref=25, K_ref=0,
@@ -57,12 +57,26 @@ regime = "ref_lowbeta"  # pick one of the above regimes to run
 
 DT0    = 1       # the time unit: lam0 = 1/dt0 is the maximal rate, so this is not a knob
 TOL    = 1e-2      # age-grid accuracy; Qm is fitted to it rather than set by hand
-N      = 20000     # spins in the network model
-STEPS  = (10000, 5000)   # (equilibration, entropy recording), in steps
-SKIP   = 100       # steps trimmed from each end of the recording before averaging
+N      = 40000     # spins in the network model
 DEVICE = 'cpu'     # 'cuda' if torch.cuda.is_available() else 'cpu'
 
-PARAMS: dict = REGIMES[regime] | dict(dt0=DT0)
+# Durations in MILLISECONDS; the step counts follow the regime's dt (helpers.n_steps). The
+# regimes run at different dt, so a shared step count would have meant a different physical
+# window in each -- these are the windows each regime was actually run for, written down.
+# A regime may override them with "t_equi"/"t_meas", which are run settings and are stripped
+# out before the rest of the dict is handed to the model.
+T_EQUI, T_MEAS = 5000.0, 2500.0   # ms: equilibration, then entropy recording
+SKIP_MS        = 10.0             # ms trimmed from each end of the recording before averaging
+
+RUN_KEYS = ("t_equi", "t_meas")   # regime entries that are the run, not the model
+
+PARAMS: dict = {k: v for k, v in REGIMES[regime].items() if k not in RUN_KEYS} | dict(dt0=DT0)
+
+T_EQUI = REGIMES[regime].get("t_equi", T_EQUI)
+T_MEAS = REGIMES[regime].get("t_meas", T_MEAS)
+STEPS  = (hlp.n_steps(T_EQUI, PARAMS["dt"], name="T_EQUI"),
+          hlp.n_steps(T_MEAS, PARAMS["dt"], name="T_MEAS"))
+SKIP   = hlp.n_steps(SKIP_MS, PARAMS["dt"], name="SKIP_MS")
 
 
 # ── Paths & switches ──────────────────────────────────────────────────────────
@@ -75,7 +89,7 @@ PARAMS: dict = REGIMES[regime] | dict(dt0=DT0)
 # model parameter: two runs at the same physics and the same accuracy are the same run,
 # whatever bin count each turned out to need. A change to the FITTING code is a code change,
 # which the cache does not track and clearing cache/ handles.
-CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, N=N, steps=STEPS, dt0=DT0, tol=TOL),
+CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, N=N, t_equi=T_EQUI, t_meas=T_MEAS, dt0=DT0, tol=TOL),
                        tag=regime, root=Path(__file__).parents[1] / "cache")
 
 run_sim   = True
@@ -100,7 +114,8 @@ if run_sim and (overwrite or not CACHE.exists()):
     # the two models do not share
     sm = SpinIsingModel(N, PARAMS["J"], **mf_args, device=DEVICE, ic="silent")
     mf = RDMIsingModel(PARAMS["J"], **mf_args, Qm=Qm, eps=0.01, device=DEVICE)
-    print(f"Q = {mf.Qm} age bins. Running {steps1 + steps2} steps of each model on {DEVICE}.")
+    print(f"Q = {mf.Qm} age bins. Running {T_EQUI + T_MEAS:g} ms of each model "
+          f"({steps1 + steps2} steps at dt={PARAMS['dt']:g}) on {DEVICE}.")
 
     t0 = time.time()
     mf_traj1 = mf.trajectory(T=steps1)
@@ -118,7 +133,8 @@ if run_sim and (overwrite or not CACHE.exists()):
     roots  = mf.fixed_points(method='bracket', n_grid=2001)
 
     out = {
-        "params": PARAMS, "steps": STEPS, "N": N, "dt": DT0,
+        "params": PARAMS, "t_equi": T_EQUI, "t_meas": T_MEAS, "steps": STEPS,
+        "N": N, "dt": DT0,
         "mf_traj1": mf_traj1, "mf_traj2": mf_traj2,
         "sm_traj1": sm_traj1, "sm_traj2": sm_traj2,
         # the two age distributions, on the mean field's grid
@@ -154,10 +170,12 @@ if run_plot:
     sm_traj1, sm_traj2 = d["sm_traj1"], d["sm_traj2"]
 
     if True:  # final p(n) distribution
+        # the age axis in ms (u = n*dt), not in bins: the bin index is a property of the
+        # solver, and the two models are only comparable on the physical age
         rp.curves({'Spin Model': d["p_sm"], 'Mean Field': d["p_mf"]},
-                  x=torch.arange(len(d["p_mf"])),
+                  x=torch.arange(len(d["p_mf"])) * dt,
                   title="Firing age distribution (mean-field vs spin model)",
-                  xlabel='n (age bin)', ylabel='p(n)')
+                  xlabel='age u (ms)', ylabel='p(u)')
 
     if True:  # equilibration trajectories
         rp.curves({'Spin Model': sm_traj1["m_tot"], 'Mean Field': mf_traj1["m"]},
@@ -169,10 +187,12 @@ if run_plot:
 
     if True:  # entropy trajectories
         rp.panels({'Spin Model': sm_traj2, 'Mean Field': mf_traj2},
-                  ["m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot"], dt=dt)
+                  ["m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot"], dt=dt,
+                  suptitle='Entropy trajectories')
 
         for name, traj in (("Spin Model", sm_traj2), ("Mean Field", mf_traj2)):
-            print(f"{name}: <sigma> = {traj['sigma'][SKIP:-SKIP].mean():.8f} nats, "
+            print(f"{name} (trimmed {SKIP_MS:g} ms each end): "
+                  f"<sigma> = {traj['sigma'][SKIP:-SKIP].mean():.8f} nats, "
                   f"<H_fwd> = {traj['H_fwd'][SKIP:-SKIP].mean():.8f}, "
                   f"<H_rev> = {traj['H_rev'][SKIP:-SKIP].mean():.8f}")
 
@@ -214,4 +234,4 @@ if run_plot:
         ax2.set_ylim(G[inside].min() - pad, G[inside].max() + pad)
         fig.tight_layout()
 
-    plt.show()
+    rp.show()

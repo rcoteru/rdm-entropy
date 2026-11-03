@@ -89,3 +89,29 @@ def test_epr_peak_matches_the_allocator():
     real = torch.cuda.max_memory_allocated()
     pred = hlp.epr_peak_bytes(B, Q, chunk, inplace=True)
     assert pred <= real <= 1.10 * pred, f"predicted {pred}, measured {real}"
+
+
+# n_steps
+# ~~~~~~~
+
+def test_n_steps_is_the_duration_divided_by_the_step():
+    assert hlp.n_steps(10000.0, 0.5) == 20000
+    assert hlp.n_steps(10000.0, 1.0) == 10000
+
+
+def test_n_steps_keeps_the_window_when_dt_is_refined():
+    """ The point of specifying runs in ms: halving dt doubles the steps and measures the same
+    physical window, where a fixed step count would have halved it. """
+    ms = 6000.0
+    assert hlp.n_steps(ms, 0.25) == 2 * hlp.n_steps(ms, 0.5)
+
+
+def test_n_steps_rounds_to_the_nearest_step():
+    assert hlp.n_steps(1.0, 0.3) == 3          # 3.33 steps, so at most half a step is lost
+    assert hlp.n_steps(1.1, 0.3) == 4
+
+
+@pytest.mark.parametrize("ms, dt", [(0.1, 0.3), (0.0, 1.0), (-5.0, 1.0), (5.0, 0.0)])
+def test_n_steps_rejects_a_window_that_is_not_a_window(ms, dt):
+    with pytest.raises(ValueError):
+        hlp.n_steps(ms, dt)

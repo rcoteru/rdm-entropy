@@ -29,7 +29,14 @@ PARAMS: dict = dict(
 # cache key -- Qm is a solver setting, not a model parameter.
 TOL = 1e-2   # age-grid accuracy; Qm is fitted to it
 
-EQUI, STEPS = 5000, 5000
+# Equilibration and recording are set in MILLISECONDS; the step counts follow dt (see
+# helpers.n_steps). A step count says nothing about the system -- the same 20000 steps is a
+# different physical window at every dt -- so refining dt here keeps the window and buys
+# resolution, which is what refining a solver is supposed to do.
+T_EQUI, T_MEAS = 2500, 2500        # ms (= the 5000 + 5000 steps this script ran at dt = 0.5)
+
+EQUI  = hlp.n_steps(T_EQUI, PARAMS["dt"], name="T_EQUI")
+STEPS = hlp.n_steps(T_MEAS, PARAMS["dt"], name="T_MEAS")
 
 # Reduced at the end of each tile rather than cached whole: the plot stage only ever takes a
 # mean and a std over time, and the full (n_J, n_E, T) trajectories of this grid are 2.5 GiB
@@ -39,7 +46,7 @@ KEYS = ("m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot")
 
 # ── Paths & switches ──────────────────────────────────────────────────────────
 
-CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, equi=EQUI, steps=STEPS, tol=TOL),
+CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
                        root=Path(__file__).parents[1] / "cache")
 
 run_sim   = True
@@ -69,7 +76,8 @@ if run_sim and (overwrite or not CACHE.exists()):
     assert all(len(t) >= 2 for t in J_tiles), "tiles of one J value would drop the J axis"
 
     print(f"Q = {Q} age bins; running {n_tiles} tile(s) of <= {max(map(len, J_tiles))} J values.")
-    print(f"Batch steps: {EQUI+STEPS} per mean-field ({EQUI} equilibration + {STEPS} recording)")
+    print(f"Per mean-field: {T_EQUI:g} ms equilibration + {T_MEAS:g} ms recording "
+          f"= {EQUI + STEPS} steps at dt={PARAMS['dt']:g}")
     print(f"Running on: {device}")
 
     t0 = time.time()
@@ -121,7 +129,8 @@ if run_plot:
                  'Std of Activity': d["m_tot_std"],
                  'Mean Sigma':      d["sigma_tot_mean"],
                  'Std of Sigma':    d["sigma_tot_std"]},
-                extent=extent, xlabel='E (External Input)', ylabel='J (Coupling Strength)')
+                extent=extent, xlabel='E (External Input)', ylabel='J (Coupling Strength)',
+                suptitle='Mean and std over the (E, J) plane')
 
     if True:  # slices of the grid at a handful of J values
         for key, name in (("m_tot", 'Activity'), ("sigma_tot", 'Sigma')):
@@ -136,4 +145,4 @@ if run_plot:
                 ax.fill_between(E, avg[i] - std[i], avg[i] + std[i],
                                 color=line.get_color(), alpha=0.3)
 
-    plt.show()
+    rp.show()

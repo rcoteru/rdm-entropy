@@ -56,6 +56,7 @@ import matplotlib.pyplot as plt
 import torch
 
 import rdme.helpers as hlp
+import rdme.plots as rp
 from rdme.rdm_single import RDMIsingModel
 
 
@@ -578,4 +579,4 @@ if run_plot:
     fig.suptitle(r'Control: $H$ diverges as $-r\ln\Delta_t$, at the predicted rate')
     fig.tight_layout()
 
-    plt.show()
+    rp.show()

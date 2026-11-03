@@ -8,6 +8,7 @@ import torch
 import rdme.fixed_points as fpts
 import rdme.helpers as hlp
 import rdme.plots as rp
+import rdme.presets as pre
 from rdme.rdm_batch import RDMIsingModelBatch
 
 
@@ -24,17 +25,14 @@ from rdme.rdm_batch import RDMIsingModelBatch
 # an unsaturated oscillatory cell at every beta down to 2.
 #
 # theta crosses one Hopf at ~0.86: oscillatory below, stable above.
-PARAMS: dict = dict(
+PRESET = "S1"
+HAZARD = "async"        # stated per script: the hazard is its own axis, not part of a preset
+
+PARAMS: dict = pre.params(
+    PRESET, hazard=HAZARD,
     J       = 15.0,
-    E       = 0.0,    # zero input: the activity is self-sustained, not driven
-    beta    = 6.0,    # low: the sigmoid is soft enough to supply the drive
     theta   = torch.linspace(0, 1.6, 300),
-    tau_int = 15.0,
-    tau_ref = 15.0,   # long: the refractory delay sets the oscillation period (~117 ms)
-    K_ref   = 15.0,   # without this the fixed point is stable at every beta -- see above
-    dt0     = 1.0,
     dt      = 1.0,
-    hazard  = "async",
 )
 
 # The age grid is FITTED, not declared: the model's q_from_tau default sizes it from the
@@ -46,7 +44,18 @@ TOL = 1e-2   # age-grid accuracy; Qm is fitted to it
 AXIS  = "theta"                      # the swept parameter: the one PARAMS gives a vector
 LABEL = 'Threshold θ'
 
-EQUI, STEPS = 20000, 30000
+# Equilibration and recording are set in MILLISECONDS; the step counts follow dt (see
+# helpers.n_steps). A step count says nothing about the system -- the same 20000 steps is a
+# different physical window at every dt -- so refining dt here keeps the window and buys
+# resolution, which is what refining a solver is supposed to do.
+#
+# 10000 + 15000 ms is the window shared by all four S1 1-D scans, so they average over the
+# same stretch and can be read against each other: at the ~117 ms period of S1 that is ~85
+# cycles of equilibration and ~128 recorded.
+T_EQUI, T_MEAS = 10000.0, 15000.0
+
+EQUI  = hlp.n_steps(T_EQUI, PARAMS["dt"], name="T_EQUI")
+STEPS = hlp.n_steps(T_MEAS, PARAMS["dt"], name="T_MEAS")
 
 N_LEAD     = 4      # leading eigenvalues kept per fixed point
 N_THETA_FP = 100    # theta values to analyse; the cost is dominated by the eigendecomposition
@@ -70,7 +79,7 @@ MEANS = ("sigma_tot", "H_fwd_tot", "H_rev_tot")
 
 CACHE_DIR = Path(__file__).parents[1] / "cache"
 STEM      = Path(__file__).stem
-CACHE_SIM = hlp.cache_path(STEM, dict(PARAMS, equi=EQUI, steps=STEPS, tol=TOL),
+CACHE_SIM = hlp.cache_path(STEM, dict(PARAMS, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
                            tag="traj", root=CACHE_DIR)
 CACHE_FP  = hlp.cache_path(STEM, dict(PARAMS, n_lead=N_LEAD, n_pts=N_THETA_FP, n_scan=N_SCAN, tol=TOL),
                            tag="fp", root=CACHE_DIR)
@@ -109,7 +118,8 @@ if run_sim and (overwrite or not CACHE_SIM.exists()):
     B_tile, chunk = hlp.epr_plan(len(axis_values), Qm[0], device=device)
     tiles = torch.tensor_split(axis_values, max(1, -(-len(axis_values) // B_tile)))
 
-    print(f"Running {len(axis_values)} mean-fields for {EQUI+STEPS} steps on {device}...")
+    print(f"Running {len(axis_values)} mean-fields for {T_EQUI + T_MEAS:g} ms "
+          f"({EQUI + STEPS} steps at dt={PARAMS['dt']:g}) on {device}...")
     t0 = time.time()
     parts = []
     for k, vals in enumerate(tiles):
@@ -132,7 +142,8 @@ if run_sim and (overwrite or not CACHE_SIM.exists()):
         if device == 'cuda': torch.cuda.empty_cache()
     print(f"Done in {time.time() - t0:.2f}s")
 
-    out: dict = {"params": PARAMS, "equi": EQUI, "steps": STEPS}
+    out: dict = {"params": PARAMS, "t_equi": T_EQUI, "t_meas": T_MEAS,
+             "equi": EQUI, "steps": STEPS}
     out.update({key: torch.cat([p[key] for p in parts], dim=0) for key in parts[0]})
 
     CACHE_DIR.mkdir(exist_ok=True)
@@ -172,11 +183,8 @@ if run_plot:
     d  = torch.load(CACHE_SIM, weights_only=False)
     fp = torch.load(CACHE_FP, weights_only=False) if CACHE_FP.exists() else None
 
-    banner = ('RDM Ising mean-field  '
-              f'J={PARAMS["J"]:g},  E={PARAMS["E"]:g},  β={PARAMS["beta"]:g},  '
-              f'τ_int={PARAMS["tau_int"]:g},  τ_ref={PARAMS["tau_ref"]:g},  '
-              f'K_ref={PARAMS["K_ref"]:g}')
+    banner = pre.banner(PRESET, PARAMS)
 
     rp.sweep_figures(PARAMS[AXIS], d["m_tot"], dt=PARAMS["dt"], label=LABEL, banner=banner,
                      fp=fp, means={k: d[f"{k}_mean"] for k in MEANS})
-    plt.show()
+    rp.show()

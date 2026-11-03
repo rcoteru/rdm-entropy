@@ -32,7 +32,14 @@ PARAMS: dict = dict(
     eps     = 0.01,
 )
 
-EQUI, STEPS = 20000, 30000
+# Equilibration and recording are set in MILLISECONDS; the step counts follow dt (see
+# helpers.n_steps). A step count says nothing about the system -- the same 20000 steps is a
+# different physical window at every dt -- so refining dt here keeps the window and buys
+# resolution, which is what refining a solver is supposed to do.
+T_EQUI, T_MEAS = 20000, 30000        # ms (= the 20000 + 30000 steps this script ran at dt = 1)
+
+EQUI  = hlp.n_steps(T_EQUI, PARAMS["dt"], name="T_EQUI")
+STEPS = hlp.n_steps(T_MEAS, PARAMS["dt"], name="T_MEAS")
 
 # The age grid is sized from the RATE as well as the kernels. q_from_tau alone truncates where
 # the kernel has decayed, which is the right rule only when the firing rate is high enough that
@@ -54,7 +61,7 @@ KEYS = ("m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot")
 
 # ── Paths & switches ──────────────────────────────────────────────────────────
 
-CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, equi=EQUI, steps=STEPS, tol=TOL),
+CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
                        root=Path(__file__).parents[1] / "cache")
 
 run_sim   = True
@@ -114,7 +121,8 @@ if run_sim and (overwrite or not CACHE.exists()):
              for t in tr_tiles]
     print(f"Running {n_tiles} tile(s) along tau_ref, largest peak "
           f"{max(peaks)/2**30:.1f} GiB of {hlp.device_budget(device)/2**30:.1f} GiB budget.")
-    print(f"Batch steps: {EQUI+STEPS} per mean-field ({EQUI} equilibration + {STEPS} recording)")
+    print(f"Per mean-field: {T_EQUI:g} ms equilibration + {T_MEAS:g} ms recording "
+          f"= {EQUI + STEPS} steps at dt={PARAMS['dt']:g}")
     print(f"Running on: {device}")
 
     t0 = time.time()
@@ -180,7 +188,8 @@ if run_plot:
                  'Mean Sigma':       d["sigma_tot_mean"],
                  'Std of Sigma':     d["sigma_tot_std"]},
                 extent=extent, xlabel='K_ref (refractory amplitude)',
-                ylabel='τ_ref (refractory timescale, ms)')
+                ylabel='τ_ref (refractory timescale, ms)',
+                suptitle='Oscillation and its cost over the (K_ref, tau_ref) plane')
 
     if True:  # the K_ref = 0 null arm against a few nonzero ones
         idxs = hlp.grab_closest_idxs(K_ref, [0.0, 6.0, 12.0, 25.0])
@@ -189,4 +198,4 @@ if run_plot:
                        xlabel='τ_ref (ms)', ylabel='CV of activity', figsize=(8, 6))
         ax.set_yscale('log')
 
-    plt.show()
+    rp.show()

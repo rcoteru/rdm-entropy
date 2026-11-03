@@ -1,0 +1,219 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+""" The named parameter sets every run starts from.
+
+A run is a PRESET plus explicit overrides, and nothing else. The point is not convenience --
+seven numbers are not hard to type -- but that a number quoted in a dump or a note can be
+traced back to a parameter set with a name, instead of to a dict that happened to be at the
+top of a script on the day. If a run differs from a preset in anything other than its swept
+axes and its listed overrides, it is a new preset and belongs in this file (and in the table
+in CLAUDE.md, which is the same table in prose).
+
+What a preset holds is the MODEL: the couplings, the kernels, the time quantum `dt0` and the
+absolute refractory window `t_abs`. What it deliberately does not hold:
+
+  the hazard, which is its own axis. Three kernels share these parameters and are different
+  models, so a preset that named one would quietly fold that choice into every comparison.
+  `params()` therefore takes `hazard` as a required keyword -- the script has to say it, and
+  it ends up in the dump's frontmatter because the script had to write it down.
+
+  the solver step `dt`, the age grid `Qm` and the tolerance, which are numerics rather than
+  model. `dt` defaults to `dt0` (the discrete model) and is overridden per run; `Qm` is fitted
+  to a tolerance by helpers.fit_age_grid rather than declared.
+
+  N, for the spin runs. The same preset drives the mean field and the microscopic model, and
+  N is a property of the simulation, not of the system being simulated.
+
+`t_abs=None` means the model's own default, which is `dt0` -- written as None rather than as a
+number so that overriding `dt0` carries the window with it. A study that is ABOUT the window
+overrides it explicitly.
+
+Status: the hazard convention is not settled, so the presets below are the parameters, not a
+full specification of a model; the Hopf points and the named cycle points move with the hazard
+and are recorded where they are known for a stated one. The two-population sets are not here
+yet, see PENDING. """
+
+
+# The presets
+# ~~~~~~~~~~~
+#
+# Single-population (Ising) sets. Every entry is kwargs for RDMIsingModel / RDMIsingModelBatch
+# / SpinIsingModel, which take the same names -- so one preset drives the mean field, the batch
+# sweeps and the spin simulations without a translation layer in between.
+
+PRESETS: dict[str, dict] = {
+
+    # The main one-population system (formerly "the Ising set"): no drive, self-sustained
+    # activity. J is NOT part of it -- it is the axis this system is studied along, and a run
+    # either sweeps it or names a point below.
+    "S1": dict(
+        E       = 0.0,
+        beta    = 6.0,
+        theta   = 0.5,
+        tau_int = 15.0,
+        tau_ref = 15.0,
+        K_ref   = 15.0,
+        dt0     = 1.0,
+        t_abs   = None,     # = dt0
+    ),
+
+    # The rate-ceiling test (formerly "the low-beta point"): strong coupling into saturation,
+    # where the sigmoid kernel peaks at 100% of lam0 and the unbounded kernels do not. J is
+    # part of this one, since the point IS the saturated state.
+    "S1-sat": dict(
+        E       = 0.0,
+        beta    = 8.0,
+        theta   = 0.5,
+        tau_int = 10.0,
+        tau_ref = 25.0,
+        K_ref   = 25.0,
+        J       = 40.0,
+        dt0     = 1.0,
+        t_abs   = None,
+    ),
+
+    # Legacy driven high-beta set. Here to reproduce old figures and for nothing else: no
+    # refractory kernel (K_ref = 0), a drive that does the work instead, and dt0 = 0.5.
+    "D1": dict(
+        E       = 0.9,
+        beta    = 30.0,
+        theta   = 1.0,
+        tau_int = 20.0,
+        tau_ref = 3.0,
+        K_ref   = 0.0,
+        dt0     = 0.5,
+        t_abs   = None,
+    ),
+}
+
+# Named points on a preset's axis: a preset plus the one coupling that makes it a system
+# rather than a family. `params("S1/fp")` resolves them, and they read as presets everywhere
+# else, so a script and a dump can name the point instead of quoting the number.
+#
+# The cycle point is deliberately absent: under the Poisson kernel the Hopf sits near
+# J = 14.4-14.6 rather than at the 12.06 measured with the sigmoid at dt = dt0, and the cycle
+# point has to be re-chosen once the hazard is fixed. J = 17 is the candidate.
+POINTS: dict[str, dict] = {
+    "S1/fp": {"J": 10.0},                   # the fixed point below the Hopf
+}
+
+# Populations per preset, so a caller can tell which constructor a name belongs to without
+# counting parameters.
+POPS: dict[str, int] = {"S1": 1, "S1-sat": 1, "D1": 1, "S1/fp": 1}
+
+# Every model parameter a preset of M populations may carry, which is what an override is
+# checked against: a preset leaves J out when J is its swept axis, and that absence should not
+# make `J=...` an error. Mirrors the signature of RDMIsingModel; tests/test_presets.py checks
+# the two against each other so a parameter added to the model cannot be forgotten here.
+MODEL_KEYS: dict[int, frozenset[str]] = {
+    1: frozenset({"J", "E", "beta", "theta", "tau_int", "tau_ref", "K_ref", "dt0", "t_abs"}),
+}
+
+# Two-population sets named in CLAUDE.md but NOT encoded yet, with what is missing. Asking for
+# one raises with this text rather than returning an invented parameter set: the EI row is
+# short of w_EE and w_EI and is marked "to be confirmed", and the Painchaud cell is built by a
+# mapping whose tau_m step may still change.
+PENDING: dict[str, str] = {
+    "EI":   "the CLAUDE.md row is incomplete (no w_EE, w_EI) and marked to be confirmed; "
+            "wc-mf_vs_sm.py carries two further E-I sets that have to be reconciled first",
+    "EE-P": "built by the Painchaud et al. (2022) mapping in wc-painchaud.py, whose tau_m "
+            "step is not settled; encode it here once the mapping is fixed",
+}
+
+# The hazard is its own axis and has no default yet; scripts state it. Set this once the
+# convention is fixed (route B: "poisson" at the quantum, "exp_surv" as its exact-survival
+# solver), and `params()` will take it as the fallback.
+DEFAULT_HAZARD: str | None = None
+
+# Keys a run may pass that are not model parameters: the solver, the grid, the hardware and,
+# for the spin runs, the population size. Separated from the model keys so that `params()` can
+# reject a typo in a model parameter without also rejecting these.
+SOLVER_KEYS = frozenset({"dt", "Qm", "eps", "device", "N", "ic"})
+
+
+# Resolving a run
+# ~~~~~~~~~~~~~~~
+
+def resolve(name: str) -> dict:
+    """ The parameter dict a preset name stands for, including the named points (`S1/fp`).
+
+    A copy, so a caller mutating what it gets back cannot edit the preset for the rest of the
+    session -- the bug that makes two runs in one process disagree for no visible reason. """
+    if name in PRESETS:
+        return dict(PRESETS[name])
+    if name in POINTS:
+        base = name.split("/")[0]
+        return dict(PRESETS[base]) | dict(POINTS[name])
+    if name in PENDING:
+        raise KeyError(f"preset {name!r} is not encoded yet: {PENDING[name]}")
+    raise KeyError(f"unknown preset {name!r}; known: {sorted(PRESETS) + sorted(POINTS)}")
+
+
+def params(name: str, *, hazard: str | None = None, **overrides) -> dict:
+    """ Model kwargs for `name`, with `hazard` and `overrides` applied: the one call a script
+    makes to build its parameter dict.
+
+        PARAMS = presets.params("S1", hazard="poisson", J=torch.linspace(0, 20, 300), dt=0.2)
+        mf = RDMIsingModelBatch(**PARAMS, Qm=Qm, device=device)
+
+    `hazard` is required while the convention is unsettled (DEFAULT_HAZARD is None), because
+    the hazard is a modelling choice of the same weight as the couplings and a default would
+    let a comparison span two models without saying so.
+
+    An override of a name the preset does not have, and that is not a solver key, raises:
+    swept axes (J here) are model parameters and pass, while `tau_m=...` or `Jay=...` is a typo
+    or a parameter this model does not have, and either way is not something to discover in the
+    figure. The deliberate exception is a key the constructor takes but the preset leaves out,
+    which is what SOLVER_KEYS lists. """
+    p = resolve(name)
+
+    hazard = hazard if hazard is not None else DEFAULT_HAZARD
+    if hazard is None:
+        raise ValueError(
+            "hazard must be given: it is its own axis, not part of a preset, and there is no "
+            "default convention yet. Pass hazard='poisson' (the MaxCal kernel at each bin) or "
+            "hazard='exp_surv' (exact survival for the same continuum).")
+
+    model_keys = MODEL_KEYS[POPS[name]]
+    unknown = [k for k in overrides if k not in model_keys and k not in SOLVER_KEYS]
+    if unknown:
+        raise TypeError(f"{sorted(unknown)} is not a parameter of preset {name!r} "
+                        f"(it takes {sorted(model_keys)}) nor a solver key "
+                        f"({sorted(SOLVER_KEYS)}). "
+                        f"If the run really needs it, it is a NEW preset: add it here and to "
+                        f"the table in CLAUDE.md.")
+
+    return p | {"hazard": hazard} | overrides
+
+
+def diff(name: str, p: Mapping) -> dict:
+    """ What `p` overrides in preset `name`: the `overrides:` field of a dump's frontmatter.
+
+    Written from the run's own parameter dict rather than typed out, so the frontmatter cannot
+    disagree with what was computed. Solver keys and the hazard are reported separately in the
+    frontmatter and are left out here; so are the swept axes, which are not scalars. """
+    base = resolve(name)
+    return {k: v for k, v in p.items()
+            if k not in SOLVER_KEYS and k != "hazard"
+            and not hasattr(v, "shape")               # a swept axis, not an override
+            and (k not in base or base[k] != v)}
+
+
+def banner(name: str, p: Mapping, *, keys: tuple[str, ...] | None = None) -> str:
+    """ The one-line parameter string for a figure title: preset, hazard, dt, parameters.
+
+    CLAUDE.md asks every figure to state its preset, hazard and dt, and this is that line, so
+    a figure cannot claim a set it was not run at -- it is built from the dict that built the
+    model. """
+    head = f'{name}  ·  hazard={p.get("hazard", "?")}'
+    dt, dt0 = p.get("dt"), p.get("dt0")
+    if dt0 is not None:
+        head += f'  ·  dt={dt0 if dt is None else dt:g} (dt0={dt0:g})'
+
+    keys = keys or ("J", "E", "beta", "theta", "tau_int", "tau_ref", "K_ref")
+    shown = {k: p[k] for k in keys if k in p and not hasattr(p[k], "shape")}
+    pretty = {"beta": "β", "theta": "θ", "tau_int": "τ_int", "tau_ref": "τ_ref"}
+    body = ',  '.join(f'{pretty.get(k, k)}={v:g}' for k, v in shown.items())
+    return f'{head}  —  {body}' if body else head

@@ -37,6 +37,7 @@ import matplotlib.pyplot as plt
 import torch
 
 import rdme.helpers as hlp
+import rdme.plots as rp
 from rdme.rdm_single import RDMIsingModel
 from rdme.spin_model import SpinIsingModel
 
@@ -694,4 +695,4 @@ if run_plot:
                  r'and only zero at the fixed point')
     fig.tight_layout()
 
-    plt.show()
+    rp.show()

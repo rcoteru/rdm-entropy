@@ -224,3 +224,6 @@ __marimo__/
 # Data that cannot be shared publicly
 data/*
 */figures
+
+# Local run records: figures and dumps travel to the vault by hand
+scripts/dumps/
