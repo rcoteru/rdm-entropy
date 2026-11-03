@@ -7,22 +7,18 @@ from pathlib import Path
 import torch
 import tqdm
 
-from rdme.dynamics import (compute_total_input, compute_firing_rate,
-                               update_synaptic_term, update_age_distribution)
-from rdme.epr import (joint_distribution, epr_from_joint, make_epr_indices,
-                          init_epr_state, step_epr, anchor_reverse_synaptic_term,
-                          hazard_field, EPRState)
-from rdme.fixed_points import fp_overlap_map, fp_state, fp_guess_lattice
-from rdme.lyapunov import update_tangent, init_tangent_blocks
-
-from rdme.single import RDMNetwork
-from rdme.hazards import HAZARDS
-import rdme.fixed_points as fpts
+import rdme.rdm as rdm
+import rdme.epr as epr
+import rdme.hazards as hzd
 import rdme.kernels as krn
+import rdme.fixed_points as fpts
+import rdme.lyapunov as lyap
+
+from rdme.rdm_single import RDMNetwork
 
 """ A batch of independent systems sharing an architecture but not their parameters.
 
-The batched counterpart of rdme.single. Same model, same hazards, same observables; the
+The batched counterpart of rdme.rdm_single. Same model, same hazards, same observables; the
 difference is that every parameter carries a leading batch axis and one `update()` advances the
 whole batch, so a parameter sweep is one pass rather than B of them.
 
@@ -30,14 +26,14 @@ Everything the batch needs beyond the class itself is already rank-agnostic: rdm
 rdme.fixed_points and
 rdme.epr index on trailing axes, so the overlap map, the tangent step and both entropy paths are
 the same functions the single system calls, with a (B, ...) argument instead of a (...) one.
-That is worth stating because rdme.mean_field could not do it -- its joint build is written for
+That is worth stating because the pre-port implementation could not do it -- its joint build was written for
 one system and the batched case goes through torch.vmap with a chunk size. Here the gather
 consumes exactly the last two axes, so no vmap is involved and the joint path is available to
 the batch too, as the oracle the sliding recursions are checked against.
 
-Weights are in physical units and NOT divided by dt, as in rdme.single: the input is built from
-the rate r = m/dt. The factories at the bottom mirror the rdme.mean_field ones with that one
-change at the call site. """
+Weights are in physical units and NOT divided by dt -- pass J, never J/dt. The input is built
+from the rate r = m/dt, which is what makes a coupling independent of the step; see
+rdm.compute_total_input, which states the convention once for all three model classes. """
 
 
 # Parameter grids
@@ -154,9 +150,11 @@ class RDMNetworkBatch:
                  tau_int: torch.Tensor,
                  tau_ref: torch.Tensor,
                  K_ref: torch.Tensor,
-                 dt: float = 1.0,
-                 dt0: float | None = None,
+                 *,
+                 dt0: float,
+                 dt: float | None = None,
                  hazard: str = "escape",
+                 t_abs: float | None = None,
                  Qm: list[int] | None = None,
                  eps: float = 0.01,
                  grid_shape: tuple[int, ...] | None = None,
@@ -166,9 +164,10 @@ class RDMNetworkBatch:
         from w. N is a plain length-M list, shared across the batch: population sizes are
         structural, not swept.
 
-        dt is the resolution and dt0 the model's time quantum (see RDMNetwork); both are
-        scalars shared by the batch, since a sweep over dt0 would be a sweep over *models* and
-        is better written as separate batches.
+        dt0 is the model and dt the solver (see hazards.resolve_timesteps); both are scalars
+        shared by the batch, since a sweep over dt0 would be a sweep over *models* and is
+        better written as separate batches. dt0 is required and keyword-only, dt defaults to
+        it.
 
         Qm, if given, is shared. Otherwise each population's bin count comes from the slowest
         (tau_int, tau_ref) pair anywhere in the batch, so one Qm[i] safely represents every
@@ -183,18 +182,11 @@ class RDMNetworkBatch:
                           ("tau_ref", tau_ref), ("K_ref", K_ref)]:
             assert arr.shape == (B, M), f"{name} must have shape (B={B},M={M})"
         assert len(N) == M and all(isinstance(n, int) for n in N), "N must be M integers"
-        if hazard not in HAZARDS:
-            raise ValueError(f"hazard must be one of {sorted(HAZARDS)}, got {hazard!r}")
+        self.dt0, dt, self.lam0 = hzd.resolve_timesteps(dt0, dt, hazard)
 
         dtype = torch.get_default_dtype()
         self.B, self.M, self.dt, self.device = B, M, dt, device
         self.hazard = hazard
-        self.dt0 = dt if dt0 is None else dt0
-        self.lam0 = 1.0 / self.dt0
-        if HAZARDS[hazard].bounded_step and self.lam0 * dt > 1.0 + 1e-12:
-            raise ValueError(
-                f"hazard {hazard!r} requires lam0*dt <= 1, got lam0*dt = {self.lam0 * dt:.4g} "
-                f"(dt={dt}, dt0={self.dt0}). Refine dt, or raise dt0.")
 
         self.N = N
         self.w = w.to(device=device, dtype=dtype)
@@ -223,11 +215,20 @@ class RDMNetworkBatch:
         assert len(Qm) == M and all(isinstance(q, int) and q > 0 for q in Qm)
         self.Qm = Qm
 
-        # per-population, per-element refractory kernel; refractory_kernel takes scalar K/tau,
-        # so vmap over the batch for each population separately (ragged Qm rules out one vmap)
+        # t_abs defaults to dt0 for the refinement-consistency reason in RDMNetwork; it is a
+        # scalar shared by the batch, since dt0 and dt are, so n_abs is too. R_abs is NOT --
+        # it is sized per element from that element's weights, so it rides the vmap.
+        self.t_abs = self.dt0 if t_abs is None else t_abs
+        # abs_refractory_floor reduces w over its last axis and is elementwise in everything
+        # else, so (B, M, M) and (B, M) go straight through -- no vmap needed here
+        self.R_abs = (krn.abs_refractory_floor(self.w, self.E, self.theta, self.beta,
+                                               r_max=1.0 / self.t_abs)
+                      if self.t_abs > 0 else torch.zeros_like(self.theta))
+        self.n_abs = krn.n_abs_bins(self.t_abs, dt)
         self.R = [
-            torch.vmap(lambda K, tau, i=i: krn.refractory_kernel(
-                self.Qm[i], K, tau, dt=dt, device=device))(self.K_ref[:, i], self.tau_ref[:, i])
+            torch.vmap(lambda K, tau, Ra, i=i: krn.refractory_kernel(
+                self.Qm[i], K, tau, dt=dt, t_abs=self.t_abs, R_abs=Ra, device=device)
+            )(self.K_ref[:, i], self.tau_ref[:, i], self.R_abs[:, i])
             for i in range(M)
         ]
 
@@ -295,12 +296,14 @@ class RDMNetworkBatch:
             # the step deltaT, and -- the part that would otherwise corrupt the model silently
             # -- it stored w already divided by it, because its input was built from the
             # per-bin overlap rather than the rate. Multiplying back recovers physical units.
-            # The hazard it implied is the sigmoid at its own step, i.e. lam0*dt = 1.
+            # The hazard it implied is the sigmoid at its own step, i.e. lam0*dt = 1 -- which
+            # is "async" there, bit for bit, the synchronous kernel having been dropped as a
+            # redundant parameterisation of exactly that point.
             data = dict(data)
             data["dt"] = data.pop("deltaT")
             data["w"] = data["w"] * data["dt"]
             data["dt0"], data["lam0"] = data["dt"], 1.0 / data["dt"]
-            data["hazard"] = "synchronous"
+            data["hazard"] = "async"
 
         for k in cls._SAVE_SCALARS:
             setattr(obj, k, data[k])
@@ -339,10 +342,61 @@ class RDMNetworkBatch:
         return [p_i / self.dt for p_i in self.p]
 
     @torch.inference_mode()
+    def max_step_prob(self) -> torch.Tensor:   # (B,)
+        """ Per batch element, max over bins and populations of Phi at the CURRENT state: the
+        largest fraction of an age bin that fires in one step. See RDMNetwork.max_step_prob for
+        what it is for -- in a sweep it is also the cheapest way to find the cells where dt has
+        stopped resolving the hazard, which are not usually the ones you would have guessed. """
+        return torch.stack([phi.flatten(1).max(dim=1).values
+                            for phi in self.firing_prob()], dim=0).max(dim=0).values
+
+    @torch.inference_mode()
+    def truncation_error(self) -> torch.Tensor:   # (B,)
+        """ Rigorous relative bound on the firing-rate error committed by the finite age grid.
+
+            err = p[-1] * |Phi(h_inf) - Phi(h[-1])| / m
+
+        Read it as: the fraction of the population's firing that is misassigned because the
+        age axis stops at U_max = Q*dt. `tol = 1e-2` therefore means "the rate is right to 1%",
+        which is a statement about the answer rather than about a kernel.
+
+        Why it is a bound and not an estimate. The boundary bin is absorbing: every cohort
+        older than U_max is lumped into it and fires at Phi(h[-1]), when cohort u should fire
+        at Phi(h(u)). But h(u) = S(u) + R(u) - theta is MONOTONE increasing in age -- the
+        synaptic term saturates up to the total input I and the refractory kernel decays up to
+        zero -- and Phi is monotone in h. So every true Phi(h(u)) for u > U_max lies between
+        Phi(h[-1]) and Phi(h_inf), and the displaced mass p[-1] cannot be wrong by more than
+        the gap between them. Nothing here is linearized and no gain is approximated.
+
+        This supersedes two earlier attempts, both wrong in instructive ways:
+
+          - thresholding the boundary MASS p[-1]. A cell at a low-rate fixed point correctly
+            keeps nearly all its mass at old ages, so any sweep containing a silent cell fails
+            such a check everywhere. On the theta scan the mass stays near 0.94 however far Q
+            is pushed, while this error falls through 1e-6.
+          - thresholding `p[-1] * beta * |R(U_max)|`. With K_ref = 0 the refractory term
+            vanishes identically and the check reports convergence however much mass is
+            frozen -- worse than no check. The synaptic tail is what is left.
+
+        Divide-by-zero is not guarded: a population with m = 0 is not firing at all, and the
+        age grid cannot be distorting a rate that does not exist. """
+        I = self.total_input()                              # (B, M), the asymptotic field
+        h = self.field()
+        phi = hzd.HAZARDS[self.hazard].phi
+        out = []
+        for i in range(self.M):
+            h_inf = (I[:, i] - self.theta[:, i]).unsqueeze(-1)            # (B, 1)
+            b     = self.beta[:, i:i+1]
+            gap   = (phi(h_inf, b, self.lam0, self.dt).squeeze(-1)
+                     - phi(h[i][:, -1:], b, self.lam0, self.dt).squeeze(-1)).abs()
+            out.append(self.p[i][:, -1] * gap / self.m[:, i].clamp_min(1e-300))
+        return torch.stack(out, dim=0).max(dim=0).values
+
+    @torch.inference_mode()
     def total_input(self) -> torch.Tensor:
         """ I^a = sum_b w^{ab} r^b + E^a, shape (B, M). Built from the RATE, which is why w
         carries no 1/dt here. """
-        return compute_total_input(self.rates(), self.w, self.E)
+        return rdm.compute_total_input(self.rates(), self.w, self.E)
 
     @torch.inference_mode()
     def field(self) -> list[torch.Tensor]:
@@ -352,19 +406,19 @@ class RDMNetworkBatch:
     @torch.inference_mode()
     def firing_prob(self) -> list[torch.Tensor]:
         """ Per-bin hazard Phi, list of (B, Qm[i]). """
-        fn, h = HAZARDS[self.hazard].phi, self.field()
+        fn, h = hzd.HAZARDS[self.hazard].phi, self.field()
         return [fn(h[i], self.beta[:, i:i+1], self.lam0, self.dt) for i in range(self.M)]
 
     @torch.inference_mode()
     def d_firing_prob(self) -> list[torch.Tensor]:
         """ dPhi/dh at the current state, list of (B, Qm[i]). Needed by the tangent map. """
-        fn, h = HAZARDS[self.hazard].dphi, self.field()
+        fn, h = hzd.HAZARDS[self.hazard].dphi, self.field()
         return [fn(h[i], self.beta[:, i:i+1], self.lam0, self.dt) for i in range(self.M)]
 
     @torch.inference_mode()
     def hazard_rate(self) -> list[torch.Tensor]:
         """ The rate lambda(h) the hazard represents, in 1/ms, list of (B, Qm[i]). """
-        fn, h = HAZARDS[self.hazard].rate, self.field()
+        fn, h = hzd.HAZARDS[self.hazard].rate, self.field()
         return [fn(h[i], self.beta[:, i:i+1], self.lam0, self.dt) for i in range(self.M)]
 
     # Fixed points
@@ -372,17 +426,17 @@ class RDMNetworkBatch:
 
     def _fp_args(self) -> tuple:
         return (self.w, self.E, self.alpha_int, self.beta, self.theta, self.R,
-                HAZARDS[self.hazard], self.lam0, self.dt)
+                hzd.HAZARDS[self.hazard], self.lam0, self.dt)
 
     def fp_residual(self, m: torch.Tensor) -> torch.Tensor:
         """ G(m) = m - F(m) for the whole batch at once: m is (B, M), out is (B, M). In
         overlaps, not rates, so the residual sits on the [0, 1] scale the generic Newton
         routines clamp to. """
-        return m - fp_overlap_map(m, *self._fp_args())
+        return m - fpts.fp_overlap_map(m, *self._fp_args())
 
     def fp_state(self, m: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """ The stationary (p, S) implied by the overlaps m. """
-        return fp_state(m, *self._fp_args())
+        return fpts.fp_state(m, *self._fp_args())
 
     def set_state(self, m: torch.Tensor) -> None:
         """ Place every system on the stationary state implied by its overlaps. """
@@ -398,8 +452,8 @@ class RDMNetworkBatch:
         and not tensors. Argument order matches fp_sweep's params tuple. """
         w, E, alpha, beta, theta = params[:5]
         R = list(params[5:])
-        return m - fp_overlap_map(m, w, E, alpha, beta, theta, R,
-                                  HAZARDS[self.hazard], self.lam0, self.dt)
+        return m - fpts.fp_overlap_map(m, w, E, alpha, beta, theta, R,
+                                  hzd.HAZARDS[self.hazard], self.lam0, self.dt)
 
     def fp_sweep(self,
                  guesses: torch.Tensor | None = None,
@@ -423,7 +477,7 @@ class RDMNetworkBatch:
         The default lattice spans overlaps in [0, 1], which at small dt is a very coarse net
         over a root sitting at O(dt) -- pass `guesses` explicitly when refining. """
         if guesses is None:
-            guesses = fp_guess_lattice(self.M, n_per_axis, device=self.device)
+            guesses = fpts.fp_guess_lattice(self.M, n_per_axis, device=self.device)
         K = guesses.shape[0]
 
         def rep(t): return t.repeat_interleave(K, dim=0)
@@ -447,10 +501,10 @@ class RDMNetworkBatch:
         the tangent: the tangent is the linearization *at this state*, so a second evaluation
         after the state had moved would linearize about the wrong point. """
         self.m = torch.stack(
-            [compute_firing_rate(self.p[i], fprobs[i]) for i in range(self.M)], dim=1)
+            [rdm.compute_firing_rate(self.p[i], fprobs[i]) for i in range(self.M)], dim=1)
         for i in range(self.M):
-            self.p[i] = update_age_distribution(self.p[i], fprobs[i])
-            self.S[i] = update_synaptic_term(self.S[i], self.alpha_int[:, i:i+1], I[:, i:i+1])
+            self.p[i] = rdm.update_age_distribution(self.p[i], fprobs[i])
+            self.S[i] = rdm.update_synaptic_term(self.S[i], self.alpha_int[:, i:i+1], I[:, i:i+1])
 
     @torch.inference_mode()
     def update(self) -> None:
@@ -471,7 +525,7 @@ class RDMNetworkBatch:
                      generator: torch.Generator | None = None,
                      ) -> list[torch.Tensor]:   # 2M blocks, each (B, k, Qm[i])
         """ A random orthonormal, sum-zero tangent basis for the whole batch. """
-        return init_tangent_blocks(self.Qm, k, prefix=(self.B,),
+        return lyap.init_tangent_blocks(self.Qm, k, prefix=(self.B,),
                                    device=self.device, generator=generator)
 
     @torch.no_grad()
@@ -483,7 +537,7 @@ class RDMNetworkBatch:
         I      = self.total_input()
         fprobs = self.firing_prob()
         dphi   = self.d_firing_prob()
-        blocks[:] = update_tangent(
+        blocks[:] = lyap.update_tangent(
             blocks, self.p, fprobs, dphi, self.w,
             [self.alpha_int[:, i].reshape(-1, 1, 1) for i in range(self.M)], self.dt)
         self._advance_from(I, fprobs)
@@ -577,7 +631,7 @@ class RDMNetworkBatch:
 
         B, M, Qm, device = self.B, self.M, self.Qm, self.device
         Q_max = max(Qm)
-        hz, lam0, dt = HAZARDS[self.hazard], self.lam0, self.dt
+        hz, lam0, dt = hzd.HAZARDS[self.hazard], self.lam0, self.dt
         ok = self._out_device_kwargs()
 
         out = {k: torch.zeros(B, T, M, **ok) for k in ("r", "m", "sigma", "H_fwd", "H_rev")}
@@ -597,17 +651,17 @@ class RDMNetworkBatch:
                 else:         pending[i].append(snap)
             self.update()
 
-        idx = [make_epr_indices(Qm[i], Qm[i], device) for i in range(M)]
+        idx = [epr.make_epr_indices(Qm[i], Qm[i], device) for i in range(M)]
 
         def _init_state(i):
             """ The sliding state for population i, in batch chunks. Each field of EPRState is
             a per-element quantity, so the chunks concatenate back along the batch axis. """
             cs = B if chunk is None else chunk
-            parts = [init_epr_state(p_cur[i][sub], buff_S[i][sub], self.R[i][sub],
+            parts = [epr.init_epr_state(p_cur[i][sub], buff_S[i][sub], self.R[i][sub],
                                     self.beta[sub, i:i+1], self.theta[sub, i:i+1],
                                     hz, lam0, dt, inplace=inplace)
                      for sub in (slice(lo, min(lo + cs, B)) for lo in range(0, B, cs))]
-            return EPRState(*(torch.cat(f, dim=0) for f in zip(*parts)))
+            return epr.EPRState(*(torch.cat(f, dim=0) for f in zip(*parts)))
 
         state = [_init_state(i) if method == "sliding" else None for i in range(M)]
         head = 0
@@ -618,7 +672,7 @@ class RDMNetworkBatch:
                 bet, the = self.beta[:, i:i+1], self.theta[:, i:i+1]
 
                 if method == "sliding":
-                    e, p_cur[i], state[i] = step_epr(
+                    e, p_cur[i], state[i] = epr.step_epr(
                         p_cur[i], state[i], buff_S[i], buff_I[i], idx[i], head,
                         self.R[i], self.alpha_int[:, i:i+1], bet, the, hz, lam0, dt,
                         inplace=inplace)
@@ -629,11 +683,11 @@ class RDMNetworkBatch:
                     # chunk it is the same rows in the same order, just Q^2 * cs at a time.
                     Sb = None if inplace else buff_S[i][:, sl]   # logical order, (B, K, Q)
                     S0 = buff_S[i][:, sl[0]]                     # (B, Q) view, row j = 0
-                    phi_f = hz.phi(hazard_field(S0, self.R[i], the, inplace), bet, lam0, dt,
+                    phi_f = hz.phi(epr.hazard_field(S0, self.R[i], the, inplace), bet, lam0, dt,
                                    inplace=inplace)
-                    S_rev = anchor_reverse_synaptic_term(buff_I[i][:, sl],
+                    S_rev = epr.anchor_reverse_synaptic_term(buff_I[i][:, sl],
                                                          self.alpha_int[:, i:i+1])
-                    phi_r = hz.phi(hazard_field(S_rev, self.R[i], the, inplace), bet, lam0, dt,
+                    phi_r = hz.phi(epr.hazard_field(S_rev, self.R[i], the, inplace), bet, lam0, dt,
                                    inplace=inplace)
                     # the joint is the one (B, Q, Q) object here, so it is what `chunk` splits
                     cs = B if chunk is None else chunk
@@ -641,13 +695,13 @@ class RDMNetworkBatch:
                     for lo in range(0, B, cs):
                         sub = slice(lo, min(lo + cs, B))
                         Sb_sub = buff_S[i][sub][:, sl] if inplace else Sb[sub]
-                        J = joint_distribution(p_cur[i][sub], Sb_sub, self.R[i][sub],
+                        J = epr.joint_distribution(p_cur[i][sub], Sb_sub, self.R[i][sub],
                                                bet[sub], the[sub], hz, lam0, dt,
                                                inplace=inplace)
-                        parts.append(epr_from_joint(J, phi_f[sub], phi_r[sub]))
+                        parts.append(epr.epr_from_joint(J, phi_f[sub], phi_r[sub]))
                         del J, Sb_sub
                     e = torch.cat(parts, dim=0)
-                    p_cur[i] = update_age_distribution(p_cur[i], phi_f)
+                    p_cur[i] = rdm.update_age_distribution(p_cur[i], phi_f)
 
                 out["sigma"][:, t, i].copy_(e[:, 0], non_blocking=True)
                 out["H_fwd"][:, t, i].copy_(e[:, 1], non_blocking=True)
@@ -684,7 +738,8 @@ class RDMNetworkBatch:
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 def RDMIsingModelBatch(J, E, beta, theta, tau_int, tau_ref, K_ref,
-                       dt: float = 1.0, dt0: float | None = None, hazard: str = "escape",
+                       *, dt0: float, dt: float | None = None, hazard: str = "escape",
+                       t_abs: float | None = None,
                        Qm: list[int] | None = None, eps: float = 0.01,
                        device: str = 'cpu') -> RDMNetworkBatch:
     """ Batched single-population (M=1) network. Each parameter may be a scalar or a 1D tensor,
@@ -692,7 +747,7 @@ def RDMIsingModelBatch(J, E, beta, theta, tau_int, tau_ref, K_ref,
     sweep with no meshgrid at the call site. Scalars contribute a singleton axis that is dropped
     again on output.
 
-    J is in physical units: unlike RDMIsingModelBatch, do not pass J/dt. """
+    J is in physical units: pass J, never J/dt (see rdm.compute_total_input). """
     flat, grid_shape, axes = flatten_param_grid(
         {"J": J, "E": E, "beta": beta, "theta": theta,
          "tau_int": tau_int, "tau_ref": tau_ref, "K_ref": K_ref}, device=device)
@@ -700,12 +755,12 @@ def RDMIsingModelBatch(J, E, beta, theta, tau_int, tau_ref, K_ref,
     return RDMNetworkBatch(
         M=1, w=flat["J"].reshape(-1, 1, 1), N=[1000], E=col("E"), beta=col("beta"),
         theta=col("theta"), tau_int=col("tau_int"), tau_ref=col("tau_ref"),
-        K_ref=col("K_ref"), dt=dt, dt0=dt0, hazard=hazard, Qm=Qm, eps=eps,
+        K_ref=col("K_ref"), dt=dt, dt0=dt0, hazard=hazard, t_abs=t_abs, Qm=Qm, eps=eps,
         grid_shape=grid_shape, grid_axes=axes, device=device)
 
 
 def _wilson_cowan_from_flat(flat: dict[str, torch.Tensor], E_ratio: float, dt: float,
-                            dt0, hazard, Qm, eps, grid_shape, grid_axes,
+                            dt0, hazard, t_abs, Qm, eps, grid_shape, grid_axes,
                             device) -> RDMNetworkBatch:
     """ Assemble a two-population batch from flat (B,) parameter columns. Shared by the two
     Wilson-Cowan factories, which differ only in how they get from their arguments to `flat`:
@@ -722,7 +777,7 @@ def _wilson_cowan_from_flat(flat: dict[str, torch.Tensor], E_ratio: float, dt: f
         E=two("E_exc", "E_inh"), beta=two("beta_E", "beta_I"),
         theta=two("theta_E", "theta_I"), tau_int=two("tau_int_E", "tau_int_I"),
         tau_ref=two("tau_ref_E", "tau_ref_I"), K_ref=two("K_ref_E", "K_ref_I"),
-        dt=dt, dt0=dt0, hazard=hazard, Qm=Qm, eps=eps,
+        dt=dt, dt0=dt0, hazard=hazard, t_abs=t_abs, Qm=Qm, eps=eps,
         grid_shape=grid_shape, grid_axes=grid_axes, device=device)
 
 
@@ -733,8 +788,9 @@ _WC_NAMES = ["w_EE", "w_EI", "w_IE", "w_II", "E_exc", "E_inh", "beta_E", "beta_I
 
 def RDMWilsonCowanBatch(E_ratio, w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, beta_I,
                         theta_E, theta_I, tau_int_E, tau_int_I, tau_ref_E, tau_ref_I,
-                        K_ref_E, K_ref_I, dt: float = 1.0, dt0: float | None = None,
-                        hazard: str = "escape", Qm: list[int] | None = None,
+                        K_ref_E, K_ref_I, *, dt0: float, dt: float | None = None,
+                        hazard: str = "escape", t_abs: float | None = None,
+                        Qm: list[int] | None = None,
                         eps: float = 0.01, device: str = 'cpu') -> RDMNetworkBatch:
     """ Batched two-population (M=2, order [E, I]) network, the batch being the **outer
     product** of every argument: pass w_EE and w_II as vectors and you get the full 2D sweep.
@@ -747,14 +803,15 @@ def RDMWilsonCowanBatch(E_ratio, w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, b
                                 theta_E, theta_I, tau_int_E, tau_int_I, tau_ref_E, tau_ref_I,
                                 K_ref_E, K_ref_I]))
     flat, grid_shape, axes = flatten_param_grid(vals, device=device)
-    return _wilson_cowan_from_flat(flat, E_ratio, dt, dt0, hazard, Qm, eps,
+    return _wilson_cowan_from_flat(flat, E_ratio, dt, dt0, hazard, t_abs, Qm, eps,
                                    grid_shape, axes, device)
 
 
 def RDMWilsonCowanPoints(E_ratio, w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, beta_I,
                          theta_E, theta_I, tau_int_E, tau_int_I, tau_ref_E, tau_ref_I,
-                         K_ref_E, K_ref_I, dt: float = 1.0, dt0: float | None = None,
-                         hazard: str = "escape", Qm: list[int] | None = None,
+                         K_ref_E, K_ref_I, *, dt0: float, dt: float | None = None,
+                         hazard: str = "escape", t_abs: float | None = None,
+                         Qm: list[int] | None = None,
                          eps: float = 0.01, grid_shape=None, grid_axes=None,
                          device: str = 'cpu') -> RDMNetworkBatch:
     """ One parameter point per batch element -- the **elementwise** counterpart of
@@ -786,5 +843,5 @@ def RDMWilsonCowanPoints(E_ratio, w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, 
                          f"got {bad}. Pass one value per batch element, or a scalar to hold it "
                          f"fixed.")
     flat = {k: (v.expand(B) if v.numel() == 1 else v) for k, v in cols.items()}
-    return _wilson_cowan_from_flat(flat, E_ratio, dt, dt0, hazard, Qm, eps,
+    return _wilson_cowan_from_flat(flat, E_ratio, dt, dt0, hazard, t_abs, Qm, eps,
                                    grid_shape, grid_axes, device)

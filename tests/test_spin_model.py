@@ -7,7 +7,7 @@ test the spin model, so they live here now. """
 import pytest
 import torch
 
-from rdme.single import RDMIsingModel, RDMWilsonCowan
+from rdme.rdm_single import RDMIsingModel, RDMWilsonCowan
 
 
 torch.manual_seed(0)
@@ -25,7 +25,7 @@ def test_entropy_trajectories_share_a_time_origin():
 
     torch.manual_seed(3)
     dt = 0.2
-    args = dict(J=4, E=1, beta=30, theta=1, tau_int=12, tau_ref=3, K_ref=0, dt=dt)
+    args = dict(J=4, E=1, beta=30, theta=1, tau_int=12, tau_ref=3, K_ref=0, dt0=dt)
     T = 60
 
     def spin():
@@ -44,7 +44,7 @@ def test_entropy_trajectories_share_a_time_origin():
         assert run(m)["m_tot"][0].item() == pytest.approx(m0, abs=1e-6)
 
     # and the mean field agrees: its index 0 is the overlap it was sitting at
-    net = RDMIsingModel(**args, hazard="synchronous", eps=0.01, device="cpu")
+    net = RDMIsingModel(**args, hazard="async", eps=0.01, device="cpu")
     net.forward(50)
     p0 = net.m[0].item()
     assert net.entropy_trajectory(T, pb=False)["m_tot"][0].item() == pytest.approx(p0, abs=1e-12)
@@ -68,7 +68,7 @@ def test_spin_epr_pairs_both_halves_of_the_same_transition():
     dt = 0.2
     T = 80
     m = SpinIsingModel(N=3000, J=4, E=1, beta=30, theta=1, tau_int=12, tau_ref=3,
-                       K_ref=0, dt=dt, device="cpu", ic="silent")
+                       K_ref=0, dt0=dt, device="cpu", ic="silent")
     m.forward(400)
     out = m.entropy_trajectory(T, buffer=60, s=True, fields=True)
 
@@ -100,7 +100,7 @@ def test_spin_epr_chunked_matches_the_windowed_reference():
     dt = 0.2
     T = 60
     kw = dict(N=4000, J=4, E=1, beta=30, theta=1, tau_int=12, tau_ref=3,
-              K_ref=0, dt=dt, device="cpu", ic="silent")
+              K_ref=0, dt0=dt, device="cpu", ic="silent")
 
     # both runs have to sample the SAME trajectory to be compared step by step, and the
     # draws depend on the default dtype -- so pin it rather than inherit it from whichever
@@ -138,7 +138,7 @@ def test_entropy_trajectory_leaves_the_model_at_index_T():
     dt = 0.2
     T = 300
     kw = dict(N=5000, J=4, E=1, beta=30, theta=1, tau_int=12, tau_ref=3,
-              K_ref=0, dt=dt, device="cpu", ic="silent")
+              K_ref=0, dt0=dt, device="cpu", ic="silent")
 
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.float32)
@@ -182,15 +182,15 @@ def test_spin_and_mean_field_entropy_trajectories_share_a_dict_contract():
               tau_int_E=10.0, tau_int_I=5.0, tau_ref_E=3.0, tau_ref_I=3.0)
 
     # both models take w in physical units, so one weight set describes the network
-    net = RDMWilsonCowan(K_ref_E=0.0, K_ref_I=0.0, dt=dt, hazard="synchronous", **kw)
+    net = RDMWilsonCowan(K_ref_E=0.0, K_ref_I=0.0, dt0=dt, hazard="async", **kw)
     net.forward(200)
     mf_out = net.entropy_trajectory(T, pb=False)
 
-    spin = SpinWilsonCowan(N=4000, K_ref1=0.0, K_ref2=0.0, dt=dt, device="cpu",
+    spin = SpinWilsonCowan(N=4000, K_ref1=0.0, K_ref2=0.0, dt0=dt, device="cpu",
                            ic="silent", **kw)
     spin.forward(200)
     sm_out = spin.entropy_trajectory(T, buffer=60)
-    sm_chunk = SpinWilsonCowan(N=4000, K_ref1=0.0, K_ref2=0.0, dt=dt, device="cpu",
+    sm_chunk = SpinWilsonCowan(N=4000, K_ref1=0.0, K_ref2=0.0, dt0=dt, device="cpu",
                                ic="silent", **kw)
     sm_chunk.forward(200)
     ck_out = sm_chunk.entropy_trajectory_chunked(T, chunk=64, overlap=32,

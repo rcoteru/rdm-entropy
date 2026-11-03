@@ -117,3 +117,67 @@ def test_kaplan_yorke_known_cases():
     assert torch.isnan(lyap.kaplan_yorke(torch.tensor([[0.3, 0.2]]))[0])
     # textbook: 1 + lam1/|lam2|
     assert lyap.kaplan_yorke(torch.tensor([[0.1, -0.4]]))[0] == pytest.approx(1.25)
+
+
+# Map vs flow semantics
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+def test_continuous_mode_defaults_off():
+    """ continuous=False is the historical behaviour, so an un-updated caller keeps the map
+    reading rather than silently acquiring the flow one. """
+    lam = torch.tensor([0.0, -0.2])
+    se = torch.tensor([1e-4, 1e-4])
+    mv = torch.tensor(True)
+    assert lyap.classify_spectrum(lam, tol=5e-4, moving=mv, se=se) == lyap.CIRCLE
+
+
+def test_a_zero_leading_exponent_is_a_cycle_for_a_flow_and_a_circle_for_a_map():
+    """ The one cell where the two tables disagree, and the one that dominates these sweeps.
+
+    lam_1 ~ 0 > lam_2 is an invariant circle of a map -- quasiperiodicity -- but for a flow it
+    is the phase direction of an ordinary limit cycle. Reading a refined model with the map
+    table turns every oscillation into a claim of quasiperiodicity. """
+    lam = torch.tensor([0.0, -0.2])
+    se = torch.tensor([1e-4, 1e-4])
+    mv = torch.tensor(True)
+    assert lyap.classify_spectrum(lam, tol=5e-4, moving=mv, se=se, continuous=False) == lyap.CIRCLE
+    assert lyap.classify_spectrum(lam, tol=5e-4, moving=mv, se=se, continuous=True) == lyap.LOCKED
+
+
+def test_the_other_cells_agree_between_the_two_tables():
+    """ Only the near-zero lam_1 cell moves; fixed points, tori and chaos read the same either
+    way, which is what makes the codes mean the attractor rather than the signature. """
+    se = torch.tensor([1e-4, 1e-4])
+    cases = [([-0.05, -0.20], False, lyap.FIXED),
+             ([ 0.00,  0.00], True,  lyap.TORUS),
+             ([ 0.02, -0.20], True,  lyap.CHAOS),
+             ([ 0.02,  0.01], True,  lyap.CHAOS)]
+    for vals, mv, want in cases:
+        lam, m = torch.tensor(vals), torch.tensor(mv)
+        for cont in (False, True):
+            got = lyap.classify_spectrum(lam, tol=5e-4, moving=m, se=se, continuous=cont)
+            assert got == want, (vals, cont, got)
+
+
+def test_a_moving_cell_with_negative_lam1_is_a_cycle_in_both_modes():
+    """ In a map this is a locked cycle. In a flow it is a limit cycle whose O(dt) phase bias
+    escaped the zero band -- the failure mode of a tol that has not been scaled with dt. Both
+    are LOCKED, so an under-resolved cycle degrades to 'cycle' rather than to 'dead'. """
+    lam = torch.tensor([-0.05, -0.20])
+    se = torch.tensor([1e-4, 1e-4])
+    for cont in (False, True):
+        got = lyap.classify_spectrum(lam, tol=5e-4, moving=torch.tensor(True),
+                                     se=se, continuous=cont)
+        assert got == lyap.LOCKED, cont
+
+
+def test_class_names_track_the_regime():
+    """ CIRCLE is unreachable in continuous mode, and the name for LOCKED changes: printing
+    'invariant circle' for a flow's limit cycle is the same error as classifying it that way. """
+    assert lyap.class_names(False)[lyap.CIRCLE] == "invariant circle"
+    assert lyap.class_names(True)[lyap.LOCKED] == "limit cycle"
+    lam = torch.randn(500, 2).sort(dim=-1, descending=True).values * 0.01
+    se = torch.full((500, 2), 1e-4)
+    cls = lyap.classify_spectrum(lam, tol=5e-4, moving=torch.ones(500, dtype=torch.bool),
+                                 se=se, continuous=True)
+    assert not (cls == lyap.CIRCLE).any(), "CIRCLE must never be emitted for a flow"

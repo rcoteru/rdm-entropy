@@ -4,23 +4,23 @@ RDMNetwork(Batch) methods built on top of them. The reference everything is chec
 a fixed point must be a state forward() does not move, and its spectral radius must predict
 whether a small kick decays.
 
-Every model here uses hazard="synchronous", so these are statements about the fixed-point
+Every model here uses hazard="async", so these are statements about the fixed-point
 machinery rather than about a particular kernel; the hazards are compared in test_srm.py. """
 
 import pytest
 import torch
 
-import rdme.dynamics as dyn
+import rdme.rdm as rdm
 import rdme.fixed_points as fpts
-from rdme.batch import RDMIsingModelBatch
-from rdme.single import RDMIsingModel, RDMWilsonCowan
+from rdme.rdm_batch import RDMIsingModelBatch
+from rdme.rdm_single import RDMIsingModel, RDMWilsonCowan
 
 
 torch.manual_seed(0)
 
 DT = 0.2
-ISING = dict(beta=30.0, theta=1.0, tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt=DT,
-             hazard="synchronous")
+ISING = dict(beta=30.0, theta=1.0, tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt0=DT,
+             hazard="async")
 # J/E chosen inside the multi-root region: five fixed points, stable and unstable mixed
 BISTABLE = dict(J=30.0, E=0.4, **ISING)
 
@@ -28,7 +28,7 @@ BISTABLE = dict(J=30.0, E=0.4, **ISING)
 WC = dict(E_ratio=0.8, w_EE=3.0, w_EI=3.0, w_IE=-1.0, w_II=-1.0,
           E_exc=1.0, E_inh=1.0, beta_E=30.0, beta_I=30.0, theta_E=1.0, theta_I=1.0,
           tau_int_E=20.0, tau_int_I=20.0, tau_ref_E=3.0, tau_ref_I=3.0,
-          K_ref_E=0.0, K_ref_I=0.0, dt=DT, hazard="synchronous")
+          K_ref_E=0.0, K_ref_I=0.0, dt0=DT, hazard="async")
 
 
 @pytest.fixture(autouse=True)
@@ -57,7 +57,7 @@ def test_forward_field_constant_input():
     assert S[0] == 0
 
     # and it is a genuine fixed point of update_synaptic_term, boundary bin included
-    assert torch.allclose(dyn.update_synaptic_term(S, alpha, I), S, rtol=0, atol=1e-14)
+    assert torch.allclose(rdm.update_synaptic_term(S, alpha, I), S, rtol=0, atol=1e-14)
 
     # batched: (B,) inputs with (B,) alphas give (B, Q), row by row
     Ib = torch.tensor([0.5, 1.7, -2.0])
@@ -91,7 +91,7 @@ def test_stationary_age_distribution():
     assert torch.allclose(p.sum(), torch.tensor(1.0), rtol=0, atol=1e-14)
     assert torch.allclose(p[0], m, rtol=0, atol=1e-14)          # births are spikes
     # stationary under the renewal update it was derived from
-    assert torch.allclose(dyn.update_age_distribution(p, phi), p, rtol=0, atol=1e-14)
+    assert torch.allclose(rdm.update_age_distribution(p, phi), p, rtol=0, atol=1e-14)
     # the reset branch is an identity, not an extra condition (telescoping)
     assert torch.allclose((p * phi).sum(), m, rtol=0, atol=1e-14)
 
@@ -278,8 +278,8 @@ def test_fp_sweep_matches_the_single_model():
     J = torch.tensor([1.0, 2.0, 3.0])
     E = torch.tensor([0.9, 1.1])
     batch = RDMIsingModelBatch(J=J, E=E, beta=30.0, theta=1.0,
-                                  tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt=DT,
-                                   hazard="synchronous")
+                                  tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt0=DT,
+                                   hazard="async")
 
     roots, converged = batch.fp_sweep(n_per_axis=6)
     assert roots.shape == (batch.B, 6, 1)
@@ -288,8 +288,8 @@ def test_fp_sweep_matches_the_single_model():
     # the grid is the outer product of J and E, in that order (see flatten_param_grid)
     for b, (j, e) in enumerate([(j, e) for j in J for e in E]):
         single = RDMIsingModel(J=j.item(), E=e.item(), beta=30.0, theta=1.0,
-                                   tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt=DT,
-                                   hazard="synchronous")
+                                   tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt0=DT,
+                                   hazard="async")
         expected = single.fixed_points(n_grid=2001)
         found = fpts.deduplicate(roots[b][converged[b]])
         # every Newton trajectory that converged must have landed on a genuine root
@@ -298,8 +298,8 @@ def test_fp_sweep_matches_the_single_model():
 
 def test_batch_set_state_is_stationary():
     batch = RDMIsingModelBatch(J=torch.tensor([1.0, 2.0]), E=1.0, beta=30.0,
-                                  theta=1.0, tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt=DT,
-                                   hazard="synchronous")
+                                  theta=1.0, tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt0=DT,
+                                   hazard="async")
     roots, converged = batch.fp_sweep(n_per_axis=4)
     m = roots[:, 0, :]                          # first guess converges for every cell here
     assert converged[:, 0].all()
@@ -315,8 +315,8 @@ def test_select_matches_the_batch_element():
     reproduce the batch's own step exactly, kernels and age grid included. """
     batch = RDMIsingModelBatch(J=torch.tensor([1.0, 2.0, 3.0]),
                                   E=torch.tensor([0.9, 1.1]), beta=30.0, theta=1.0,
-                                  tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt=DT,
-                                   hazard="synchronous")
+                                  tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt0=DT,
+                                   hazard="async")
     batch.forward(200, pb=False)
 
     for b in (0, 3, batch.B - 1):
@@ -331,11 +331,40 @@ def test_select_matches_the_batch_element():
     for b in (0, 3, batch.B - 1):
         one = RDMIsingModelBatch(J=torch.tensor([1.0, 2.0, 3.0]),
                                     E=torch.tensor([0.9, 1.1]), beta=30.0, theta=1.0,
-                                    tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt=DT,
-                                   hazard="synchronous")
+                                    tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt0=DT,
+                                   hazard="async")
         one.forward(200, pb=False)
         sel = one.select(b)
         sel.update()
         assert torch.allclose(sel.m, batch.m[b], rtol=0, atol=1e-14)
         assert torch.allclose(sel.p[0], batch.p[0][b], rtol=0, atol=1e-14)
         assert torch.allclose(sel.S[0], batch.S[0][b], rtol=0, atol=1e-14)
+
+
+def test_bracket_roots_handles_root_exactly_on_the_grid():
+    """ A residual whose root sits on a grid point leaves no sign-change bracket: both of the
+    neighbouring products are zero rather than negative. The bisection then has nothing to
+    refine, and sending vmap a zero-size batch raises instead of returning nothing.
+
+    Not hypothetical -- at beta = 0 the hazard stops depending on the field, Phi = 1/2
+    everywhere, and G(m) = m - 1/2 has its root on the grid for any odd n_grid. """
+    roots = fpts.bracket_roots(lambda m: m - 0.5, n_grid=401)
+    assert roots.shape == (1, 1)
+    assert torch.allclose(roots, torch.tensor([[0.5]], dtype=roots.dtype))
+
+
+def test_bracket_roots_with_no_root_returns_empty():
+    roots = fpts.bracket_roots(lambda m: m + 5.0, n_grid=401)
+    assert roots.shape == (0, 1)
+
+
+def test_bracket_roots_beta_zero_is_the_field_free_hazard():
+    """ The end-to-end version of the above: beta = 0 is a legitimate endpoint of a beta scan
+    and must give m* = 1/2 rather than raising. """
+    from rdme.rdm_batch import RDMIsingModelBatch
+    net = RDMIsingModelBatch(J=15.0, E=0.0, beta=0.0, theta=0.5, tau_int=15.0, tau_ref=15.0,
+                             K_ref=15.0, dt0=1.0, dt=1.0, hazard="async", Qm=[64],
+                             device="cpu").select(0)
+    roots = net.fixed_points(method="bracket", n_grid=401)
+    assert roots.shape == (1, 1)
+    assert abs(float(roots[0, 0]) - 0.5) < 1e-12

@@ -5,7 +5,7 @@ from typing import Callable
 import torch
 
 from rdme.hazards import Hazard
-from rdme.dynamics import compute_total_input, hazard_clamp
+import rdme.rdm as rdm
 
 """ Fixed points: the closed forms at stationarity, the model's overlap map, and the generic
 root finders that locate its roots.
@@ -55,7 +55,7 @@ def compute_stationary_survival(fprobs: torch.Tensor,   # (..., Q) age-resolved 
     saturates and a long product of (1-Phi) underflows to zero, which would send the
     normalization of the stationary distribution to a ratio of zeros. The hazard is clamped
     below one first, with a dtype-dependent bound (see hazard_clamp). """
-    log1m = torch.log1p(-fprobs.clamp(max=hazard_clamp(fprobs.dtype)))
+    log1m = torch.log1p(-fprobs.clamp(max=rdm.hazard_clamp(fprobs.dtype)))
     cum = torch.cumsum(log1m[..., :-1], dim=-1)
     log_surv = torch.cat([torch.zeros_like(cum[..., :1]), cum], dim=-1)
     return log_surv if log else torch.exp(log_surv)
@@ -127,7 +127,7 @@ def fp_overlap_map(m: torch.Tensor,        # (M,) trial overlaps
     Note this works in overlaps m, not rates, so that the residual lives on the same scale as
     the generic Newton and bracketing routines below (which clamp to
     [0, 1]) applies unchanged. Rates are m/dt throughout the class API. """
-    I = compute_total_input(m / dt, w, E)       # w is unscaled here, so feed it the rate
+    I = rdm.compute_total_input(m / dt, w, E)       # w is unscaled here, so feed it the rate
     rates = []
     for i, R_i in enumerate(R):
         S_i = compute_stationary_forward_field(I[..., i], alpha[..., i], R_i.shape[-1])
@@ -149,7 +149,7 @@ def fp_state(m: torch.Tensor,
              dt: float,
              ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """ The full stationary state (p, S) implied by a set of overlaps. """
-    I = compute_total_input(m / dt, w, E)
+    I = rdm.compute_total_input(m / dt, w, E)
     p_out, S_out = [], []
     for i, R_i in enumerate(R):
         S_i = compute_stationary_forward_field(I[..., i], alpha[..., i], R_i.shape[-1])
@@ -327,6 +327,16 @@ def bracket_roots(residual: Callable[[torch.Tensor], torch.Tensor],  # single, u
     brack = (fa * fb) < 0
     a, b, fa = a[brack], b[brack], fa[brack]
 
+    # No bracket to bisect is a real case, not an empty edge case: a residual that lands
+    # exactly on a grid point makes both of its neighbouring products zero rather than
+    # negative, so a lone exact root leaves nothing to refine. It happens whenever the
+    # hazard stops depending on the field -- beta = 0 gives Phi = 1/2 everywhere, hence
+    # G(m) = m - 1/2, whose root is on the grid for any odd n_grid. Bisecting an empty
+    # bracket sends vmap a zero-size batch, which raises rather than returning nothing.
+    if a.numel() == 0:
+        return deduplicate(exact.unsqueeze(-1), merge_tol) if exact.numel() else \
+               torch.empty(0, 1, device=device, dtype=grid.dtype)
+
     for _ in range(max_iter):
         mid = 0.5 * (a + b)
         fm = torch.vmap(residual)(mid.unsqueeze(-1)).squeeze(-1)
@@ -383,3 +393,42 @@ def deduplicate(roots: torch.Tensor,       # (R, M)
         if all(torch.linalg.vector_norm(r - k) > merge_tol for k in kept):
             kept.append(r)
     return torch.stack(kept)
+
+
+# Branch diagrams
+# ~~~~~~~~~~~~~~~
+#
+# One rung above the solvers: a whole swept axis at once, which is what a 1-D sweep script
+# plots against its trajectory. Separate from the solvers because it loops in Python over the
+# batch -- the eigendecomposition is a dense LAPACK call per root and has no batched form here.
+
+def branch_scan(mf,                                   # an RDMNetworkBatch, M = 1
+                axis: torch.Tensor,                   # (B,) the swept parameter
+                idx: torch.Tensor | None = None,      # which batch elements, default all
+                n_grid: int = 401,
+                n_lead: int = 4) -> dict[str, torch.Tensor]:
+    """ Every fixed point of every selected batch element, with its leading eigenvalues.
+
+    Returns flat tensors, one entry per (element, root) pair rather than per element: the
+    number of roots varies along the axis, which is the whole point of a branch diagram, so
+    the axis value is carried alongside as "x" rather than implied by position.
+
+    M = 1 only. The bracketing scan over [0, 1] is then exhaustive up to its resolution, so it
+    picks up unstable branches that Newton would only reach from a narrow basin -- and it is
+    the unstable branch that says where the attractor went. """
+    if idx is None:
+        idx = torch.arange(mf.B)
+
+    x, m_star, rho, lead = [], [], [], []
+    for b in idx:
+        sys = mf.select(int(b))
+        for r in sys.fixed_points(method='bracket', n_grid=n_grid):
+            ev = sys.fp_eigenvalues(r)
+            ev = ev[ev.abs().argsort(descending=True)][:n_lead]
+            x.append(axis[b])
+            m_star.append(r[0])
+            rho.append(ev.abs().max())
+            lead.append(ev)
+
+    return {"x": torch.stack(x), "m_star": torch.stack(m_star),
+            "rho": torch.stack(rho), "lead": torch.stack(lead)}

@@ -11,14 +11,16 @@ member of the family, and that non-convergence is asserted here too, since it is
 reason the escape and asynchronous kernels exist.
 """
 
+import math
+
 import pytest
 import torch
 
 import rdme.hazards as hzd
 import rdme.lyapunov as lyap
-from rdme.batch import (RDMIsingModelBatch, RDMNetworkBatch, RDMWilsonCowanBatch,
+from rdme.rdm_batch import (RDMIsingModelBatch, RDMNetworkBatch, RDMWilsonCowanBatch,
                         RDMWilsonCowanPoints)
-from rdme.single import RDMIsingModel, RDMWilsonCowan
+from rdme.rdm_single import RDMIsingModel, RDMWilsonCowan
 
 
 # A moderate operating point: oscillatory in the discrete model, so the tests exercise moving
@@ -46,8 +48,11 @@ def float64():
 
 
 def _ct(dt, dt0=None, hazard="escape", **over):
+    """ dt0 defaults to dt here, i.e. to the quantum, which is the old class-level default.
+    The class now requires it explicitly; the helper keeps it implicit so these tests read as
+    "a model at step dt" unless they are specifically about the (dt0, dt) split. """
     p = dict(WC); p.update(over)
-    return RDMWilsonCowan(**p, dt=dt, dt0=dt0, hazard=hazard)
+    return RDMWilsonCowan(**p, dt0=dt if dt0 is None else dt0, dt=dt, hazard=hazard)
 
 
 def _rdm(dt, **over):
@@ -68,8 +73,8 @@ def test_all_three_hazards_coincide_at_the_time_quantum():
     thinning at all. Checked over a field range spanning both tails. """
     h = torch.linspace(-3.0, 3.0, 401)
     beta, dt = 30.0, 0.2
-    ref = hzd.sync_hazard(h, beta, 1.0 / dt, dt)
-    for name in ("async", "escape"):
+    ref = torch.sigmoid(beta * h)                 # the sigmoid, independently
+    for name in ("async", "escape", "poisson"):
         got = hzd.HAZARDS[name].phi(h, beta, 1.0 / dt, dt)
         assert torch.allclose(got, ref, rtol=0, atol=1e-14), (name, (got - ref).abs().max())
 
@@ -130,12 +135,226 @@ def test_escape_hazard_matches_its_rate_definition():
                           rtol=0, atol=1e-15)
 
 
-def test_default_dt0_sits_at_the_quantum():
-    """ dt0 defaults to dt, i.e. lam0*dt = 1, where all three hazards coincide. """
-    net = _ct(0.2)
-    assert net.dt0 == 0.2 and net.lam0 == pytest.approx(5.0)
-    ref = _ct(0.2, hazard="synchronous").firing_prob()
-    for name in ("async", "escape"):
+# The Poisson (MaxCal) kernel
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# The claim being tested is a pair: at dt = dt0 this kernel IS async, to the last bit, so no
+# result at the quantum moves; away from it, it is a different continuous-time model, with an
+# exponential rate and half async's prefactor. Both halves matter -- the first is what makes
+# the kernel safe to add, the second is what makes it worth adding.
+
+
+POISSON_FIELDS = torch.tensor([-12.0, -8.0, -2.0, 0.0, 2.0, 8.0])
+
+
+@pytest.mark.parametrize("dt0", [0.5, 1.0, 2.0])
+def test_poisson_is_async_bit_for_bit_at_the_quantum(dt0):
+    """ At lam0*dt = 1 the reference measure is unbiased, c = 1/2 and ell = 0, so Phi =
+    sigma(beta*h) -- which is also what async's thinning factor of one leaves behind.
+
+    torch.equal rather than allclose, and on all five branches but `rate`: the point of the
+    calibration is that every dt = dt0 result already in hand carries over UNCHANGED, which a
+    tolerance would not establish. `rate` is excluded by design -- it is the one member that
+    is a statement about the limit rather than about the step, and the three limits differ. """
+    beta, lam0 = 6.0, 1.0 / dt0
+    h = torch.linspace(-4.0, 4.0, 801)
+    a, p = hzd.HAZARDS["async"], hzd.HAZARDS["poisson"]
+    for fn in ("phi", "dphi", "logphi", "log1m_phi"):
+        want = getattr(a, fn)(h.clone(), beta, lam0, dt0)
+        got = getattr(p, fn)(h.clone(), beta, lam0, dt0)
+        assert torch.equal(want, got), (fn, dt0, (want - got).abs().max())
+
+
+@pytest.mark.parametrize("lam0,dt", [(1.0, 1.0), (0.3, 0.5), (2.0, 0.25), (1.0, 0.03125)])
+def test_poisson_inplace_branches_are_bitwise_identical(lam0, dt):
+    """ The same contract every kernel here carries: the in-place branch is the out-of-place
+    arithmetic in the same order with the temporaries folded away, not merely something close.
+    Over a field that reaches the saturated and silent tails, where the closed log forms are
+    the whole reason they are carried separately. """
+    hz = hzd.HAZARDS["poisson"]
+    h = torch.cat([torch.linspace(-20.0, 20.0, 97), torch.tensor([-60.0, 60.0])])
+    beta = 3.0
+    for fn in (hz.phi, hz.dphi, hz.rate, hz.logphi, hz.log1m_phi):
+        ref = fn(h.clone(), beta, lam0, dt)
+        got = fn(h.clone(), beta, lam0, dt, inplace=True)
+        assert torch.equal(ref.nan_to_num(), got.nan_to_num()), fn.__name__
+
+
+def test_poisson_hazard_over_dt_converges_to_its_exponential_rate():
+    """ Phi/dt -> (lam0/2) e^{beta h} as dt -> 0, and at first order in dt.
+
+    First order is asserted as well as the limit, because the limit alone would pass for a
+    kernel that reached it the wrong way: halving dt must halve the error, which is what says
+    the hazard is the exponential integrator of that rate rather than some other kernel
+    sharing its tangent. """
+    hz, beta, lam0 = hzd.HAZARDS["poisson"], 1.0, 1.0
+    for x in (-8.0, -2.0, 0.0, 2.0):
+        h = torch.tensor([x / beta], dtype=torch.float64)
+        want = float(hz.rate(h.clone(), beta, lam0, 1.0))
+        assert want == pytest.approx(0.5 * lam0 * math.exp(x), rel=1e-12)
+        errs = [abs(float(hz.phi(h.clone(), beta, lam0, dt)) / dt - want) / want
+                for dt in (1e-3, 5e-4, 2.5e-4)]
+        assert errs[1] == pytest.approx(errs[0] / 2, rel=0.05), (x, errs)
+        assert errs[2] == pytest.approx(errs[1] / 2, rel=0.05), (x, errs)
+        assert errs[2] < 1e-3
+
+
+def test_poisson_rate_is_half_the_async_rate_below_threshold():
+    """ The factor of one half, which is the documented cost of pinning c = 1/2 at the quantum
+    and is NOT a calibration bug. Both kernels share the Arrhenius tail lam0*e^{beta h} below
+    threshold; poisson carries half the prefactor, i.e. a threshold shifted by ln2/beta. """
+    beta, lam0, dt = 2.0, 3.0, 0.1
+    h = torch.tensor([-12.0 / beta], dtype=torch.float64)
+    ratio = float(hzd.poisson_rate(h.clone(), beta, lam0, dt)
+                  / hzd.async_rate(h.clone(), beta, lam0, dt))
+    assert ratio == pytest.approx(0.5, rel=1e-5)
+    # and the shift is exactly ln2/beta: the two rates coincide once async is given that much
+    # more field
+    shifted = float(hzd.async_rate(h - math.log(2.0) / beta, beta, lam0, dt))
+    assert float(hzd.poisson_rate(h.clone(), beta, lam0, dt)) == pytest.approx(shifted, rel=1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("lam0,dt", [(1.0, 1.0), (1.0, 0.0625)])
+def test_poisson_log_branches_are_finite_and_consistent(dtype, lam0, dt):
+    """ ln Phi and ln(1 - Phi) must stay finite and correct where Phi itself has lost its
+    digits -- at x = +-40 in float32 one of the two rounds to 0 or 1 and the naive log of it is
+    -inf, which is exactly the case the closed forms exist for.
+
+    Checked against log(Phi) and log1p(-Phi) only where THOSE are representable; elsewhere
+    only finiteness and the asymptote are asserted, since there is no reference to compare to.
+    """
+    hz = hzd.HAZARDS["poisson"]
+    h = torch.cat([torch.linspace(-20.0, 20.0, 81, dtype=dtype),
+                   torch.tensor([-40.0, 40.0], dtype=dtype)])
+    beta = torch.tensor(1.0, dtype=dtype)
+    phi = hz.phi(h.clone(), beta, lam0, dt)
+    lp, l1 = hz.logphi(h.clone(), beta, lam0, dt), hz.log1m_phi(h.clone(), beta, lam0, dt)
+
+    assert bool(torch.isfinite(lp).all()) and bool(torch.isfinite(l1).all())
+    assert bool((lp <= 0).all()) and bool((l1 <= 0).all())
+
+    # torch's softplus switches to the identity above an input of 20 (its `threshold`, which
+    # these kernels take as given rather than overriding -- async_logphi and escape_log1m_phi
+    # are built on the same call, and lowering it here would break the bit-for-bit agreement
+    # with async at the quantum). The branch costs at most ln(1 + e^-20) = 2.1e-9 of absolute
+    # error in a log, which is below float32's own resolution and is why it is invisible until
+    # a float64 comparison at exactly this tolerance looks for it.
+    tol = 1e-5 if dtype is torch.float32 else 3e-9
+    # "where those are representable" is not the same window for the two branches. A small Phi
+    # keeps its relative precision, so log(Phi) is good wherever Phi > 0; a Phi near one does
+    # not -- 1 - Phi is a cancellation that loses everything below the spacing of 1, so
+    # log1p(-Phi) is only a reference while 1 - Phi stays well above it. Beyond that there is
+    # nothing to compare against, which is the whole reason log1m_phi is carried.
+    near_one = 1e-2 if dtype is torch.float32 else 1e-7
+    assert torch.allclose(lp[phi > 0], torch.log(phi[phi > 0]), rtol=tol, atol=tol)
+    ok = phi < 1.0 - near_one
+    assert torch.allclose(l1[ok], torch.log1p(-phi[ok]), rtol=tol, atol=tol)
+
+    # the two tails, where the comparison above has nothing to compare against: ln Phi -> the
+    # shifted field itself at x -> -inf, ln(1 - Phi) -> -(shifted field) at x -> +inf
+    ell = hzd._poisson_logit(lam0, dt)
+    assert float(lp[-2]) == pytest.approx(-40.0 * float(beta) + ell, rel=tol, abs=tol)
+    assert float(l1[-1]) == pytest.approx(-(40.0 * float(beta) + ell), rel=tol, abs=tol)
+
+
+# The exact-survival exponential kernel
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# exp_surv is poisson's model under a different discretization map, so what is asserted here
+# is a pair of statements of exactly that shape: the RATE is the same object (same model) and
+# the per-bin Phi is not (different map). It is deliberately NOT tested against the sigmoid at
+# the quantum -- it does not reduce to it, which is the one thing it gives up.
+
+
+@pytest.mark.parametrize("lam0,dt", [(1.0, 1.0), (0.3, 0.5), (2.0, 0.25), (1.0, 0.03125)])
+def test_exp_surv_inplace_branches_are_bitwise_identical(lam0, dt):
+    hz = hzd.HAZARDS["exp_surv"]
+    h = torch.cat([torch.linspace(-20.0, 20.0, 97), torch.tensor([-60.0, 60.0])])
+    beta = 3.0
+    for fn in (hz.phi, hz.dphi, hz.rate, hz.logphi, hz.log1m_phi):
+        ref = fn(h.clone(), beta, lam0, dt)
+        got = fn(h.clone(), beta, lam0, dt, inplace=True)
+        assert torch.equal(ref.nan_to_num(), got.nan_to_num()), fn.__name__
+
+
+def test_exp_surv_rate_is_the_poisson_rate():
+    """ Not merely equal: the same function. The two kernels are one continuous-time model,
+    and `rate` is where that is readable -- so this asserts the identity that makes the
+    comparison in the convergence study a statement about discretization alone. """
+    assert hzd.HAZARDS["exp_surv"].rate is hzd.HAZARDS["poisson"].rate
+    h = torch.linspace(-6.0, 6.0, 101)
+    assert torch.equal(hzd.HAZARDS["exp_surv"].rate(h.clone(), 2.0, 3.0, 0.1),
+                       hzd.poisson_rate(h.clone(), 2.0, 3.0, 0.1))
+
+
+def test_exp_surv_hazard_over_dt_converges_to_the_same_exponential_rate():
+    """ Phi/dt -> (lam0/2) e^{beta h}, first order, at the same points poisson is checked on.
+    Same limit, reached by the other map. """
+    hz, beta, lam0 = hzd.HAZARDS["exp_surv"], 1.0, 1.0
+    for x in (-8.0, -2.0, 0.0, 2.0):
+        h = torch.tensor([x / beta], dtype=torch.float64)
+        want = float(hz.rate(h.clone(), beta, lam0, 1.0))
+        assert want == pytest.approx(0.5 * lam0 * math.exp(x), rel=1e-12)
+        errs = [abs(float(hz.phi(h.clone(), beta, lam0, dt)) / dt - want) / want
+                for dt in (1e-3, 5e-4, 2.5e-4)]
+        assert errs[1] == pytest.approx(errs[0] / 2, rel=0.05), (x, errs)
+        assert errs[2] == pytest.approx(errs[1] / 2, rel=0.05), (x, errs)
+
+
+def test_exp_surv_error_is_single_signed_where_poissons_changes_sign():
+    """ The mechanism the kernel exists for, asserted rather than described.
+
+    Exact survival always UNDERESTIMATES the rate, 1 - e^{-z} <= z, at every field. The
+    logistic kernel does not: Phi/dt = r0 e^x / (1 + c(e^x - 1)) sits above the rate below
+    threshold and below it above threshold. On an attractor spanning both, poisson's O(dt)
+    error therefore partly cancels against itself and the cancellation moves with dt, which
+    is what makes its convergence non-monotone and exp_surv's monotone. """
+    beta, lam0, dt = 1.0, 1.0, 0.25
+    x = torch.tensor([-4.0, -1.0, -0.1, 0.1, 1.0, 4.0], dtype=torch.float64)
+    rate = hzd.poisson_rate(x.clone(), beta, lam0, dt)
+
+    es = hzd.HAZARDS["exp_surv"].phi(x.clone(), beta, lam0, dt) / dt - rate
+    assert bool((es < 0).all()), f"exact survival should never overestimate: {es}"
+
+    po = hzd.HAZARDS["poisson"].phi(x.clone(), beta, lam0, dt) / dt - rate
+    assert bool((po[:3] > 0).all()) and bool((po[3:] < 0).all()), (
+        f"the logistic error should change sign at x = 0: {po}")
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("lam0,dt", [(1.0, 1.0), (1.0, 0.0625)])
+def test_exp_surv_log_branches_are_finite_and_consistent(dtype, lam0, dt):
+    """ Same contract as the poisson branches, and needed for the same reason: at x = +-40 in
+    float32 Phi has rounded to 0 or 1 and only the closed forms still carry the value. """
+    hz = hzd.HAZARDS["exp_surv"]
+    h = torch.cat([torch.linspace(-20.0, 20.0, 81, dtype=dtype),
+                   torch.tensor([-40.0, 40.0], dtype=dtype)])
+    beta = torch.tensor(1.0, dtype=dtype)
+    phi = hz.phi(h.clone(), beta, lam0, dt)
+    lp, l1 = hz.logphi(h.clone(), beta, lam0, dt), hz.log1m_phi(h.clone(), beta, lam0, dt)
+
+    assert bool(torch.isfinite(lp).all()), lp
+    assert bool((lp <= 0).all()) and bool((l1 <= 0).all())
+
+    tol = 1e-5 if dtype is torch.float32 else 1e-12
+    near_one = 1e-2 if dtype is torch.float32 else 1e-7
+    ok = (phi > 0) & (phi < 1.0 - near_one)
+    assert torch.allclose(lp[ok], torch.log(phi[ok]), rtol=tol, atol=tol)
+    assert torch.allclose(l1[ok], torch.log1p(-phi[ok]), rtol=tol, atol=tol)
+
+    # ln(1 - Phi) = -lambda*dt exactly, which is the branch's whole reason for existing: it
+    # stays finite and correct at the saturated end where log1p(-Phi) is -inf
+    want = -hz.rate(h.clone(), beta, lam0, dt) * dt
+    assert torch.allclose(l1, want, rtol=tol, atol=tol)
+
+
+def test_default_dt_sits_at_the_quantum():
+    """ dt defaults to dt0, i.e. lam0*dt = 1, where both hazards coincide on the sigmoid. """
+    net = RDMWilsonCowan(**WC, dt0=0.2)
+    assert net.dt == 0.2 and net.dt0 == 0.2 and net.lam0 == pytest.approx(5.0)
+    ref = _ct(0.2, hazard="async").firing_prob()
+    for name in ("async", "escape", "poisson"):
         for a, b in zip(_ct(0.2, hazard=name).firing_prob(), ref):
             assert torch.allclose(a, b, rtol=0, atol=1e-14), name
 
@@ -166,7 +385,10 @@ def test_sigmoid_model_does_not_converge_as_dt_refines():
     collapse. Compared against the escape hazard on the same points, since the claim is
     relative -- one converges and the other does not. """
     dts = (0.2, 0.1, 0.05)
-    sig = [_mean_rate(_ct(dt, hazard="sigmoid", **SETTLED)) for dt in dts]
+    # each point is a DIFFERENT model, at its own quantum dt0 = dt -- which is the claim.
+    # The class rejects sync at dt != dt0 outright, so walking the family is the only way to
+    # write this down, and that is the point.
+    sig = [_mean_rate(_ct(dt, dt0=dt, hazard="async", **SETTLED)) for dt in dts]
     esc = [_mean_rate(_ct(dt, dt0=0.2, **SETTLED)) for dt in dts]
 
     spread = lambda v: max(v) - min(v)
@@ -237,11 +459,11 @@ SMALL = dict(WC, tau_int_E=6.0, tau_int_I=8.0)
 
 
 def _sync(dt=0.2, **over):
-    """ The synchronous kernel at its own quantum, i.e. the model rdme.mean_field used to
+    """ The sigmoid kernel at its own quantum (async at lam0*dt = 1), i.e. the model
     implement. Kept as the default for the tests that are about machinery rather than about
     which hazard is in play. """
     p = dict(SMALL); p.update(over)
-    return RDMWilsonCowan(**p, dt=dt, hazard="synchronous")
+    return RDMWilsonCowan(**p, dt0=dt, hazard="async")
 
 
 def test_fixed_points_are_fixed_under_forward():
@@ -259,7 +481,7 @@ def test_fixed_points_are_fixed_under_forward():
 def test_tangent_matches_the_jacobian_of_its_own_state_map():
     """ The hazard-general tangent map against autodiff on the map it linearizes. Run for BOTH
     hazards: the sigmoid case would pass even if d_escape_hazard were wrong. """
-    for hazard, dt0 in (("synchronous", None), ("async", 0.2), ("escape", 0.2)):
+    for hazard, dt0 in (("async", 0.1), ("async", 0.2), ("escape", 0.2)):
         net = RDMWilsonCowan(**SMALL, dt=0.1, dt0=dt0, hazard=hazard)
         net.forward(137)
         x = net.flatten_state([t.clone() for t in net.p], [t.clone() for t in net.S])
@@ -294,8 +516,8 @@ def test_sliding_and_joint_epr_agree_for_every_hazard():
     """ The two EPR paths against each other. They share only epr_from_parts -- the joint path
     builds the (Q, K) joint and sums it, the sliding path reaches the same four marginals by
     recursion -- so agreement checks the recursions, which is the part with something to get
-    wrong. Run for all three hazards, since the recursions evaluate Phi in five places. """
-    for name, dt in (("synchronous", 0.2), ("async", 0.1), ("escape", 0.1)):
+    wrong. Run for both hazards, since the recursions evaluate Phi in five places. """
+    for name, dt in (("async", 0.2), ("async", 0.1), ("escape", 0.1)):
         a = RDMWilsonCowan(**SMALL, dt=dt, dt0=0.2, hazard=name)
         b = RDMWilsonCowan(**SMALL, dt=dt, dt0=0.2, hazard=name)
         ta = a.entropy_trajectory(40, method="sliding", pb=False)
@@ -314,9 +536,11 @@ def test_entropy_rejects_an_unknown_method():
 def test_entropy_runs_for_every_hazard():
     """ The reason the EPR was rewritten in terms of Phi rather than softplus and the logit:
     those two are identities of the logistic kernel only, and the comparison of entropy
-    production across the three hazards is the point of carrying them. """
-    for name in ("synchronous", "async", "escape"):
-        net = RDMWilsonCowan(**SMALL, dt=0.05, dt0=0.2, hazard=name)
+    production across the hazards is the point of carrying them. """
+    # async twice over: once at its own quantum, where it IS the sigmoid, and once refined
+    # below it -- the EPR must stay finite and consistent at both. See HAZ_DT.
+    for name, dt, dt0 in (("async", 0.2, 0.2), ("async", 0.05, 0.2), ("escape", 0.05, 0.2)):
+        net = RDMWilsonCowan(**SMALL, dt=dt, dt0=dt0, hazard=name)
         t = net.entropy_trajectory(30, pb=False)
         for k in ("sigma", "H_fwd", "H_rev"):
             assert torch.isfinite(t[k]).all(), (name, k)
@@ -379,14 +603,15 @@ def test_each_family_still_converges_in_dt_at_a_slow_quantum():
 #
 # Two references. A batch of B systems must agree, element by element, with B single systems
 # built from the same parameters -- that is what makes the batch axis a bookkeeping device
-# rather than a second implementation. And at hazard="synchronous" it must agree with
+# rather than a second implementation. And at hazard="async" it must agree with
 # rdme.mean_field.RDMNetworkBatch, the same oracle the single class is held to.
 
 W_EE = [1.5, 2.0, 2.5]
 
 
-# the three kernels, each at a step where it is well defined (async needs lam0*dt <= 1)
-HAZ_DT = (("synchronous", 0.2, None), ("async", 0.1, 0.2), ("escape", 0.1, 0.2))
+# both kernels, each at a step where it is well defined (async needs lam0*dt <= 1), plus
+# async at its own quantum, where it is the sigmoid
+HAZ_DT = (("async", 0.2, 0.2), ("async", 0.1, 0.2), ("escape", 0.1, 0.2))
 
 
 def _bat(hazard="escape", dt=0.1, dt0=0.2, **over):
@@ -575,7 +800,7 @@ def test_spectrum_matches_fp_eigenvalues_at_a_fixed_point():
     leading directions. Exercises the tangent map, the driver, the orthonormalization and the
     units together. """
     dt = 0.2
-    net = RDMWilsonCowan(**SMALL, dt=dt, hazard="synchronous")
+    net = RDMWilsonCowan(**SMALL, dt0=dt, hazard="async")
     net.forward(4000)
     p = [t.clone() for t in net.p]; S = [t.clone() for t in net.S]
     x = net.flatten_state(p, S)
@@ -584,7 +809,7 @@ def test_spectrum_matches_fp_eigenvalues_at_a_fixed_point():
     ev = torch.linalg.eigvals(torch.func.jacfwd(net.state_map)(x)).abs()
     want = (torch.log(ev.clamp_min(1e-300)) / dt).sort(descending=True).values[:2]
 
-    run = RDMWilsonCowan(**SMALL, dt=dt, hazard="synchronous")
+    run = RDMWilsonCowan(**SMALL, dt0=dt, hazard="async")
     run.p = [t.clone() for t in p]; run.S = [t.clone() for t in S]
     run.m = torch.stack([t[..., 0] for t in run.p], dim=-1)
 

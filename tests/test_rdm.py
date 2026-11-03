@@ -1,4 +1,4 @@
-""" Tests for the per-step primitives in rdme.dynamics: compute_total_input,
+""" Tests for the per-step primitives in rdme.rdm: compute_total_input,
 update_synaptic_term, compute_firing_rate, update_age_distribution, check_age_normalization.
 
 These are the kernel-independent half of the model -- none of them evaluates a hazard, which
@@ -9,8 +9,8 @@ import pytest
 import torch
 
 import rdme.hazards as hzd
-import rdme.dynamics as dyn
-from rdme.single import RDMWilsonCowan
+import rdme.rdm as rdm
+from rdme.rdm_single import RDMWilsonCowan
 
 
 def test_population_input():
@@ -25,14 +25,14 @@ def test_population_input():
         1.0 * 0.5 + 2.0 * (-0.25) + 0.1,
         3.0 * 0.5 + 4.0 * (-0.25) + 0.2,
     ])
-    assert torch.allclose(dyn.compute_total_input(m, w, E), expected)
+    assert torch.allclose(rdm.compute_total_input(m, w, E), expected)
 
     # random case, checked against a plain matmul rather than re-deriving the call
     M = 5
     w = torch.randn(M, M, dtype=torch.float64)
     m = torch.randn(M, dtype=torch.float64)
     E = torch.randn(M, dtype=torch.float64)
-    got = dyn.compute_total_input(m, w, E)
+    got = rdm.compute_total_input(m, w, E)
     assert torch.allclose(got, w @ m + E)
 
 
@@ -48,8 +48,8 @@ def test_wilson_cowan_weight_orientation_matches_the_spin_model():
               theta_E=1.0, theta_I=1.0, tau_int_E=10.0, tau_int_I=5.0,
               tau_ref_E=3.0, tau_ref_I=3.0)
 
-    net = RDMWilsonCowan(K_ref_E=0.0, K_ref_I=0.0, dt=0.5, hazard="synchronous", **kw)
-    spin = SpinWilsonCowan(N=1000, K_ref1=0.0, K_ref2=0.0, dt=0.5, **kw)
+    net = RDMWilsonCowan(K_ref_E=0.0, K_ref_I=0.0, dt0=0.5, hazard="async", **kw)
+    spin = SpinWilsonCowan(N=1000, K_ref1=0.0, K_ref2=0.0, dt0=0.5, **kw)
 
     assert torch.allclose(net.w.float(), spin.w)
 
@@ -61,8 +61,8 @@ def test_wilson_cowan_weight_orientation_matches_the_spin_model():
 
     # the inhibitory column must actually inhibit E: raising m_I lowers I_E
     E = torch.zeros(2, dtype=net.w.dtype)
-    quiet = dyn.compute_total_input(torch.tensor([0.1, 0.0], dtype=net.w.dtype), net.w, E)
-    loud  = dyn.compute_total_input(torch.tensor([0.1, 0.5], dtype=net.w.dtype), net.w, E)
+    quiet = rdm.compute_total_input(torch.tensor([0.1, 0.0], dtype=net.w.dtype), net.w, E)
+    loud  = rdm.compute_total_input(torch.tensor([0.1, 0.5], dtype=net.w.dtype), net.w, E)
     assert loud[0] < quiet[0]
 
 
@@ -73,7 +73,7 @@ def test_update_synaptic_term():
     I = 0.7
     S = torch.rand(Q, dtype=torch.float64)
 
-    S_new = dyn.update_synaptic_term(S, alpha, I)
+    S_new = rdm.update_synaptic_term(S, alpha, I)
 
     # bin 0 is always reset -- there is no age-0 field yet
     assert S_new[0] == 0
@@ -84,18 +84,18 @@ def test_update_synaptic_term():
     assert not torch.allclose(S, S_new)
 
     # edge cases: alpha=0 keeps only the aged-in history, alpha=1 forgets it entirely
-    S_no_input = dyn.update_synaptic_term(S, 0.0, I)
+    S_no_input = rdm.update_synaptic_term(S, 0.0, I)
     assert torch.allclose(S_no_input[1:], S[:-1])
-    S_no_memory = dyn.update_synaptic_term(S, 1.0, I)
+    S_no_memory = rdm.update_synaptic_term(S, 1.0, I)
     assert torch.allclose(S_no_memory[1:], torch.full_like(S[:-1], I))
 
     # in-place variant must match the out-of-place one bit-for-bit
     S_inplace = S.clone()
-    dyn.update_synaptic_term(S_inplace, alpha, I, inplace=True)
+    rdm.update_synaptic_term(S_inplace, alpha, I, inplace=True)
     assert torch.equal(S_inplace, S_new)
 
 
-def test_sync_hazard_is_the_sigmoid_of_the_field():
+def test_async_hazard_at_the_quantum_is_the_sigmoid_of_the_field():
     """ The kernel the old compute_firing_prob hard-coded, now one member of the family.
     Its derivative and its relatives are tested in test_srm.py; this just pins the form. """
     torch.manual_seed(2)
@@ -103,11 +103,11 @@ def test_sync_hazard_is_the_sigmoid_of_the_field():
     S = torch.randn(Q, dtype=torch.float64)
     R = torch.randn(Q, dtype=torch.float64)
     beta, theta = 2.5, 0.3
-    got = hzd.sync_hazard(S + R - theta, beta, lam0=1.0, dt=1.0)
+    got = hzd.async_hazard(S + R - theta, beta, lam0=1.0, dt=1.0)
     assert torch.allclose(got, torch.sigmoid(beta * (S + R - theta)))
     # and it does not touch the caller's tensors
     S_before, R_before = S.clone(), R.clone()
-    hzd.sync_hazard(S + R - theta, beta, 1.0, 1.0)
+    hzd.async_hazard(S + R - theta, beta, 1.0, 1.0)
     assert torch.equal(S, S_before) and torch.equal(R, R_before)
 
 
@@ -118,27 +118,27 @@ def test_update_age_distribution():
     P /= P.sum()
     fprobs = torch.rand(Q, dtype=torch.float64) * 0.8  # stay away from 1
 
-    P_new = dyn.update_age_distribution(P, fprobs)
+    P_new = rdm.update_age_distribution(P, fprobs)
 
     # renewal update stays a valid distribution
     assert torch.allclose(P_new.sum(), torch.tensor(1.0, dtype=torch.float64))
     # births into bin 0 are exactly the firing rate
-    assert torch.allclose(P_new[0], dyn.compute_firing_rate(P, fprobs))
+    assert torch.allclose(P_new[0], rdm.compute_firing_rate(P, fprobs))
     # interior bins age by one step, decayed by survival
     assert torch.allclose(P_new[1:-1], P[:-2] * (1 - fprobs[:-2]))
     # the boundary bin absorbs whatever remains, so P_new stays normalized by construction
     assert torch.allclose(P_new[-1], 1 - P_new[:-1].sum())
 
-    dyn.check_age_normalization(P_new)  # should not raise
+    rdm.check_age_normalization(P_new)  # should not raise
     with pytest.raises(ValueError):
-        dyn.check_age_normalization(torch.tensor([0.5, 0.6]))
+        rdm.check_age_normalization(torch.tensor([0.5, 0.6]))
 
     # in-place variant must match the out-of-place one to floating-point rounding: both
     # compute the boundary bin as 1 minus the same two quantities, but grouped differently
     # (1 - (frate + interior.sum()) vs (1 - frate) - interior.sum()), so they are not
     # guaranteed bit-exact
     P_inplace = P.clone()
-    dyn.update_age_distribution(P_inplace, fprobs, inplace=True)
+    rdm.update_age_distribution(P_inplace, fprobs, inplace=True)
     assert torch.allclose(P_inplace, P_new)
 
 
@@ -157,14 +157,14 @@ def test_inplace_branches_match_out_of_place(shape):
     P /= P.sum(dim=-1, keepdim=True)
     fprobs = torch.rand(*shape, dtype=torch.float64)
 
-    P_ref = dyn.update_age_distribution(P.clone(), fprobs)
-    P_ip  = P.clone(); dyn.update_age_distribution(P_ip, fprobs, inplace=True)
+    P_ref = rdm.update_age_distribution(P.clone(), fprobs)
+    P_ip  = P.clone(); rdm.update_age_distribution(P_ip, fprobs, inplace=True)
     assert torch.allclose(P_ref, P_ip, atol=1e-12)
     assert torch.allclose(P_ip.sum(dim=-1), torch.ones(shape[:-1], dtype=torch.float64), atol=1e-12)
 
     S = torch.randn(*shape, dtype=torch.float64)
-    S_ref = dyn.update_synaptic_term(S.clone(), alpha, I)
-    S_ip  = S.clone(); dyn.update_synaptic_term(S_ip, alpha, I, inplace=True)
+    S_ref = rdm.update_synaptic_term(S.clone(), alpha, I)
+    S_ip  = S.clone(); rdm.update_synaptic_term(S_ip, alpha, I, inplace=True)
     assert torch.equal(S_ref, S_ip)
 
     # (the hazards grew their own in-place branches later, for the entropy production rather
@@ -178,4 +178,67 @@ def test_compute_firing_rate_reduces_over_the_age_axis(shape):
     torch.manual_seed(1)
     P = torch.rand(*shape, dtype=torch.float64)
     fprobs = torch.rand(*shape, dtype=torch.float64)
-    assert torch.allclose(dyn.compute_firing_rate(P, fprobs), (P * fprobs).sum(dim=-1), atol=1e-12)
+    assert torch.allclose(rdm.compute_firing_rate(P, fprobs), (P * fprobs).sum(dim=-1), atol=1e-12)
+
+
+# The weight convention
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+def test_input_is_built_from_the_rate_in_all_three_models():
+    """ The convention of rdm.compute_total_input: I = w @ r + E with r the RATE in 1/ms, not
+    the per-bin overlap m = r*dt. It has to hold in all three classes, because a coupling that
+    meant different things in the mean field and the spin model would make every comparison
+    between them wrong by a factor of dt. """
+    from rdme.rdm_single import RDMIsingModel
+    from rdme.rdm_batch import RDMIsingModelBatch
+    from rdme.spin_model import SpinIsingModel
+
+    J, E = 4.0, 0.5
+    base = dict(beta=3.0, theta=0.4, tau_int=5.0, tau_ref=4.0, K_ref=0.0)
+
+    for dt in (1.0, 0.5):
+        s = RDMIsingModel(J=J, E=E, **base, dt0=1.0, dt=dt, hazard="async",
+                          t_abs=0.0, Qm=[60])
+        s.forward(200)
+        assert s.total_input()[0].item() == pytest.approx(J * s.rates()[0].item() + E, abs=1e-12)
+
+    b = RDMIsingModelBatch(J=torch.tensor([J]), E=E, **base, dt0=1.0, dt=0.5,
+                           hazard="async", t_abs=0.0, Qm=[60])
+    b.forward(200)
+    assert b.total_input()[0, 0].item() == pytest.approx(J * b.rates()[0, 0].item() + E, abs=1e-12)
+
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    try:
+        m = SpinIsingModel(N=5000, J=J, E=E, **base, dt0=1.0, dt=0.5,
+                           hazard="async", ic="silent")
+        m.forward(600)
+        assert m.total_input()[0].item() == pytest.approx(J * m.rates()[0].item() + E, rel=1e-5)
+    finally:
+        torch.set_default_dtype(prev)
+
+
+def test_a_coupling_does_not_have_to_be_rescaled_when_dt_changes():
+    """ The invariant, measured through the dynamics rather than inferred from the rates.
+
+    The coupling contribution to the input is I - E. Divided by the RATE it is w, at every dt;
+    divided by the per-bin overlap m = r*dt it would be w*dt and would halve whenever dt did.
+    So (I - E)/r is the quantity that has to come back equal to J, and it is what a caller
+    relies on when it moves a script from dt = 0.5 to dt = 0.1 without touching J.
+
+    Checking the rates instead is NOT enough: a first version of this test asserted only that
+    the rates stay within 50% of each other across dt, and it PASSED with the input rebuilt
+    from m -- the regressed rates happened to land inside the band. """
+    from rdme.rdm_single import RDMIsingModel
+    J, E = 4.0, 0.5
+    base = dict(beta=3.0, theta=0.4, tau_int=5.0, tau_ref=4.0, K_ref=0.0)
+    for dt in (1.0, 0.5, 0.25, 0.125):
+        m = RDMIsingModel(J=J, E=E, **base, dt0=1.0, dt=dt, hazard="async",
+                          t_abs=0.0, Qm=[int(60 / dt)])
+        m.forward(int(2000 / dt))
+        r = m.rates()[0].item()
+        assert r > 1e-3, f"dt={dt}: silent, the test proves nothing"
+        effective_J = (m.total_input()[0].item() - E) / r
+        assert effective_J == pytest.approx(J, rel=1e-12), (
+            f"dt={dt}: effective coupling {effective_J} != {J}; the input is being built "
+            "from the per-bin overlap rather than the rate")

@@ -223,5 +223,4 @@ __marimo__/
 
 # Data that cannot be shared publicly
 data/*
-papers/figures
-papers/scipost/figures
+*/figures

@@ -17,9 +17,23 @@ tangent directions, Q_b is the b-th block of a ragged state vector. Inner produc
 the block axis and the last axis, so a state split across several differently-sized blocks
 never has to be concatenated into one contiguous vector.
 
-Everything here is for a *map*, not a flow. An attracting periodic orbit of a map has all
-exponents strictly negative; a zero exponent means an invariant circle. Exponents are returned
-per unit time (divided by dt), which is the only form comparable across discretizations. """
+Whether this is a map or a flow is the caller's to say, and it changes the CLASSIFICATION but
+not the measurement. The Benettin driver is agnostic: QR on a time-dt sampling of a flow returns
+lam_flow * dt, so dividing by dt recovers the rates either way, and that per-unit-time form is
+the only one comparable across discretizations.
+
+The two differ in what a given spectrum MEANS, and they differ in opposite directions:
+
+                      genuine map (dt = dt0)        flow (dt refined below dt0)
+    fixed point       all lam < 0, not moving       all lam < 0
+    periodic orbit    all lam < 0, moving           lam_1 = 0 > lam_2
+    quasiperiodic     lam_1 = 0 > lam_2             lam_1 = lam_2 = 0
+
+In a genuine map an attracting periodic orbit is a fixed point of its P-th iterate, so every
+exponent is strictly negative and `moving` has to supply the dead/oscillating bit. Sample a FLOW
+every dt and its limit cycle keeps the phase direction, so lam_1 sits at zero and the same
+reading would file it as quasiperiodic. Pass `continuous=` to classify_spectrum accordingly;
+with dt0 and dt both on the model, `continuous = mf.dt < mf.dt0` is the test. """
 
 
 # Tangent dynamics
@@ -145,9 +159,22 @@ class Spectrum(NamedTuple):
     partial:    torch.Tensor   # (..., k) partial sums, cumsum of lam -- see `degenerate`
     drift:      torch.Tensor   # (..., k) second-half minus first-half estimate (a bias check)
     degenerate: torch.Tensor   # (..., k) bool: |lam_i - lam_{i+1}| < se, so the pair is unresolved
-    valid:      torch.Tensor   # (..., k) bool: |lam_i| * dt < 0.1, so lam/dt is a rate not an artifact
+    valid:      torch.Tensor   # (..., k) bool: |lam_i| * dt < 0.1 -- see the note below
     n_blocks:   int
     T:          float          # measurement window in time units, not steps
+
+    # `valid` asks whether a direction's per-STEP log-contraction is small, i.e. whether the
+    # step resolves that direction at all. It is informative only in the map regime, where a
+    # strongly contracting mode can die inside one step and its "rate" is then a property of
+    # the grid rather than of the model -- the age shift is near-nilpotent, so this model has
+    # such modes whenever k reaches them.
+    #
+    # It is VACUOUS for a flow. Refining dt sends lam*dt -> 0 for every direction with a finite
+    # rate, so the flag passes by construction and says nothing. In particular it does not
+    # certify that an exponent is converged: on the Painchaud cell every dt in the scan passed
+    # it, including the dt = 0.1 row whose lam_1 was an order of magnitude off its neighbours.
+    # The question it looks like it answers -- "is this exponent trustworthy?" -- is answered
+    # only by halving dt and re-measuring.
 
 
 def benettin(advance: Callable[[list[torch.Tensor]], None],
@@ -264,7 +291,21 @@ def benettin(advance: Callable[[list[torch.Tensor]], None],
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 FIXED, LOCKED, CIRCLE, TORUS, CHAOS = 0, 1, 2, 3, 4
+
+# The codes name the ATTRACTOR, so they mean the same thing in both regimes; only the spectral
+# signature that selects them moves, and only the vocabulary changes. CIRCLE is unreachable in
+# continuous mode: an invariant circle of the time-dt map IS the flow's limit cycle, which is
+# LOCKED, and genuine quasiperiodicity carries a second zero and is TORUS.
 CLASS_NAMES = ["fixed point", "locked cycle", "invariant circle", "2-torus", "chaos"]
+CLASS_NAMES_CONTINUOUS = ["fixed point", "limit cycle", "(unused)", "2-torus", "chaos"]
+
+
+def class_names(continuous: bool = False) -> list[str]:
+    """ Labels for the class codes, in the vocabulary of the regime. Use this rather than
+    CLASS_NAMES directly when a plot or a table may be built either way: "invariant circle" is
+    the map's name for what a flow calls a limit cycle, and printing the wrong one turns an
+    ordinary oscillation into a claim of quasiperiodicity. """
+    return CLASS_NAMES_CONTINUOUS if continuous else CLASS_NAMES
 
 
 def classify_spectrum(lam: torch.Tensor,            # (..., k) exponents per unit time
@@ -272,25 +313,39 @@ def classify_spectrum(lam: torch.Tensor,            # (..., k) exponents per uni
                       moving: torch.Tensor,         # (...) bool: the state varies in time
                       se: torch.Tensor | None = None,   # (..., k) standard error of lam
                       n_sigma: float = 3.0,         # how many SE a nonzero exponent must clear
+                      continuous: bool = False,     # True when dt < dt0, i.e. sampling a flow
                       ) -> torch.Tensor:            # (...) long, one of the class codes above
-    """ Attractor class from the leading exponents, for a MAP.
+    """ Attractor class from the leading exponents.
 
-    The flow table does not apply and getting this wrong is the easiest mistake here. In a flow
-    a limit cycle has one zero exponent, the phase direction. In a map an attracting periodic
-    orbit is a fixed point of the P-th iterate and every exponent is strictly negative; a zero
-    exponent means an invariant circle, i.e. quasiperiodicity. So lam_1 < 0 does not separate a
-    dead cell from an oscillating one, and `moving` -- in practice a variance or
-    coefficient-of-variation test from a cheaper screening pass -- has to supply that bit.
+    `continuous` says which regime the spectrum came from, and it is NOT a detail: the map and
+    flow readings disagree about exactly the case that dominates these sweeps, an ordinary
+    oscillation. See the module docstring for the two tables. With dt0 and dt both carried on
+    the model, the test is `continuous = mf.dt < mf.dt0`.
 
-    Needs only two exponents. lam_1 decides chaos and the fixed/cycle split; lam_2 separates an
-    invariant circle (lam_1 ~ 0 > lam_2) from a 2-torus (both ~ 0) and catches hyperchaos. A
-    larger k is not read here.
+    continuous=False (a genuine map, dt = dt0). An attracting periodic orbit is a fixed point
+    of its P-th iterate, so every exponent is strictly negative and lam_1 < 0 does NOT separate
+    a dead cell from an oscillating one; `moving` -- in practice a variance or CV test from a
+    cheaper screening pass -- supplies that bit. A zero exponent means an invariant circle.
+
+    continuous=True (a flow sampled every dt). A limit cycle keeps its phase direction, so
+    lam_1 = 0 > lam_2, and two zeros mean a 2-torus. lam_1 < 0 is then a fixed point on its own
+    and `moving` is not needed for that split -- but it is still read, because the age lattice
+    biases the phase direction negative by O(dt) and a cell whose bias exceeds the band would
+    otherwise be filed as dead. A moving cell with lam_1 < 0 is a cycle the band failed to
+    catch, which is the same LOCKED code; see `tol` below, which has to shrink with dt.
+
+    Needs only two exponents. lam_1 decides chaos and the fixed/cycle split; lam_2 separates a
+    cycle from a torus and catches hyperchaos. A larger k is not read here.
 
     The zero band has two half-widths and takes the larger, per cell:
 
       `tol` is a floor, covering anything that biases a genuinely marginal exponent by a fixed
-      amount -- for an age-structured map the lattice pins the phase direction and gives it a
-      small negative bias of order dt. It is a property of the model and the discretization.
+      amount -- for an age-structured scheme the lattice pins the phase direction and gives it
+      a small negative bias. MEASURED AT O(dt): -2.7e-4, -2.3e-4, -1.7e-4, -0.5e-4 /ms at
+      dt = 0.4, 0.2, 0.1, 0.05 on one oscillating cell. So in continuous mode `tol` is a
+      function of dt and a value calibrated at one step is wrong at another -- too wide at
+      small dt, where it swallows genuine weak chaos. Scale it, e.g. tol = c * dt with c fixed
+      from a cell known to be periodic.
 
       `n_sigma * se` is the per-cell statistical half-width. This is the one that actually
       binds: a finite window leaves each exponent with its own error bar, and cells differ by
@@ -300,14 +355,21 @@ def classify_spectrum(lam: torch.Tensor,            # (..., k) exponents per uni
 
     Pass `se` from the Benettin block statistics. Omitting it falls back to the scalar `tol`,
     which is only defensible if the windows are long enough that se << tol everywhere, and
-    that is worth checking rather than assuming. """
+    that is worth checking rather than assuming.
+
+    Neither mode makes a claim that survives refinement on its own: a class that changes
+    between dt and dt/2 is a statement about the grid, not the attractor. """
     lam1 = lam[..., 0]
     band = torch.full_like(lam1, tol) if se is None else torch.clamp(n_sigma * se[..., 0], min=tol)
     out = torch.full(lam1.shape, FIXED, dtype=torch.long, device=lam.device)
 
     near0_1 = lam1.abs() <= band
+    # a moving cell with a resolved negative lam_1: a locked cycle in a map, and in a flow a
+    # cycle whose O(dt) phase bias escaped the band. Same code, same reading.
     out[~near0_1 & (lam1 < 0) & moving] = LOCKED
-    out[near0_1] = CIRCLE
+    # the one cell where the tables disagree: lam_1 ~ 0 is an invariant circle of a map and
+    # the limit cycle of a flow
+    out[near0_1] = LOCKED if continuous else CIRCLE
 
     if lam.shape[-1] > 1:
         # two independent neutral directions, not one conjugate pair sitting near zero

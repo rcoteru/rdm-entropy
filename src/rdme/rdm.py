@@ -19,13 +19,32 @@ for what is really a dtype-dependent numerical bound. """
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 def compute_total_input(
-        m: torch.Tensor, # (M,) or (B, M) overlaps
-        w: torch.Tensor, # (M, M) or (B, M, M) pop connection weights
+        r: torch.Tensor, # (M,) or (B, M) population RATES, in 1/ms -- NOT the per-bin overlap
+        w: torch.Tensor, # (M, M) or (B, M, M) pop connection weights, PHYSICAL units
         E: torch.Tensor, # (M,) or (B, M) pop external drives
         ) -> torch.Tensor:
-    """ Total input to each population: I^a = sum_b w[a, b] m^b + E^a, i.e. w @ m + E.
-    Row = target, column = source, matching w^{ab} ("from population b onto a") in the theory. """
-    return (w @ m.unsqueeze(-1)).squeeze(-1) + E
+    """ Total input to each population: I^a = sum_b w[a, b] r^b + E^a, i.e. w @ r + E.
+    Row = target, column = source, matching w^{ab} ("from population b onto a") in the theory.
+
+    THE WEIGHT CONVENTION, stated once here because all three model classes share it and
+    nothing else in the package should restate it.
+
+    The first argument is the RATE r = m/dt in 1/ms, not the per-bin firing probability m.
+    Weights are therefore in physical units and are NOT divided by dt: pass J, never J/dt.
+
+    The point of building the input from the rate is that it makes w independent of the
+    solver. m is O(dt) and so means something different at every step size, while r has a
+    dt -> 0 limit; a coupling multiplied into r therefore keeps its meaning when dt is
+    refined. Concretely, J = 4 at dt = 0.5 is the same model as J = 4 at dt = 0.1 or dt = 1,
+    and only the discretization error moves. A coupling multiplied into m would have to be
+    rescaled at every step size, which is the trap this convention exists to remove.
+
+    Historical note, because old caches and old scripts still carry it: the pre-port
+    implementation built the input from m and so stored w already divided by dt. A J quoted
+    against that convention is J_physical/dt and will be wrong by that factor here. The batch
+    loader converts such saves on read; a script that hard-codes a pre-divided J will not be
+    caught by anything and has to be checked by hand. """
+    return (w @ r.unsqueeze(-1)).squeeze(-1) + E
 
 
 def update_synaptic_term(S: torch.Tensor,               # (Q,) or (B, Q) synaptic term

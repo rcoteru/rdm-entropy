@@ -13,20 +13,20 @@ import pytest
 import torch
 
 import rdme.hazards as hzd
-import rdme.dynamics as dyn
+import rdme.rdm as rdm
 import rdme.epr
-import rdme.single
-from rdme.batch import RDMNetworkBatch
+import rdme.rdm_single
+from rdme.rdm_batch import RDMNetworkBatch
 from rdme.epr import (anchor_reverse_synaptic_term, compute_reverse_synaptic_term,
                       epr_from_joint, epr_from_parts, init_epr_state, joint_distribution,
                       make_epr_indices, step_epr)
-from rdme.single import RDMIsingModel, RDMNetwork
+from rdme.rdm_single import RDMIsingModel, RDMNetwork
 
 
 torch.manual_seed(0)
 
 # the synchronous kernel at its own quantum: lam0*dt = 1, where sync ignores both anyway
-HZ, LAM0, DT = hzd.HAZARDS["synchronous"], 1.0, 1.0
+HZ, LAM0, DT = hzd.HAZARDS["async"], 1.0, 1.0
 
 
 def _phi(S, R, beta, theta):
@@ -124,30 +124,27 @@ def test_reverse_field_anchoring_is_wired_through_the_trajectory():
     torch.set_default_dtype(torch.float64)
     try:
         dt = 0.5
-        net = RDMIsingModel(4, 1, 30, 1, 12, 3, 0, dt, hazard="synchronous",
+        net = RDMIsingModel(4, 1, 30, 1, 12, 3, 0, dt0=dt, hazard="async",
                                 eps=0.01, device="cpu")
         net.forward(300)
         out = net.entropy_trajectory(40, pb=False)
 
         # a shifted anchoring changes H_rev (and hence sigma) but leaves H_fwd alone --
         # so a silent regression to the t-anchored field would show up right here
-        net2 = RDMIsingModel(4, 1, 30, 1, 12, 3, 0, dt, hazard="synchronous",
+        net2 = RDMIsingModel(4, 1, 30, 1, 12, 3, 0, dt0=dt, hazard="async",
                                  eps=0.01, device="cpu")
         net2.forward(300)
-        # The name has to be patched in the module that READS it, not in the rdme
-        # package namespace: the default path is the sliding one and step_epr resolves the
-        # name through rdme.epr's own globals, so patching the package re-export is a no-op
-        # and the test would pass vacuously. Both modules are patched so the check holds
-        # whichever path runs.
-        mods = [rdme.epr, rdme.single]
-        real = [m.anchor_reverse_synaptic_term for m in mods]
-        for m in mods:
-            m.anchor_reverse_synaptic_term = compute_reverse_synaptic_term   # the old bug
+        # The name has to be patched in the module that DEFINES it, and rdme.epr is now the
+        # only place it lives: every caller reaches it as epr.anchor_reverse_synaptic_term
+        # rather than holding a from-import binding of its own. That is the point of the
+        # module-qualified imports -- there used to be a second binding in rdme.rdm_single's
+        # globals, and patching only one of the two let the test pass vacuously.
+        real = rdme.epr.anchor_reverse_synaptic_term
+        rdme.epr.anchor_reverse_synaptic_term = compute_reverse_synaptic_term   # the old bug
         try:
             bad = net2.entropy_trajectory(40, pb=False)
         finally:
-            for m, r in zip(mods, real):
-                m.anchor_reverse_synaptic_term = r
+            rdme.epr.anchor_reverse_synaptic_term = real
 
         assert torch.allclose(out["H_fwd_tot"], bad["H_fwd_tot"])    # forward half untouched
         assert not torch.allclose(out["H_rev_tot"], bad["H_rev_tot"])
@@ -207,7 +204,7 @@ def test_joint_distribution_survives_saturated_hazards(dtype):
     assert torch.allclose(joint.sum(dim=1), p, atol=1e-6)
 
     # float64 must keep the historical bound exactly, so this is not a silent numerics change
-    assert dyn.hazard_clamp(torch.float64) == 1.0 - 1e-12
+    assert rdm.hazard_clamp(torch.float64) == 1.0 - 1e-12
 
 
 def _naive_epr(p_joint, S_fwd, S_rev, R, beta, theta):
@@ -363,7 +360,7 @@ def _small_network(Qm, seed=0):
         M=M, w=w, N=[1000] * M,
         E=[0.3] * M, beta=[3.0] * M, theta=[0.4] * M,
         tau_int=[3.0] * M, tau_ref=[5.0] * M, K_ref=[2.0] * M,
-        Qm=Qm, hazard="synchronous",
+        Qm=Qm, dt0=1.0, hazard="async",
     )
 
 
@@ -423,7 +420,7 @@ def test_entropy_trajectory_rewinds_live_state():
     assert torch.allclose(peeked.m, stepped.m, atol=1e-6)
 
 
-def _small_batch(Qm, B, seed=1, hazard="synchronous"):
+def _small_batch(Qm, B, seed=1, hazard="async"):
     """ A small RDMNetworkBatch whose B batch elements carry distinct parameters, so a bug
     that only shows up when elements diverge (e.g. a broadcast collapsing the batch axis)
     has something to trip on. """
@@ -437,7 +434,7 @@ def _small_batch(Qm, B, seed=1, hazard="synchronous"):
         M=M, w=w, N=[1000] * M,
         E=E, beta=beta, theta=const(0.4),
         tau_int=const(3.0), tau_ref=const(5.0), K_ref=const(2.0),
-        Qm=Qm, hazard=hazard,
+        Qm=Qm, dt0=1.0, hazard=hazard,
     )
 
 
@@ -451,7 +448,7 @@ def test_batch_entropy_trajectory_matches_independent_networks():
             M=batch.M, w=batch.w[b], N=batch.N,
             E=batch.E[b].tolist(), beta=batch.beta[b].tolist(), theta=batch.theta[b].tolist(),
             tau_int=batch.tau_int[b].tolist(), tau_ref=batch.tau_ref[b].tolist(),
-            K_ref=batch.K_ref[b].tolist(), Qm=Qm,
+            K_ref=batch.K_ref[b].tolist(), Qm=Qm, dt0=batch.dt0,
         )
         single_out = single.entropy_trajectory(T, pb=False)
         for k in ("sigma", "H_fwd", "H_rev"):
@@ -487,7 +484,7 @@ def test_batch_entropy_trajectory_chunk_matches_unchunked(chunk, method):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-@pytest.mark.parametrize("name", ["synchronous", "async", "escape"])
+@pytest.mark.parametrize("name", ["async", "escape", "poisson", "exp_surv"])
 @pytest.mark.parametrize("lam0,dt", [(1.0, 1.0), (0.3, 0.5), (2.0, 0.25)])
 def test_hazard_inplace_branches_are_bitwise_identical(name, dtype, lam0, dt):
     """ All five kernel members, over a field that spans the saturated tails where the closed
@@ -510,7 +507,7 @@ def test_hazard_inplace_branches_are_bitwise_identical(name, dtype, lam0, dt):
     assert torch.equal(ref.nan_to_num(), got.nan_to_num())
 
 
-@pytest.mark.parametrize("name", ["synchronous", "async", "escape"])
+@pytest.mark.parametrize("name", ["async", "escape", "poisson", "exp_surv"])
 def test_hazard_inplace_leaves_the_result_but_not_the_field(name):
     """ The flag is a licence to destroy h and nothing more: the result is correct, and the
     caller is on notice that h is gone. Pinned here so a future rewrite that quietly starts
@@ -532,7 +529,7 @@ def test_joint_distribution_inplace_matches_and_leaves_inputs_alone():
     theta = torch.rand(3, 1, dtype=torch.float64)
     keep = (p.clone(), buff_S.clone(), R.clone())
 
-    for name in ("synchronous", "async", "escape"):
+    for name in ("async", "escape", "poisson", "exp_surv"):
         hz = hzd.HAZARDS[name]
         ref = rdme.epr.joint_distribution(p, buff_S, R, beta, theta, hz, 0.5, 0.5)
         got = rdme.epr.joint_distribution(p, buff_S, R, beta, theta, hz, 0.5, 0.5,
@@ -543,7 +540,7 @@ def test_joint_distribution_inplace_matches_and_leaves_inputs_alone():
 
 
 @pytest.mark.parametrize("method", ["joint", "sliding"])
-@pytest.mark.parametrize("hazard", ["synchronous", "async", "escape"])
+@pytest.mark.parametrize("hazard", ["async", "escape", "poisson", "exp_surv"])
 def test_entropy_trajectory_inplace_is_bitwise_identical(method, hazard):
     """ End to end, which is what the flag is actually used through: every output, and the
     live state the run rewinds to, must match the oracle exactly.

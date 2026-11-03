@@ -5,28 +5,19 @@ from collections import deque
 import torch
 import tqdm
 
-from rdme.dynamics import (compute_total_input, compute_firing_rate,
-                               update_synaptic_term, update_age_distribution,
-                               check_age_normalization)
-from rdme.epr import (anchor_reverse_synaptic_term, joint_distribution, epr_from_joint,
-                          make_epr_indices, init_epr_state, step_epr, hazard_field)
-from rdme.fixed_points import fp_overlap_map, fp_state, fp_guess_lattice
-from rdme.lyapunov import update_tangent, init_tangent_blocks
-
-from rdme.hazards import HAZARDS
-import rdme.fixed_points as fpts
+import rdme.rdm as rdm
+import rdme.epr as epr
+import rdme.hazards as hzd
 import rdme.kernels as krn
+import rdme.fixed_points as fpts
+import rdme.lyapunov as lyap
 
-""" The single-system network. See rdme for what the model is; this file is the class. """
-
-
-
-# Continuous-time network
+# Single system network
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 class RDMNetwork:
 
-    """ Continuous-time mean field on an age grid, solved with du = dt. """
+    """ Single-system network. """
 
     M: int                    # number of populations
     dt: float                 # time step AND age-bin width, in ms -- a numerical parameter here
@@ -64,22 +55,30 @@ class RDMNetwork:
                  tau_int: torch.Tensor | list[float],
                  tau_ref: torch.Tensor | list[float],
                  K_ref: torch.Tensor | list[float],
-                 dt: float = 1.0,
-                 dt0: float | None = None,
+                 *,
+                 dt0: float,
+                 dt: float | None = None,
                  hazard: str = "escape",
+                 t_abs: float | None = None,
                  Qm: list[int] | None = None,
                  eps: float = 0.01,
                  device: str = 'cpu') -> None:
         """ Initialize the continuous-time mean field.
 
-        dt is the resolution of the solution, and is the quantity to refine when checking
-        convergence. dt0 is the *model's* time quantum, which fixes lam0 = 1/dt0 and does not
-        change when dt does; it is what ties this model to a particular member of the discrete
-        family. dt0 defaults to dt, i.e. to sitting at the quantum, where the escape hazard and
-        the sigmoid coincide -- convenient as a starting point, but then refining dt alone would
-        move the model, so a convergence study must pin dt0 explicitly.
+        dt0 is the model and dt is the solver; see hazards.resolve_timesteps, which states
+        the convention and enforces it. dt0 is required, dt defaults to it, and dt0/dt are
+        keyword-only so the two can never be swapped by position.
 
-        w is in physical units and is NOT divided by dt (see the module docstring).
+        t_abs is the absolute refractory period, defaulting to dt0. That default is not a
+        biophysical choice but a consistency one: the model lives on spike trains binned at
+        dt0, which cannot carry two spikes closer than dt0, and no hazard enforces that on its
+        own -- see kernels.refractory_kernel. It costs nothing at dt = dt0, where the window is
+        empty, and switches on only as dt is refined. Pass t_abs=0.0 for the plain exponential
+        kernel (the pre-window behaviour), or a larger value for a genuine biophysical dead
+        time.
+
+        w is in physical units and is NOT divided by dt -- pass J, never J/dt. See
+        rdm.compute_total_input for why, and for what old caches carry instead.
 
         Qm is derived from the slower of the two kernels, as in RDMNetwork, which makes the
         truncation age U_max = -tau*ln(eps) independent of dt. Note this bounds the kernels, not
@@ -89,19 +88,11 @@ class RDMNetwork:
         for name, seq in [("N", N), ("E", E), ("beta", beta), ("theta", theta),
                           ("tau_int", tau_int), ("tau_ref", tau_ref), ("K_ref", K_ref)]:
             assert len(seq) == M, f"{name} must have length M={M}"
-        if hazard not in HAZARDS:
-            raise ValueError(f"hazard must be one of {sorted(HAZARDS)}, got {hazard!r}")
+        self.dt0, dt, self.lam0 = hzd.resolve_timesteps(dt0, dt, hazard)
 
         dtype = torch.get_default_dtype()
         self.M, self.dt, self.device = M, dt, device
         self.hazard = hazard
-        self.dt0 = dt if dt0 is None else dt0
-        self.lam0 = 1.0 / self.dt0
-        if HAZARDS[hazard].bounded_step and self.lam0 * dt > 1.0 + 1e-12:
-            # Phi = lam0*dt*sigma would exceed 1: an update probability above one
-            raise ValueError(
-                f"hazard {hazard!r} requires lam0*dt <= 1, got lam0*dt = {self.lam0 * dt:.4g} "
-                f"(dt={dt}, dt0={self.dt0}). Refine dt, or raise dt0.")
         self.N = N
         self.w = w.to(device=device, dtype=dtype)
 
@@ -123,8 +114,16 @@ class RDMNetwork:
         assert len(Qm) == M and all(isinstance(q, int) and q > 0 for q in Qm)
         self.Qm = Qm
 
+        self.t_abs = self.dt0 if t_abs is None else t_abs
+        # r_max = 1/t_abs is what the window itself allows, so the floor is sized against a
+        # drive the window has already bounded -- see kernels.abs_refractory_floor
+        self.R_abs = (krn.abs_refractory_floor(self.w, self.E, self.theta, self.beta,
+                                               r_max=1.0 / self.t_abs)
+                      if self.t_abs > 0 else torch.zeros_like(self.theta))
+        self.n_abs = krn.n_abs_bins(self.t_abs, dt)
         self.R = [krn.refractory_kernel(Qm[i], self.K_ref[i].item(), self.tau_ref[i].item(),
-                                         dt=dt, device=device) for i in range(M)]
+                                        dt=dt, t_abs=self.t_abs, R_abs=self.R_abs[i],
+                                        device=device) for i in range(M)]
 
         # all age mass in the oldest bin, zero integrated field -- as RDMNetwork, so the two
         # start from the same state and a comparison is not reading a difference in the IC
@@ -161,10 +160,55 @@ class RDMNetwork:
         return [p_i / self.dt for p_i in self.p]
 
     @torch.inference_mode()
+    def max_step_prob(self) -> float:
+        """ max over bins and populations of Phi at the CURRENT state: the largest fraction of
+        an age bin that fires in one step. A value near 1 means a bin can empty in a single
+        step, which is the two-step flip; << 1 means the step resolves the fastest hazard
+        present.
+
+        This is ONE INSTANT, which on an oscillating attractor is not the worst case -- the
+        peak of a burst can be an order of magnitude above the trough. To answer "is dt small
+        enough?" take the max along a trajectory covering at least one period:
+
+            peak = max(net.max_step_prob() or net.update() for _ in range(n))   # sketch
+
+        A single call is only the whole story at a fixed point.
+
+        Why this rather than lam0*dt. For "async" the two agree, since Phi <= lam0*dt
+        everywhere -- the rate saturates at lam0, so the calibration IS the bound. For "escape"
+        the rate lam0*softplus(beta*h) is unbounded, so lam0*dt bounds nothing: at strong drive
+        Phi approaches 1 however small lam0*dt is. Only the realized max(Phi) sees that, which
+        is why refining "escape" has to be checked rather than assumed. """
+        return max(phi.max().item() for phi in self.firing_prob())
+
+    @torch.inference_mode()
+    def truncation_error(self) -> float:
+        """ Rigorous relative bound on the firing-rate error from the finite age grid:
+
+            err = p[-1] * |Phi(h_inf) - Phi(h[-1])| / m
+
+        i.e. the fraction of this population's firing that is misassigned because the age axis
+        stops at U_max = Q*dt. A bound, not an estimate: h(u) = S(u) + R(u) - theta is monotone
+        increasing in age and Phi is monotone in h, so every cohort beyond the boundary fires
+        at a rate between Phi(h[-1]) and Phi(h_inf), and the displaced mass p[-1] cannot be
+        wrong by more than their gap. See RDMNetworkBatch.truncation_error for the two weaker
+        criteria this replaced and why each failed. """
+        I = self.total_input()
+        h = self.field()
+        phi = hzd.HAZARDS[self.hazard].phi
+        out = []
+        for i in range(self.M):
+            h_inf = (I[i] - self.theta[i]).reshape(1)
+            gap = (phi(h_inf, self.beta[i], self.lam0, self.dt)
+                   - phi(h[i][-1:], self.beta[i], self.lam0, self.dt)).abs()
+            out.append(float(self.p[i][-1] * gap / max(float(self.m[i]), 1e-300)))
+        return max(out)
+
+    @torch.inference_mode()
     def total_input(self) -> torch.Tensor:
         """ I^a = sum_b w^{ab} r^b + E^a, shape (M,). Built from the RATE, which is why w
         carries no 1/dt here. """
-        return compute_total_input(self.rates(), self.w, self.E)
+        return rdm.compute_total_input(self.rates(), self.w, self.E)
 
     @torch.inference_mode()
     def field(self) -> list[torch.Tensor]:
@@ -175,22 +219,22 @@ class RDMNetwork:
     def hazard_rate(self) -> list[torch.Tensor]:
         """ The firing rate lambda(h) the hazard represents, in 1/ms, list of (Qm[i],).
 
-        The quantity the three hazards actually differ by in the dt -> 0 limit; the per-bin
-        Phi below is its rendering on this grid. For "synchronous" this is sigma(beta*h)/dt,
-        which has no limit -- see sync_rate. """
-        fn, h = HAZARDS[self.hazard].rate, self.field()
+        The quantity the two hazards actually differ by in the dt -> 0 limit; the per-bin Phi
+        below is its rendering on this grid. Bounded by lam0 for "async", unbounded for
+        "escape" -- see max_step_prob, which is what decides whether dt resolves it. """
+        fn, h = hzd.HAZARDS[self.hazard].rate, self.field()
         return [fn(h[i], self.beta[i], self.lam0, self.dt) for i in range(self.M)]
 
     @torch.inference_mode()
     def firing_prob(self) -> list[torch.Tensor]:
         """ Per-bin hazard Phi, list of (Qm[i],). """
-        fn, h = HAZARDS[self.hazard].phi, self.field()
+        fn, h = hzd.HAZARDS[self.hazard].phi, self.field()
         return [fn(h[i], self.beta[i], self.lam0, self.dt) for i in range(self.M)]
 
     @torch.inference_mode()
     def d_firing_prob(self) -> list[torch.Tensor]:
         """ dPhi/dh at the current state, list of (Qm[i],). Needed by the tangent map. """
-        fn, h = HAZARDS[self.hazard].dphi, self.field()
+        fn, h = hzd.HAZARDS[self.hazard].dphi, self.field()
         return [fn(h[i], self.beta[i], self.lam0, self.dt) for i in range(self.M)]
 
     # Fixed points
@@ -198,18 +242,18 @@ class RDMNetwork:
 
     def _fp_args(self) -> tuple:
         return (self.w, self.E, self.alpha_int, self.beta, self.theta, self.R,
-                HAZARDS[self.hazard], self.lam0, self.dt)
+                hzd.HAZARDS[self.hazard], self.lam0, self.dt)
 
     def fp_residual(self, m: torch.Tensor) -> torch.Tensor:
         """ G(m) = m - F(m), in OVERLAPS (per-bin), shape (M,).
 
         In overlaps rather than rates so the residual sits on the same [0, 1] scale the generic
         Newton routines in rdme.fixed_points clamp to. Divide a root by dt for the rate. """
-        return m - fp_overlap_map(m, *self._fp_args())
+        return m - fpts.fp_overlap_map(m, *self._fp_args())
 
     def fp_state(self, m: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """ The stationary (p, S) implied by the overlaps m. """
-        return fp_state(m, *self._fp_args())
+        return fpts.fp_state(m, *self._fp_args())
 
     def set_state(self, m: torch.Tensor) -> None:
         """ Place the network on the stationary state implied by m. """
@@ -247,7 +291,7 @@ class RDMNetwork:
                                       merge_tol=merge_tol, device=self.device, **kwargs)
         if method == 'newton':
             if guesses is None:
-                guesses = fp_guess_lattice(self.M, n_per_axis=5, device=self.device)
+                guesses = fpts.fp_guess_lattice(self.M, n_per_axis=5, device=self.device)
             return fpts.newton_roots(self.fp_residual, guesses, tol=tol,
                                      merge_tol=merge_tol, **kwargs)
         raise ValueError(f"unknown method {method!r}, expected 'auto', 'bracket' or 'newton'")
@@ -278,12 +322,12 @@ class RDMNetwork:
         spurious zero mode from a redundant variable. """
         p, S = self.unflatten_state(x)
         m = torch.stack([p[i][..., 0] for i in range(self.M)], dim=-1)
-        I = compute_total_input(m / self.dt, self.w, self.E)
-        fn = HAZARDS[self.hazard].phi
+        I = rdm.compute_total_input(m / self.dt, self.w, self.E)
+        fn = hzd.HAZARDS[self.hazard].phi
         fprobs = [fn(S[i] + self.R[i] - self.theta[i], self.beta[i], self.lam0, self.dt)
                   for i in range(self.M)]
-        p_new = [update_age_distribution(p[i], fprobs[i]) for i in range(self.M)]
-        S_new = [update_synaptic_term(S[i], self.alpha_int[i], I[..., i])
+        p_new = [rdm.update_age_distribution(p[i], fprobs[i]) for i in range(self.M)]
+        S_new = [rdm.update_synaptic_term(S[i], self.alpha_int[i], I[..., i])
                  for i in range(self.M)]
         return self.flatten_state(p_new, S_new)
 
@@ -304,7 +348,7 @@ class RDMNetwork:
                      ) -> list[torch.Tensor]:   # 2M blocks, each (k, Qm[i])
         """ A random orthonormal, sum-zero tangent basis. Shares mean_field's builder: the
         layout and the sum-zero projection are properties of the state, not of the hazard. """
-        return init_tangent_blocks(self.Qm, k, device=self.device, generator=generator)
+        return lyap.init_tangent_blocks(self.Qm, k, device=self.device, generator=generator)
 
     @torch.no_grad()
     def step_tangent(self, blocks: list[torch.Tensor]) -> None:
@@ -317,7 +361,7 @@ class RDMNetwork:
         I      = self.total_input()
         fprobs = self.firing_prob()
         dphi   = self.d_firing_prob()
-        blocks[:] = update_tangent(blocks, self.p, fprobs, dphi, self.w,
+        blocks[:] = lyap.update_tangent(blocks, self.p, fprobs, dphi, self.w,
                                    [self.alpha_int[i] for i in range(self.M)], self.dt)
         self._advance_from(I, fprobs)
 
@@ -334,14 +378,14 @@ class RDMNetwork:
         # compute_firing_rate rather than (p*fprobs).sum(): same quantity, but reusing the
         # function RDMNetwork calls keeps the summation order identical, so hazard="sigmoid"
         # reproduces it bit for bit instead of to within roundoff
-        self.m = torch.stack([compute_firing_rate(self.p[i], fprobs[i]) for i in range(self.M)])
+        self.m = torch.stack([rdm.compute_firing_rate(self.p[i], fprobs[i]) for i in range(self.M)])
 
         for i in range(self.M):
-            update_age_distribution(self.p[i], fprobs[i], inplace=True)
-            update_synaptic_term(self.S[i], self.alpha_int[i], I[i], inplace=True)
+            rdm.update_age_distribution(self.p[i], fprobs[i], inplace=True)
+            rdm.update_synaptic_term(self.S[i], self.alpha_int[i], I[i], inplace=True)
 
         for pi in self.p:
-            check_age_normalization(pi)
+            rdm.check_age_normalization(pi)
 
     @torch.inference_mode()
     def update(self) -> None:
@@ -425,7 +469,7 @@ class RDMNetwork:
 
         M, Qm, device = self.M, self.Qm, self.device
         Q_max = max(Qm)
-        hz, lam0, dt = HAZARDS[self.hazard], self.lam0, self.dt
+        hz, lam0, dt = hzd.HAZARDS[self.hazard], self.lam0, self.dt
 
         out = {k: torch.zeros(T, M, device=device)
                for k in ("r", "m", "sigma", "H_fwd", "H_rev")}
@@ -447,8 +491,8 @@ class RDMNetwork:
 
         # The buffers are rings from here on: logical row j lives at slot (head + j) % Qm[i],
         # so retiring a row is one slot write rather than a (Qm, Qm) shift.
-        idx = [make_epr_indices(Qm[i], Qm[i], device) for i in range(M)]
-        state = [init_epr_state(p_cur[i], buff_S[i], self.R[i], self.beta[i], self.theta[i],
+        idx = [epr.make_epr_indices(Qm[i], Qm[i], device) for i in range(M)]
+        state = [epr.init_epr_state(p_cur[i], buff_S[i], self.R[i], self.beta[i], self.theta[i],
                                 hz, lam0, dt, inplace=inplace) if method == "sliding" else None
                  for i in range(M)]
         head = 0
@@ -460,22 +504,22 @@ class RDMNetwork:
                 out["m"][t, i] = p_cur[i][0]
 
                 if method == "sliding":
-                    e, p_cur[i], state[i] = step_epr(
+                    e, p_cur[i], state[i] = epr.step_epr(
                         p_cur[i], state[i], buff_S[i], buff_I[i], idx[i], head,
                         self.R[i], self.alpha_int[i], self.beta[i], self.theta[i],
                         hz, lam0, dt, inplace=inplace)
                 else:
                     sl = idx[i].slots[head % Qm[i]]
                     Sb = buff_S[i][sl]                         # logical order, O(Q^2) gather
-                    J = joint_distribution(p_cur[i], Sb, self.R[i], self.beta[i],
+                    J = epr.joint_distribution(p_cur[i], Sb, self.R[i], self.beta[i],
                                            self.theta[i], hz, lam0, dt, inplace=inplace)
-                    phi_f = hz.phi(hazard_field(Sb[0], self.R[i], self.theta[i], inplace),
+                    phi_f = hz.phi(epr.hazard_field(Sb[0], self.R[i], self.theta[i], inplace),
                                    self.beta[i], lam0, dt, inplace=inplace)
-                    S_rev = anchor_reverse_synaptic_term(buff_I[i][sl], self.alpha_int[i])
-                    phi_r = hz.phi(hazard_field(S_rev, self.R[i], self.theta[i], inplace),
+                    S_rev = epr.anchor_reverse_synaptic_term(buff_I[i][sl], self.alpha_int[i])
+                    phi_r = hz.phi(epr.hazard_field(S_rev, self.R[i], self.theta[i], inplace),
                                    self.beta[i], lam0, dt, inplace=inplace)
-                    e = epr_from_joint(J, phi_f, phi_r)
-                    p_cur[i] = update_age_distribution(p_cur[i], phi_f)
+                    e = epr.epr_from_joint(J, phi_f, phi_r)
+                    p_cur[i] = rdm.update_age_distribution(p_cur[i], phi_f)
 
                 out["sigma"][t, i], out["H_fwd"][t, i], out["H_rev"][t, i] = e
 
@@ -546,18 +590,21 @@ def RDMIsingModel(J: float,
                  tau_int: float,
                  tau_ref: float,
                  K_ref: float,
-                 dt: float = 1.0,
-                 dt0: float | None = None,
+                 *,
+                 dt0: float,
+                 dt: float | None = None,
                  hazard: str = "escape",
+                 t_abs: float | None = None,
                  Qm: list[int] | None = None,
                  eps: float = 0.01,
                  device: str = 'cpu',
                  ) -> RDMNetwork:
-    """ Single-population (M=1) continuous-time network. J is in physical units: unlike
-    RDMIsingModel, do not pass J/dt. """
+    """ Single-population (M=1) continuous-time network. J is in physical units: pass J,
+    never J/dt (see rdm.compute_total_input). """
     return RDMNetwork(M=1, w=torch.tensor([[J]]), N=[1000], E=[E], beta=[beta], theta=[theta],
                      tau_int=[tau_int], tau_ref=[tau_ref], K_ref=[K_ref],
-                     dt=dt, dt0=dt0, hazard=hazard, Qm=Qm, eps=eps, device=device)
+                     dt=dt, dt0=dt0, hazard=hazard, t_abs=t_abs, Qm=Qm, eps=eps,
+                     device=device)
 
 
 def RDMWilsonCowan(E_ratio: float,
@@ -577,9 +624,11 @@ def RDMWilsonCowan(E_ratio: float,
                   tau_ref_I: float,
                   K_ref_E: float,
                   K_ref_I: float,
-                  dt: float = 1.0,
-                  dt0: float | None = None,
+                  *,
+                  dt0: float,
+                  dt: float | None = None,
                   hazard: str = "escape",
+                  t_abs: float | None = None,
                   Qm: list[int] | None = None,
                   eps: float = 0.01,
                   device: str = 'cpu',
@@ -596,4 +645,5 @@ def RDMWilsonCowan(E_ratio: float,
     return RDMNetwork(M=2, w=w, N=[N_E, N_I], E=[E_exc, E_inh], beta=[beta_E, beta_I],
                      theta=[theta_E, theta_I], tau_int=[tau_int_E, tau_int_I],
                      tau_ref=[tau_ref_E, tau_ref_I], K_ref=[K_ref_E, K_ref_I],
-                     dt=dt, dt0=dt0, hazard=hazard, Qm=Qm, eps=eps, device=device)
+                     dt=dt, dt0=dt0, hazard=hazard, t_abs=t_abs, Qm=Qm, eps=eps,
+                     device=device)

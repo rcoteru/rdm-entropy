@@ -1,17 +1,85 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+import hashlib
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 import torch
 
-""" Small analysis utilities, used by the plotting stages of the scripts rather than by the
-model. One function so far; the file exists so that an array utility does not have to live in
-a physics module to be shared between scripts. """
+""" Small utilities for the scripts -- the cache naming and the plotting-stage helpers --
+rather than for the model. The file exists so that an array utility or a path rule does not
+have to live in a physics module to be shared between scripts. """
 
 
 def grab_closest_idxs(vector: torch.Tensor, values: Sequence[float]) -> list[int]:
     """ Indices of the entries of `vector` closest to each of `values`. """
     return [int(torch.argmin((vector - value).abs())) for value in values]
+
+
+def cycle_window(x: torch.Tensor, rel_tol: float = 1e-9) -> tuple[int, int, int]:
+    """ (start, stop, n_cycles) spanning a whole number of periods of `x`.
+
+    For averaging a periodic signal: a window that is not a whole number of periods leaves a
+    phase error of order amplitude/n_periods, which on a burst whose amplitude is several times
+    its mean is larger than most things worth measuring. Delimited by upward crossings of the
+    mean rather than by peaks -- a crossing of a smooth signal is located to within one step,
+    while the peak of a flat-topped burst is not.
+
+    A settled state has no crossings to find and returns the whole window with n_cycles = 0,
+    which is the honest answer: there are no cycles to align to and none are needed. So is a
+    NOISY signal's answer meaningful only when the oscillation is deterministic -- a finite-N
+    trajectory crosses its mean many times per period, and this will happily report those as
+    cycles. Use it on the mean field, and a plain long average on the samples.
+
+    `rel_tol` is the peak-to-peak, relative to the mean, below which the signal counts as
+    settled. """
+    if float(x.max() - x.min()) < rel_tol * float(x.mean().abs()):
+        return 0, len(x), 0
+    y  = x - x.mean()
+    up = ((y[:-1] <= 0) & (y[1:] > 0)).nonzero().flatten()
+    if len(up) < 2:
+        return 0, len(x), 0
+    return int(up[0]), int(up[-1]), len(up) - 1
+
+
+# Cache naming
+# ~~~~~~~~~~~~
+
+def _stable(v):
+    """ A value's identity for hashing, normalized so that equal runs hash equal.
+
+    Numbers collapse to float, because J=4 and J=4.0 are the same model and would otherwise
+    get separate caches. Tensors hash by their contents rather than by their id, which is what
+    makes this work for the swept axes of the grid scripts. Mappings sort by key, so a dict
+    rebuilt in a different order is still the same run. """
+    if torch.is_tensor(v):
+        return ("tensor", tuple(v.flatten().tolist()), tuple(v.shape))
+    if isinstance(v, Mapping):
+        return tuple((k, _stable(v[k])) for k in sorted(v))
+    if isinstance(v, (list, tuple)):
+        return tuple(_stable(x) for x in v)
+    if isinstance(v, bool):          # before int: True == 1, but it does not mean 1
+        return ("bool", v)
+    if isinstance(v, (int, float)):
+        return float(v)
+    return v
+
+
+def cache_path(script: str, key: Mapping, *, tag: str = "",
+               root: str | Path = "cache", suffix: str = ".pt") -> Path:
+    """ Cache file for `script` run at parameters `key`, named so the parameters pick the file.
+
+    Changing any parameter changes the hash, so a run never finds a cache another parameter
+    set wrote and there is no `overwrite` flag to remember -- the old file simply stays where
+    it is, which also means switching between parameter sets costs nothing after the first
+    run of each. `tag` is a readable prefix (a regime name, say) so the directory can still be
+    read by eye.
+
+    What this does NOT catch is a change to the code: the same parameters through a fixed
+    model still hash the same. That is the one case still worth an explicit re-run. """
+    h = hashlib.sha1(repr(_stable(key)).encode()).hexdigest()[:8]
+    name = "_".join(p for p in (script, tag, h) if p)
+    return Path(root) / f"{name}{suffix}"
 
 
 # Text width of the SciPost class (`article`, 11pt, a4paper, 30 mm side margins), in inches:
@@ -103,3 +171,164 @@ def pub_style(font: str = "charter", base: float = SCIPOST_FONTSIZE - 2,
         "savefig.bbox":         "tight",
         "savefig.pad_inches":   0.02,
     })
+
+
+# Age-grid sizing
+# ~~~~~~~~~~~~~~~
+
+def fit_age_grid(build, *, tol: float = 1e-2, equi: int = 20000,
+                 max_doublings: int = 6, verbose: bool = True) -> list[int]:
+    """ The smallest age grid that keeps `truncation_error()` below `tol`.
+
+    There is nothing fitted about the criterion -- `truncation_error` is a rigorous relative
+    bound on the firing-rate error (see RDMNetworkBatch.truncation_error), so `tol = 1e-2`
+    means "the rate is right to 1%". What this routine does is solve `err(Q) < tol` for Q,
+    which has to be done numerically because `err` depends on the attractor and the attractor
+    depends on Q.
+
+    `build(qm)` takes a `Qm` argument -- `None` for the model's own `q_from_tau` default, or a
+    list of ints -- and returns a model. The default is the right first guess and the wrong
+    answer whenever the firing interval is comparable to `Q*dt`, where mass reaches the
+    absorbing last bin and the run converges on a different attractor.
+
+    The search doubles until the bound is met, then takes one log-linear interpolation step
+    back: `err` falls geometrically in Q (mass beyond U_max and the kernel tails both decay
+    exponentially), so two bracketing measurements predict the crossing well. The interpolated
+    Q is verified before being returned and the bracketing Q is kept if it fails, so the
+    result always satisfies the tolerance -- the interpolation only trims the overshoot that
+    doubling alone leaves behind, which can be a factor of two in Q and four in memory.
+
+    `equi` must take the pilot to the SAME state the caller will measure -- for a script that
+    equilibrates and then records, that is `EQUI + STEPS`, not `EQUI`. The boundary mass
+    settles on the slowest timescale in the problem and the attractor keeps taking it on after
+    equilibration ends, so a pilot stopped earlier under-reports and the caller's own assertion
+    then fires. That is not a false alarm; it is this argument being set too short.
+
+    Sized on the ATTRACTOR, deliberately. A fixed point holds more mass at old ages than the
+    orbit around it does, so measuring there would ask for a larger grid -- but that mass is
+    not what the dynamics is made of, and the attractor is the object every reported quantity
+    describes. Fixed-point work done at the same parameters inherits this grid.
+
+    Qm is a solver setting, not a model parameter: the physics is fixed by the couplings and
+    the timesteps. So a script should fit it here rather than declaring a number, and should
+    put `tol` in its cache key rather than the resulting Q. """
+    def measure(qm):
+        mf = build(qm)
+        qm = list(mf.Qm)
+        mf.forward(equi, pb=False)
+        err = mf.truncation_error()
+        err = float(err.max()) if torch.is_tensor(err) else float(err)
+        del mf
+        if verbose:
+            print(f"  age grid: Qm={qm} -> truncation_error={err:.2e}"
+                  f"{'  [ok]' if err < tol else '  [too coarse]'}")
+        return qm, err
+
+    qm, err = measure(None)
+    if err < tol:
+        return qm
+
+    for _ in range(max_doublings):
+        lo, lo_err = qm, err
+        qm, err = measure([2 * q for q in qm])
+        if err < tol:
+            break
+    else:
+        raise RuntimeError(f"truncation_error still {err:.2e} at Qm={qm}; raise "
+                           f"max_doublings, or check the model is not diverging")
+
+    # Log-linear interpolation between the bracketing pair, then verify. Aimed at tol/3
+    # rather than tol: the interpolation is only approximate, so targeting the threshold
+    # itself lands on either side of it with even odds and wastes the probe half the time.
+    if lo_err > 0 and err > 0:
+        import math
+        target = tol / 3
+        f = (math.log(lo_err) - math.log(target)) / (math.log(lo_err) - math.log(err))
+        mid = [max(a + 1, int(a + f * (b - a))) for a, b in zip(lo, qm)]
+        if all(a < m < b for a, m, b in zip(lo, mid, qm)):
+            mid_qm, mid_err = measure(mid)
+            if mid_err < tol:
+                return mid_qm
+    return qm
+
+
+# EPR memory
+# ~~~~~~~~~~
+
+# Measured on the sliding path, float64, by sweeping `chunk` at fixed (B, Q) and fitting the
+# peak allocation (scripts in the repo history; the fit is linear to three digits):
+#
+#   peak = (1 + not inplace) * B * Q^2 * s   +   3 * chunk * Q^2 * s
+#
+# The first term is persistent for the whole trajectory: one ring buffer buff_S of (B, Q, Q),
+# plus -- when `inplace` is off -- the (B, Q, Q) gather that init_epr_state's phi_end is a view
+# into, which therefore stays pinned until the run ends. The second is transient, the chain of
+# joint-sized temporaries inside init_epr_state, and is the one `chunk` caps.
+#
+# Q is SQUARED here and B is not: an age grid that comes back twice as long is four times the
+# memory, which is why fit_age_grid's result has to be fed to this and not just to the model.
+EPR_PERSISTENT = 1.0   # ring buffer, per batch element
+EPR_PINNED     = 1.0   # the gather phi_end views, per batch element, out-of-place only
+EPR_TRANSIENT  = 3.0   # init_epr_state's temporaries, per chunk element
+
+
+def epr_peak_bytes(B: int, Q: int, chunk: int | None = None, *,
+                   inplace: bool = True, itemsize: int = 8) -> int:
+    """ Peak memory of `entropy_trajectory` for a batch of B on an age grid of Q bins.
+
+    The estimate the scripts size their tiles with. Sizing on the ring buffer alone -- the
+    obvious thing, since it is the only allocation named in the signature -- under-counts by
+    between 2x and 5x, which is the usual way one of these scans dies. """
+    cs = B if chunk is None else min(chunk, B)
+    per_b = EPR_PERSISTENT + (0.0 if inplace else EPR_PINNED)
+    return int((per_b * B + EPR_TRANSIENT * cs) * Q * Q * itemsize)
+
+
+def device_budget(device: str | torch.device, fraction: float = 0.8) -> int:
+    """ Bytes a run may use on `device`: a fraction of what is actually free right now.
+
+    Read rather than declared, so the same script runs on a different card without a constant
+    to edit, and so a budget set while something else holds half the card does not OOM. """
+    if torch.device(device).type == "cuda":
+        free, _ = torch.cuda.mem_get_info(device)
+        return int(fraction * free)
+    with open("/proc/meminfo") as f:                      # MemAvailable, in kB
+        avail = next(int(l.split()[1]) for l in f if l.startswith("MemAvailable"))
+    return int(fraction * avail * 1024)
+
+
+def epr_plan(B: int, Q: int, *, device: str | torch.device, budget: int | None = None,
+             inplace: bool = True, itemsize: int = 8, verbose: bool = True
+             ) -> tuple[int, int]:
+    """ The (tile size, chunk) that keep an EPR run of B systems inside the memory budget.
+
+    Returns a batch size to split the scan into and a `chunk` to pass to entropy_trajectory;
+    `budget` defaults to most of what is free on the device. The split gives three quarters of
+    the budget to the tile and a quarter to the chunk: the tile is what costs wall time (each
+    one re-pays the equilibration), while the chunk only paces init_epr_state, which runs once
+    per tile. A tile of 1 is possible and means the grid is too fine for this card at this Q --
+    the fix then is a shorter age grid (a looser `tol`) or a coarser scan, not a smaller tile.
+
+    On the sliding path -- the default, and what every scan here uses -- `chunk` costs nothing
+    but the init's speed, so there is no reason for a script to set it by hand. """
+    budget = device_budget(device) if budget is None else budget
+    unit   = Q * Q * itemsize
+    # The split below saturates whatever it is given exactly, so it is given nine tenths: the
+    # formula counts the (Q, Q)-shaped objects and nothing else, and the model's own O(B * Q)
+    # state puts the true peak 1-3% above it. Measured, not guessed -- see the test.
+    cap    = 0.9 * budget / unit               # batch-elements' worth of (Q, Q) planes
+    per_b  = EPR_PERSISTENT + (0.0 if inplace else EPR_PINNED)
+
+    B_tile = max(1, min(B, int(0.75 * cap / per_b)))
+    chunk  = max(1, min(B_tile, int(0.25 * cap / EPR_TRANSIENT)))
+    while B_tile > 1 and epr_peak_bytes(B_tile, Q, chunk, inplace=inplace,
+                                        itemsize=itemsize) > budget:
+        B_tile = max(1, B_tile // 2)           # only reachable through the rounding above
+        chunk  = min(chunk, B_tile)
+
+    if verbose:
+        peak = epr_peak_bytes(B_tile, Q, chunk, inplace=inplace, itemsize=itemsize)
+        n = -(-B // B_tile)
+        print(f"  epr plan: Q={Q}, {n} tile(s) of <= {B_tile} of {B}, chunk={chunk} -> peak "
+              f"{peak / 2**30:.2f} GiB against a {budget / 2**30:.2f} GiB budget")
+    return B_tile, chunk

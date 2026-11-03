@@ -2,7 +2,7 @@ import torch
 import tqdm
 
 import rdme.kernels as krn
-from rdme.hazards import HAZARDS
+from rdme.hazards import HAZARDS, resolve_timesteps
 
 # Auxiliary functions
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -55,14 +55,14 @@ class SpinModel:
     def __init__(self, s: torch.Tensor, n: torch.Tensor, S: torch.Tensor, R: torch.Tensor,
              w: torch.Tensor, E: torch.Tensor, beta: torch.Tensor, theta: torch.Tensor,
              tau_int: torch.Tensor, K_ref: torch.Tensor, tau_ref: torch.Tensor, 
-             Nm: torch.Tensor, n_obs: int = 3, dt: float = 1.0,
-             dt0: float | None = None, hazard: str = "escape"):
+             Nm: torch.Tensor, n_obs: int = 3, *,
+             dt0: float, dt: float | None = None, hazard: str = "escape",
+             t_abs: float | None = None):
 
-        """ dt is the simulation step and dt0 the model's time quantum, exactly as in
-        RDMNetwork: the hazard is calibrated by lam0 = 1/dt0, which does NOT move when dt is
-        refined. dt0 defaults to dt, i.e. to lam0*dt = 1, where all three hazards collapse onto
-        the sigmoid this class used to hardcode -- so the default reproduces the old dynamics
-        and only an explicit dt0 selects a different member of the family.
+        """ dt0 is the model and dt the solver, exactly as in RDMNetwork; the convention and
+        its checks live in hazards.resolve_timesteps. dt0 is required and keyword-only, dt
+        defaults to it, and at that default lam0*dt = 1 puts both hazards on the sigmoid
+        this class used to hardcode.
 
         w is in PHYSICAL units and is NOT pre-divided by dt, matching RDMNetwork: the input
         is built from the rate m/dt, so the scaling lives in total_input rather than at the
@@ -84,18 +84,10 @@ class SpinModel:
         assert K_ref.shape == (M,), f"K_ref must have shape ({M},)."
         assert Nm.sum().item() == N, f"Sum of Nm must equal N={N}, got {Nm.sum().item()}"
         
-        if hazard not in HAZARDS:
-            raise ValueError(f"hazard must be one of {sorted(HAZARDS)}, got {hazard!r}")
+        self.dt0, dt, self.lam0 = resolve_timesteps(dt0, dt, hazard)
 
         self.N, self.M, self.dt = N, M, dt
         self.hazard = hazard
-        self.dt0 = dt if dt0 is None else dt0
-        self.lam0 = 1.0 / self.dt0
-        if HAZARDS[hazard].bounded_step and self.lam0 * dt > 1.0 + 1e-12:
-            # Phi = lam0*dt*sigma would exceed 1: a firing probability above one
-            raise ValueError(
-                f"hazard {hazard!r} requires lam0*dt <= 1, got lam0*dt = {self.lam0 * dt:.4g} "
-                f"(dt={dt}, dt0={self.dt0}). Refine dt, or raise dt0.")
         self.s, self.n, self.S, self.R = s, n, S, R
         self.w, self.E = w, E
         self.theta, self.beta = theta, beta
@@ -131,12 +123,23 @@ class SpinModel:
         self.theta_net = self.pop_expand.t().float() @ self.theta  # (N, M) @ (M,) -> (N,)
         self.beta_net = self.pop_expand.t().float() @ self.beta    # (N, M) @ (M,) -> (N,)
 
+        # Absolute refractory window. The mean field carries this inside its R(u) kernel; here
+        # R is a per-NEURON state with no age axis, so the window has to be applied through the
+        # age n instead. The two must agree, which is what the spin-vs-mean-field tests pin.
+        # t_abs defaults to dt0 for the refinement-consistency reason in kernels.refractory_kernel.
+        self.t_abs = self.dt0 if t_abs is None else t_abs
+        self.n_abs = krn.n_abs_bins(self.t_abs, self.dt)
+        R_abs = (krn.abs_refractory_floor(self.w, self.E, self.theta, self.beta,
+                                          r_max=1.0 / self.t_abs)
+                 if self.t_abs > 0 else torch.zeros_like(self.theta))
+        self.R_abs_net = self.pop_expand.t().float() @ R_abs.float()   # (N,)
+
     @classmethod
     def random_start(cls, Nm: torch.Tensor, w: torch.Tensor, E: torch.Tensor, 
                     beta: torch.Tensor, theta: torch.Tensor, 
                     tau_int: torch.Tensor, tau_ref: torch.Tensor, K_ref: torch.Tensor, 
-                    n_obs: int = 1, dt: float = 1.0, dt0: float | None = None,
-                    hazard: str = "escape") -> SpinModel:
+                    n_obs: int = 1, *, dt0: float, dt: float | None = None,
+                    hazard: str = "escape", t_abs: float | None = None) -> SpinModel:
         device = w.device
         N = int(Nm.sum().item())
         #TODO: start this more reasonably, e.g. by sampling from the fixed point distribution for the given parameters
@@ -146,14 +149,14 @@ class SpinModel:
         S = torch.zeros((N,), device=device, dtype=torch.float32)
         R = torch.zeros((N,), device=device, dtype=torch.float32)
         return cls(s, n, S, R, w, E, beta, theta, tau_int, K_ref, tau_ref, 
-                Nm, n_obs=n_obs, dt=dt, dt0=dt0, hazard=hazard)
+                Nm, n_obs=n_obs, dt=dt, dt0=dt0, hazard=hazard, t_abs=t_abs)
 
     @classmethod
     def silent_start(cls, Nm: torch.Tensor, w: torch.Tensor, E: torch.Tensor, 
                     beta: torch.Tensor, theta: torch.Tensor, 
                     tau_int: torch.Tensor, tau_ref: torch.Tensor, K_ref: torch.Tensor, 
-                    n_obs: int = 1, dt: float = 1.0, dt0: float | None = None,
-                    hazard: str = "escape") -> SpinModel:
+                    n_obs: int = 1, *, dt0: float, dt: float | None = None,
+                    hazard: str = "escape", t_abs: float | None = None) -> SpinModel:
         device = w.device
         N = int(Nm.sum().item())
         s = torch.zeros((N,), device=device)
@@ -161,7 +164,7 @@ class SpinModel:
         S = torch.zeros((N,), device=device, dtype=torch.float32)
         R = torch.zeros((N,), device=device, dtype=torch.float32)
         return cls(s, n, S, R, w, E, beta, theta, tau_int, K_ref, tau_ref, 
-                Nm, n_obs=n_obs, dt=dt, dt0=dt0, hazard=hazard)
+                Nm, n_obs=n_obs, dt=dt, dt0=dt0, hazard=hazard, t_abs=t_abs)
     
     
     # Observables and derived quantities
@@ -215,14 +218,26 @@ class SpinModel:
         pop_I = self.w @ self.rates() + self.E
         return self.pop_to_network(pop_I)
 
+    def R_eff(self, R: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+        """ The refractory term the hazard actually sees: the exponential state R, floored at
+        -R_abs for neurons younger than n_abs bins.
+
+        Takes R and n as ARGUMENTS rather than reading self, because the entropy production
+        needs exactly this transformation applied to the reverse trajectory's own (R, n) --
+        which are reconstructed by backward recursion and are not the live state. Routing both
+        directions through one function is what keeps them from drifting apart. """
+        if self.n_abs == 0:
+            return R
+        return torch.where(n < self.n_abs, -self.R_abs_net.to(R.dtype), R)
+
     @torch.inference_mode()
     def field(self) -> torch.Tensor:
-        return self.S + self.R
+        return self.S + self.R_eff(self.R, self.n)
 
     @torch.inference_mode()
     def firing_prob(self) -> torch.Tensor:
         """ Per-step firing probability P(s_i(t+1)=1) = Phi(beta*(H_i(t)+X_i(t)-theta)), with
-        Phi the chosen hazard. At the default dt0 = dt this is the sigmoid for all three. """
+        Phi the chosen hazard. At the default dt = dt0 this is the sigmoid for both. """
         return self._phi(self.field() - self.theta_net)
 
     @torch.inference_mode()
@@ -274,6 +289,17 @@ class SpinModel:
 
         # sample new spikes based on probabilities
         fired = torch.rand(self.N, device=self.device) < probs
+        if self.n_abs:
+            # The absolute window must be enforced on the DRAW, not only through the field.
+            # R_abs is finite on purpose (-inf gives 0*-inf = nan in the log-probability
+            # branches), so a blocked neuron has Phi ~ 1e-34 rather than 0 -- and
+            # torch.rand returns exactly 0.0 with probability ~2^-24 in float32, for which
+            # `0.0 < Phi` is True at ANY positive Phi. That leaks one spike per ~6e-8
+            # neuron-steps through a window that is supposed to be absolute, and no increase
+            # in R_abs removes it. Measured before this mask: 1 escape in 6e7 draws, at an
+            # age of 1 bin against n_abs = 4. The mean field has no counterpart, being
+            # deterministic -- 1e-34 of age mass is simply negligible there.
+            fired &= self.n >= self.n_abs
         
         # update state tensor by rolling it down and inserting new spikes at the top
         self.s = torch.roll(self.s, shifts=1, dims=0) 
@@ -400,6 +426,7 @@ class SpinModel:
         s_trj = torch.zeros((L, self.N), device=dev, dtype=torch.int8)
         S_fwd = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
         R_fwd = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
+        n_fwd = torch.zeros((L, self.N), device=dev, dtype=torch.long)
         I = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
         if kur: kur_buf = torch.zeros(L, device=dev)
         if ent: ent_buf = torch.zeros(L, device=dev)
@@ -409,6 +436,7 @@ class SpinModel:
             s_trj[t] = self.s
             S_fwd[t] = self.S
             R_fwd[t] = self.R
+            n_fwd[t] = self.n
             I[t] = self.total_input()
             if fdist: P_fwd[t] = self.fdist(Q)
             self.update()
@@ -418,6 +446,11 @@ class SpinModel:
 
         S_rev = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
         R_rev = torch.zeros((L, self.N), device=dev, dtype=torch.float32)
+        # the reverse trajectory's AGE, by the same backward recursion as R_rev: in reversed
+        # time a neuron's last spike is its next spike forward, so the age resets on the same
+        # mask and increments the other way. Needed only for the absolute refractory window,
+        # which is a function of age rather than of R.
+        n_rev = torch.zeros((L, self.N), device=dev, dtype=torch.long)
 
         for t in tqdm.tqdm(range(L - 2, -1, -1), desc="Reverse pass"):
             fired_t = s_trj[t] == 1
@@ -425,9 +458,11 @@ class SpinModel:
             S_rev[t, fired_t] = 0
             R_rev[t] = (1 - self.a_ref_net) * R_rev[t + 1]
             R_rev[t, fired_t] = -self.K_ref_net[fired_t]
+            n_rev[t] = n_rev[t + 1] + 1
+            n_rev[t, fired_t] = 0
 
-        hf = self.beta_net * (S_fwd + R_fwd - self.theta_net)
-        hr = self.beta_net * (S_rev + R_rev - self.theta_net)
+        hf = self.beta_net * (S_fwd + self.R_eff(R_fwd, n_fwd) - self.theta_net)
+        hr = self.beta_net * (S_rev + self.R_eff(R_rev, n_rev) - self.theta_net)
 
         # both halves of the bond (t, t+1): forward emits s[t+1] from hf[t], reverse
         # emits s[t] from hr[t+1]
@@ -521,6 +556,7 @@ class SpinModel:
         s_win = torch.zeros((W, N), device=dev, dtype=torch.int8)
         S_win = torch.zeros((W, N), device=dev, dtype=store_dtype)
         R_win = torch.zeros((W, N), device=dev, dtype=store_dtype)
+        n_win = torch.zeros((W, N), device=dev, dtype=torch.long)
         I_win = torch.zeros((W, N), device=dev, dtype=store_dtype)
         if fdist: fd_win  = torch.zeros((W, Q), device=dev, dtype=store_dtype)
 
@@ -551,11 +587,13 @@ class SpinModel:
             s_win[j] = self.s
             S_win[j].copy_(self.S)
             R_win[j].copy_(self.R)
+            n_win[j].copy_(self.n)
             I_win[j].copy_(self.total_input())
             if fdist: fd_win[j].copy_(self.fdist(Q))
 
         h_rev = torch.zeros(N, device=dev, dtype=store_dtype)
         x_rev = torch.zeros(N, device=dev, dtype=store_dtype)
+        a_rev = torch.zeros(N, device=dev, dtype=torch.long)   # reverse age, for the window
 
         emitted, first = 0, True
         pbar = tqdm.tqdm(total=T, desc="EPR")
@@ -566,7 +604,7 @@ class SpinModel:
                     record(j); advance()
                 first = False
             else:
-                for buf in (s_win, S_win, R_win, I_win):
+                for buf in (s_win, S_win, R_win, n_win, I_win):
                     buf[:overlap].copy_(buf[chunk:])
                 if fdist: fd_win[:overlap].copy_(fd_win[chunk:])
                 for j in range(overlap, W):
@@ -580,21 +618,24 @@ class SpinModel:
                     print(f"[warn] {silent}/{N} neurons never fired in the "
                           f"{overlap}-step tail; increase overlap.")
 
-            h_rev.zero_(); x_rev.zero_()
+            h_rev.zero_(); x_rev.zero_(); a_rev.zero_()
             for t in range(W - 2, 0, -1):
                 fired = s_win[t].bool()
                 h_rev.mul_(1.0 - self.a_int_net).addcmul_(I_win[t + 1], self.a_int_net)
                 h_rev.masked_fill_(fired, 0.0)
                 x_rev.mul_(1.0 - self.a_ref_net)
                 x_rev[fired] = -self.K_ref_net[fired]
+                a_rev.add_(1)
+                a_rev.masked_fill_(fired, 0)
 
                 # h_rev/x_rev now hold the reverse field at window index t, which is
                 # the one that emits s[t-1] -- so it pairs with the bond (t-1, t)
                 k = t - 1
                 if k < n_emit:
                     i  = emitted + k
-                    hf = self.beta_net * (S_win[k] + R_win[k] - self.theta_net)
-                    hr = self.beta_net * (h_rev + x_rev - self.theta_net)
+                    hf = self.beta_net * (S_win[k] + self.R_eff(R_win[k], n_win[k])
+                                          - self.theta_net)
+                    hr = self.beta_net * (h_rev + self.R_eff(x_rev, a_rev) - self.theta_net)
                     sn = s_win[k + 1].to(store_dtype)   # s[t+1], forward emission
                     sc = s_win[k].to(store_dtype)       # s[t],   reverse emission
 
@@ -633,10 +674,12 @@ class SpinModel:
 
 def SpinIsingModel(N: int, J: float, E: float, beta: float, theta: float,
                tau_int: float, tau_ref: float, K_ref: float,
-               dt: float = 1.0, dt0: float | None = None, hazard: str = "escape",
+               *, dt0: float, dt: float | None = None, hazard: str = "escape",
+               t_abs: float | None = None,
                device: str = "cpu", ic: str = "random") -> SpinModel:
     
-    """ Construct an Ising SpinModel. J is in physical units -- do not pass J/dt. """
+    """ Construct an Ising SpinModel. J is in physical units: pass J, never J/dt -- the
+    same convention as the mean field, stated in rdm.compute_total_input. """
 
     M = 1
     Nm = torch.tensor([N], device=device)
@@ -651,11 +694,11 @@ def SpinIsingModel(N: int, J: float, E: float, beta: float, theta: float,
     if ic == "random":
         return SpinModel.random_start(Nm=Nm, w=w, E=E_vec, beta=beta_vec, theta=theta_vec,
                                       tau_int=tau_int_vec, tau_ref=tau_ref_vec, K_ref=K_ref_vec,
-                                      n_obs=1, dt=dt, dt0=dt0, hazard=hazard)
+                                      n_obs=1, dt=dt, dt0=dt0, hazard=hazard, t_abs=t_abs)
     elif ic == "silent":
         return SpinModel.silent_start(Nm=Nm, w=w, E=E_vec, beta=beta_vec, theta=theta_vec,
                                   tau_int=tau_int_vec, tau_ref=tau_ref_vec, K_ref=K_ref_vec,
-                                  n_obs=1, dt=dt, dt0=dt0, hazard=hazard)
+                                  n_obs=1, dt=dt, dt0=dt0, hazard=hazard, t_abs=t_abs)
     else:
         raise ValueError(f"Unknown initial condition '{ic}'")
 
@@ -679,12 +722,13 @@ def SpinWilsonCowan(
         tau_ref_I: float,
  
         K_ref1: float, K_ref2: float,
-        dt: float = 1.0, dt0: float | None = None, hazard: str = "escape",
+        *, dt0: float, dt: float | None = None, hazard: str = "escape",
+        t_abs: float | None = None,
         n_obs: int = 1, device: str = "cpu", ic: str = "random"
         ) -> SpinModel:
     
-    """ Construct a Wilson-Cowan SpinModel. Weights are in physical units: pass w_EE, not
-    w_EE/dt. """
+    """ Construct a Wilson-Cowan SpinModel. Weights are in physical units: pass w_EE, never
+    w_EE/dt -- the same convention as the mean field, in rdm.compute_total_input. """
 
     M = 2
     # split on E_ratio directly, as RDMWilsonCowan does: going through (1 - E_ratio)
@@ -708,7 +752,7 @@ def SpinWilsonCowan(
                                       tau_int=tau_int_vec,
                                       tau_ref=tau_ref_vec,
                                       K_ref=K_ref_vec,
-                                      n_obs=n_obs, dt=dt, dt0=dt0, hazard=hazard)
+                                      n_obs=n_obs, dt=dt, dt0=dt0, hazard=hazard, t_abs=t_abs)
     elif ic == "silent":
         return SpinModel.silent_start(Nm=Nm, w=w, E=E_vec,
                                       beta=beta_vec,
@@ -716,6 +760,6 @@ def SpinWilsonCowan(
                                       tau_int=tau_int_vec,
                                       tau_ref=tau_ref_vec,
                                       K_ref=K_ref_vec,
-                                      n_obs=n_obs, dt=dt, dt0=dt0, hazard=hazard)
+                                      n_obs=n_obs, dt=dt, dt0=dt0, hazard=hazard, t_abs=t_abs)
     else:
         raise ValueError(f"Unknown initial condition '{ic}'")

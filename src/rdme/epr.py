@@ -5,7 +5,7 @@ from typing import NamedTuple
 import torch
 
 from rdme.hazards import Hazard
-from rdme.dynamics import update_age_distribution, hazard_clamp
+import rdme.rdm as rdm
 
 """ Entropy production, two ways.
 
@@ -14,13 +14,15 @@ EPR off it, at O(Q^2) per step. The sliding path reaches the same four marginals
 at O(Q). Both call epr_from_parts, so they share one formula and can only disagree through
 those four quantities -- which is what the cross-check in the tests isolates.
 
-The EPR is a functional of the hazard alone, so one implementation serves all three kernels;
+The EPR is a functional of the hazard alone, so one implementation serves both kernels;
 that is why it is written as the plain Bernoulli entropy in Phi rather than in the
-softplus/logit form of rdme.mean_field, which is an identity of the logistic kernel only.
+softplus/logit form of the pre-port implementation, which is an identity of the logistic
+kernel only.
 
 Everything here indexes on trailing axes, so one implementation also serves one system and a
 whole batch: shapes are written (..., Q) and (..., K), with the leading axes carrying the batch
-or nothing at all. rdme.mean_field has to vmap its joint build for the batched case; the gather
+or nothing at all. The pre-port implementation had to vmap its joint build for the batched
+case; the gather
 here consumes exactly the last two axes, so the ellipsis handles it and no vmap is needed. """
 
 
@@ -80,7 +82,7 @@ def anchor_reverse_synaptic_term(
 # Entropy production
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #
-# Every function below takes the `inplace` flag of rdme.dynamics and rdme.hazards, with the
+# Every function below takes the `inplace` flag of rdme.rdm and rdme.hazards, with the
 # same contract: the out-of-place branch is the definition and the oracle, the in-place one is
 # the same arithmetic in the same order with the temporaries folded away, so the two agree bit
 # for bit. Nothing a caller owns is touched -- p, buff_S, buff_I and R are read-only on both
@@ -99,7 +101,7 @@ def _log1m(phi: torch.Tensor, inplace: bool) -> torch.Tensor:
     """ log1p(-Phi) with the clamp every survival product needs, in one buffer instead of
     three. phi itself is never written to -- clamp() already copies, and the rest rides on that
     copy -- so this is safe on a hazard the caller still needs, which is every caller here. """
-    c = hazard_clamp(phi.dtype)
+    c = rdm.hazard_clamp(phi.dtype)
     return phi.clamp(max=c).neg_().log1p_() if inplace else torch.log1p(-phi.clamp(max=c))
 
 
@@ -191,8 +193,8 @@ def epr_from_parts(p_fwd: torch.Tensor,    # (..., Q) row sums of the joint == p
     from 0 and 1 before the logs -- where Phi is 0 the weight is 0 too, and 0 * -inf is a NaN
     rather than the 0 it should be. """
     lo = lambda phi: torch.log(phi.clamp(min=torch.finfo(phi.dtype).tiny,
-                                         max=hazard_clamp(phi.dtype)))
-    l1 = lambda phi: torch.log1p(-phi.clamp(max=hazard_clamp(phi.dtype)))
+                                         max=rdm.hazard_clamp(phi.dtype)))
+    l1 = lambda phi: torch.log1p(-phi.clamp(max=rdm.hazard_clamp(phi.dtype)))
 
     sm = lambda x: x.sum(dim=-1)
     H_fwd = -(sm(spike_f * lo(phi_fwd)) + sm((p_fwd - spike_f) * l1(phi_fwd)))
@@ -213,7 +215,8 @@ def epr_from_joint(p_joint: torch.Tensor,   # (Q, K)
 # Sliding-state EPR: the same quantity in O(Q) per step instead of O(Q^2)
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #
-# Port of the recursions in rdme.mean_field, with the hazard as a parameter. epr_from_parts
+# Port of the recursions in the pre-port implementation, with the hazard as a parameter.
+# epr_from_parts
 # needs only four marginals of the joint, and each slides exactly from one timestep to the
 # next, so the (Q, K) joint is built once and never again. Writing Phi[tau, n] for the hazard
 # at absolute time tau and age n (buffer row tau, clamped age), L = log1p(-Phi), and J_t for
@@ -343,7 +346,7 @@ def step_epr(p, state, buff_S, buff_I, idx, head, R, alpha, beta, theta, hazard,
     epr = epr_from_parts(p, state.G, col0, row0, phi_t, phi(fld(S_rev, R)))
     del col0, row0, S_rev
 
-    p_next = update_age_distribution(p, phi_t)
+    p_next = rdm.update_age_distribution(p, phi_t)
 
     # -- slide logV: drop time t off the front of the window, add t+K-2 at the back. Index Q-1
     # takes the lumped-bin value rather than the shifted one; the two agree analytically (both
