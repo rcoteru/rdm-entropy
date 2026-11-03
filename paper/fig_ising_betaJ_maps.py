@@ -1,4 +1,4 @@
-""" (J, E) phase maps of activity, entropy production and the two path entropies for the
+""" (beta, J) phase maps of activity, entropy production and the two path entropies for the
 single-population Ising network -- figure of the SciPost paper.
 
 Self-contained by design: every parameter of the run is in this file and the cache lives in
@@ -8,7 +8,7 @@ a cache some other script wrote. Only the `rdme` package is shared.
 
 The cache holds the *reduced* statistics rather than the trajectories themselves.
 
-    python papers/scipost/fig_ising_IJ_maps.py
+    python papers/scipost/fig_ising_betaJ_maps.py
 """
 
 from pathlib import Path
@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import torch
 
 import rdme.helpers as hlp
-from rdme.batch import RDMIsingModelBatch
+from rdme.rdm_batch import RDMIsingModelBatch
 
 
 # ── Paths & switches ──────────────────────────────────────────────────────────
@@ -26,7 +26,7 @@ from rdme.batch import RDMIsingModelBatch
 HERE      = Path(__file__).parent
 CACHE_DIR = HERE / "cache"
 FIG_DIR   = HERE / "figures"
-STATS_FILE = CACHE_DIR / "ising_IJ_maps_stats.pt"
+STATS_FILE = CACHE_DIR / "ising_betaJ_maps_stats.pt"
 
 run_sim   = True
 run_plot  = True
@@ -37,9 +37,9 @@ torch.set_default_dtype(torch.float64)
 # ── Parameters ────────────────────────────────────────────────────────────────
 
 PARAMS = dict(
-    J       = torch.linspace(0, 17.0, 101),
-    E       = torch.linspace(0.6, 1.4, 101),
-    beta    = 30.0,
+    J       = torch.linspace(0, 18.0, 101),
+    E       = 0.9,
+    beta    = torch.linspace(1.0, 60.0, 101),
     theta   = 1.0,
     tau_int = 20.0,
     tau_ref = 3.0,
@@ -58,13 +58,17 @@ if run_sim and (overwrite or not STATS_FILE.exists()):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # J and E are passed as vectors, so the batch is their outer product and the trajectory
-    # comes back shaped (n_J, n_E, T) -- no meshgrid/reshape bookkeeping.
-    # NOTE: dt is NOT passed here, so the model runs at a step of 1.0 while J carries a
-    # 1/dt and dt = 0.2 is used for the axis labels below -- the kernels are therefore in
-    # units of steps, not ms. That predates this port and is preserved exactly: J/dt with
-    # dt defaulting to 1.0 reproduces the previous numbers bit for bit. Passing J and
-    # dt=dt instead would be the consistent version, and would change the results.
+    # J and beta are passed as vectors, so the batch is their outer product and the trajectory
+    # comes back shaped (n_J, n_beta, T) -- no meshgrid/reshape bookkeeping.
+    # NOTE (superseded): this used to run at a step of 1.0 with J carrying a 1/dt, because
+    # dt was not passed and defaulted to 1.0. PARAMS now sets dt and dt0 explicitly, dt0 is
+    # a required argument, and the input is built from the rate -- so J is passed through
+    # unscaled, used unscaled, and plotted unscaled (see rdm.compute_total_input).
+    #
+    # The numbers therefore already differ from the pre-port ones. What is NOT settled here
+    # is whether the J range below is quoted in physical units or still carries the old
+    # 1/dt: nothing in the code can tell, since both are valid inputs. Check it against the
+    # axis label before the figure is used.
     mf = RDMIsingModelBatch(device=device, **PARAMS)
     print(f"Running {mf.B} mean-fields. Grid axes: "
           f"{ {k: len(v) for k, v in mf.grid_axes.items()} }.")
@@ -82,8 +86,8 @@ if run_sim and (overwrite or not STATS_FILE.exists()):
              for k in ("m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot")
              for s in ("mean", "std")}
     # grid_axes holds the vectors as they were passed in
-    stats["J"] = mf.grid_axes["J"]
-    stats["E"] = mf.grid_axes["E"]
+    stats["J"]    = mf.grid_axes["J"]
+    stats["beta"] = mf.grid_axes["beta"]
     stats["params"] = {k: v for k, v in PARAMS.items()}
     stats["steps"] = (EQUI, STEPS)
 
@@ -104,9 +108,9 @@ if run_plot:
 
     hlp.pub_style()
 
-    stats = torch.load(STATS_FILE, weights_only=False)
-    J, E  = stats["J"], stats["E"]
-    extent = (E.min().item(), E.max().item(), J.min().item(), J.max().item())
+    stats   = torch.load(STATS_FILE, weights_only=False)
+    J, beta = stats["J"], stats["beta"]
+    extent  = (beta.min().item(), beta.max().item(), J.min().item(), J.max().item())
 
     m_avg, sigma_avg = stats["m_tot_mean"], stats["sigma_tot_mean"]
     H_fwd_avg, H_rev_avg = stats["H_fwd_tot_mean"], stats["H_rev_tot_mean"]
@@ -145,13 +149,13 @@ if run_plot:
         ax.tick_params(direction="out", top=False, right=False)
 
     for ax in axes[-1, :]:
-        ax.set_xlabel(r"external input $E$")
+        ax.set_xlabel(r"inverse temperature $\beta$")
     for ax in axes[:, 0]:
         ax.set_ylabel(r"coupling $J$")
 
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     for ext in ("pdf", "png"):
-        fig.savefig(FIG_DIR / f"ising_EJ_maps.{ext}")
-    print(f"Figure saved to {FIG_DIR / 'ising_EJ_maps.pdf'}.")
+        fig.savefig(FIG_DIR / f"ising_betaJ_maps.{ext}")
+    print(f"Figure saved to {FIG_DIR / 'ising_betaJ_maps.pdf'}.")
 
     plt.show()

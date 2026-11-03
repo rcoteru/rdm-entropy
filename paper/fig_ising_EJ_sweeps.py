@@ -9,6 +9,8 @@ Two figures, each 2x2 with one column per sweep:
   fig_ising_sweeps_stability   -- (row 1) the leading eigenvalues of the one-step Jacobian
       at each fixed point; (row 2) the activity spectrogram, with the frequencies predicted
       by arg(lambda) of the first and third modes drawn over it.
+  fig_ising_sweeps_spectrum    -- that second row on its own, for use where the eigenvalue
+      panels are not wanted.
 
 Self-contained in the same sense as fig_ising_EJ_maps: all parameters live here, the cache
 is this directory's, and only the `rdme` API is shared. The cache holds reductions -- time
@@ -21,12 +23,13 @@ not the trajectories, which are several hundred MB per sweep.
 from pathlib import Path
 import time
 
+import matplotlib.patheffects as path_effects
 import matplotlib.pyplot as plt
 import numpy
 import torch
 
 import rdme.helpers as hlp
-from rdme.batch import RDMIsingModelBatch
+from rdme.rdm_batch import RDMIsingModelBatch
 
 
 # ── Paths & switches ──────────────────────────────────────────────────────────
@@ -45,12 +48,12 @@ torch.set_default_dtype(torch.float64)
 
 # Shared with fig_ising_EJ_maps; the two cuts differ only in which of (E, J) is the axis.
 BASE = dict(beta=30.0, theta=1.0, tau_int=20.0, tau_ref=3.0, K_ref=0.0,
-            dt=0.5, dt0=0.5, hazard="synchronous", eps=0.01)
+            dt=0.5, dt0=0.5, hazard="async", eps=0.01)
 
 SWEEPS = {
     "E": dict(axis="E", label=r"external drive $E$", fixed="J",
               J=6.0, E=torch.linspace(0.6, 1.8, 300)),
-    "J": dict(axis="J", label=r"recurrent coupling $J$", fixed="E",
+    "J": dict(axis="J", label=r"recurrent coupling $w$", fixed="E",
               J=torch.linspace(0.0, 17.0, 300), E=0.9),
 }
 
@@ -352,5 +355,59 @@ if run_plot:
     label_panels(ax2, ["(a) drive sweep", "(b) coupling sweep",
                        "(c) activity spectrum", "(d) activity spectrum"])
     save(fig2, "ising_sweeps_stability")
+
+
+    # ── Figure 3: activity spectrum alone ─────────────────────────────────────
+
+    # The spectrogram row of figure 2 on its own, for use where the eigenvalue panels are
+    # not needed. omega_k is arg(lambda_k)/2*pi*dt, the frequency of the k-th mode. The two
+    # branches are drawn in cyan and spring green: magma runs from
+    # near-black purple through orange to pale yellow, so neither hue occurs anywhere in
+    # the colour scale, and each marker also carries a dark halo so it stays visible where
+    # it crosses a bright ridge.
+    fig3 = plt.figure(constrained_layout=True,
+                      figsize=(hlp.SCIPOST_TEXTWIDTH, 0.38 * hlp.SCIPOST_TEXTWIDTH))
+    gs3  = fig3.add_gridspec(1, 3, width_ratios=[1, 1, 0.04])
+    ax3  = numpy.empty(2, dtype=object)
+    for c in range(2):
+        ax3[c] = fig3.add_subplot(gs3[0, c], sharey=ax3[0] if c else None)
+        ax3[c].tick_params(direction="out", top=False, right=False, labelleft=(c == 0))
+    cax3 = fig3.add_subplot(gs3[0, 2])
+
+    C_MODE = ["#00E5FF", "#00FF95"]          # cyan, spring green: absent from magma
+    halo   = [path_effects.withStroke(linewidth=1.1, foreground="0.05")]
+
+    for col, key in enumerate(SWEEPS):
+        d  = data[key]
+        dt = d["dt"].item()
+
+        ax = ax3[col]
+        ax.grid(False)
+        db, freqs = pool_spectrum(d["power_db"], d["freqs"], MAX_FREQ / KHZ_TO_HZ)
+        pcm = ax.pcolormesh(d["x"].numpy(), (freqs * KHZ_TO_HZ).numpy(),
+                            (db - db.max()).numpy(),
+                            shading="auto", cmap="magma", rasterized=True, **db_lim)
+        for (mode, mk), c in zip([(0, "o"), (2, "s")], C_MODE):
+            f_mode = d["fp_lead"][:, mode].angle().abs() / (2 * torch.pi) / dt * KHZ_TO_HZ
+            f_mode[d["fp_lead"][:, mode].imag.abs() < 1e-12] = float("nan")
+            ax.scatter(d["fp_x"], f_mode, s=4, marker=mk, color=c, linewidths=0,
+                       path_effects=halo, zorder=3,
+                       label=rf"$\omega_{mode+1}$")
+        ax.set_ylim(0, MAX_FREQ)
+        ax.set_xlabel(SWEEPS[key]["label"])
+        if col == 0:
+            ax.set_ylabel("frequency (Hz)")
+            ax.legend(loc="lower right", ncols=2, handletextpad=0.3, borderpad=0.3,
+                      columnspacing=1.0, markerscale=3, labelcolor="w", facecolor="0.15",
+                      framealpha=0.75, frameon=True)
+        else:
+            cbar = fig3.colorbar(pcm, cax=cax3)
+            cbar.ax.set_title("power (dB)", pad=4)
+            cbar.outline.set_linewidth(0.6)
+            cbar.ax.tick_params(width=0.6, size=2.5)
+
+    for ax, t in zip(ax3, ["(a) drive sweep", "(b) coupling sweep"]):
+        ax.set_title(t, loc="left", pad=4)
+    save(fig3, "ising_sweeps_spectrum")
 
     plt.show()
