@@ -1,3 +1,22 @@
+# ── NOT RUNNABLE (2026-11-07) ─────────────────────────────────────────────────
+#
+# Ported to the route-B API mechanically and nothing more: `dt0` is gone, the dead hazard keys
+# are mapped, and the model builds. It is NOT wired to a preset and has NOT been re-run, because
+# the two-population presets it needs (`EI`, `EE-P`) are still `PENDING` in rdme.presets and
+# their values are a vault decision that has not been made. Running it produces numbers that
+# belong to no named parameter set, so do not.
+#
+# What the port changed, and why it is a change of MODEL and not a rename:
+#   `dt0`         removed. There is no time quantum under route B; `nu0` is the rate unit of
+#                 the Poisson reference and `t_abs` the physical dead time.
+#   "async"    -> "poisson_exact". The route-B kernel with async's per-bin FORM is "bernoulli"
+#                 (nu0*dt*sigma), not this one; the 2026-11-07 brief asks for the solver here
+#                 instead, so the rate function changes from saturating to exponential.
+#   "sync"/"synchronous"
+#              -> "bernoulli", which at nu0*dt = 1 is the sigmoid bit for bit.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+
 import matplotlib.pyplot as plt
 import torch
 import time
@@ -86,7 +105,7 @@ ta
 dt = 0.5
 steps1 = 5000
 steps2 = 5000
-hazard="async"
+hazard="poisson_exact"
 
 # Model initialization
 # ~~~~~~~~~~~~~~~~~~~~
@@ -95,14 +114,14 @@ torch.set_default_dtype(torch.float64)
 sm = SpinWilsonCowan(N, E_ratio, w_EE, w_EI, w_IE, w_II, 
                     E_exc, E_inh, beta_E, beta_I, theta_E, theta_I, 
                     tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I, 
-                    dt=dt, dt0=dt, hazard=hazard, device=device, ic="silent")
+                    dt=dt, hazard=hazard, device=device, ic="silent")
 
 # Both models take the weights in physical units -- no /dt, since both build the input
-# from the rate -- and hazard="async" at dt = dt0 IS the sigmoid of the original model.
+# from the rate. The old call passed dt0=dt (lam0*dt = 1, the sigmoid); route B has no dt0.
 mf = RDMWilsonCowan(E_ratio, w_EE, w_EI, w_IE, w_II, 
                     E_exc, E_inh, beta_E, beta_I, theta_E, theta_I, 
                     tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I,
-                    dt=dt, dt0=dt, hazard=hazard, eps=0.01, device=device)
+                    dt=dt, hazard=hazard, eps=0.01, device=device)
 
 print(mf.Qm)
 
@@ -365,7 +384,7 @@ if True: # Lyapunov spectrum of the mean field
     lmf = RDMWilsonCowan(E_ratio, w_EE, w_EI, w_IE, w_II,
                          E_exc, E_inh, beta_E, beta_I, theta_E, theta_I,
                          tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I,
-                         dt0=dt, hazard="async", eps=0.01, device=device)
+                         dt=dt, hazard="poisson_exact", eps=0.01, device=device)
 
     print(f"\nLyapunov: equilibrating {eq_lyap} steps, then {wu_lyap} warmup + {T_lyap} "
           f"accumulation, k={k_lyap} ...")

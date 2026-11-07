@@ -14,25 +14,16 @@ from rdme.rdm_batch import RDMIsingModelBatch
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 
-# Refraction-driven oscillation at ZERO input in a soft regime (beta = 8). With E = 0 the
-# only thing sustaining any activity is sigma(-beta*theta), the softness of the sigmoid
-# itself -- at large beta the network would simply be silent. So low beta is not merely
-# tolerated here, it is what supplies the drive.
-#
-# The refractory kernel is what makes it oscillate rather than settle. Searched over
-# J <= 320, theta <= 2, tau_int <= 40 at beta = 20, 10, 8, 5, 3: with K_ref = 0 not one of
-# 358 cells has an unstable fixed point (best mu ~ -0.035/ms), and with K_ref = 25 there is
-# an unsaturated oscillatory cell at every beta down to 2.
-#
-# theta crosses one Hopf at ~0.86: oscillatory below, stable above.
 PRESET = "S1"
-HAZARD = "async"        # stated per script: the hazard is its own axis, not part of a preset
+HAZARD = "poisson_exact"   # stated per script: the hazard is its own axis, not part of a
+                           # preset. This is a SCAN, so it wants the solver (exact survival,
+                           # single-signed error, monotone in dt) and not "poisson", which is
+                           # the per-bin model of binned data.
 
 PARAMS: dict = pre.params(
     PRESET, hazard=HAZARD,
-    J       = 15.0,
-    theta   = torch.linspace(0, 1.6, 300),
-    dt      = 1.0,
+    J       = torch.linspace(0.0, 80.0, 200),
+    dt      = 0.5,
 )
 
 # The age grid is FITTED, not declared: the model's q_from_tau default sizes it from the
@@ -41,8 +32,8 @@ PARAMS: dict = pre.params(
 # is what goes in the cache key -- Qm is a solver setting, not a model parameter.
 TOL = 1e-2   # age-grid accuracy; Qm is fitted to it
 
-AXIS  = "theta"                      # the swept parameter: the one PARAMS gives a vector
-LABEL = 'Threshold θ'
+AXIS = "J"                           # the swept parameter: the one PARAMS gives a vector
+LABEL = 'Recurrent coupling  J'
 
 # Equilibration and recording are set in MILLISECONDS; the step counts follow dt (see
 # helpers.n_steps). A step count says nothing about the system -- the same 20000 steps is a
@@ -57,21 +48,13 @@ T_EQUI, T_MEAS = 10000.0, 15000.0
 EQUI  = hlp.n_steps(T_EQUI, PARAMS["dt"], name="T_EQUI")
 STEPS = hlp.n_steps(T_MEAS, PARAMS["dt"], name="T_MEAS")
 
-N_LEAD     = 4      # leading eigenvalues kept per fixed point
-N_THETA_FP = 100    # theta values to analyse; the cost is dominated by the eigendecomposition
-N_SCAN     = 401    # resolution of the sign scan that brackets the roots
+N_LEAD = 4      # leading eigenvalues kept per fixed point
+N_J_FP = 100    # J values to analyse; the cost is dominated by the eigendecomposition
+N_SCAN = 401    # resolution of the sign scan that brackets the roots
 
-# Two things to know when reading the stability panel of this scan:
-#
-# |lam| sits within ~2% of the unit circle throughout, which is not a weak instability. For
-# a map approximating a flow lam ~ exp(mu dt), so the dt-independent quantity is
-# (|lam| - 1)/dt, and |lam| - 1 roughly halves at each refinement while mu converges. Read
-# the margin that way. At theta = 0.5 on the converged age grid, mu = +0.034 /ms.
-#
-# The fixed point is far from the lam0 = 1/dt0 rate ceiling (3.5% of it at theta = 0.5, and
-# falling with theta), so the Hopf is not a saturation artifact. The LIMIT CYCLE does reach
-# the ceiling at its peak -- it is a relaxation oscillator, CV ~ 7, and the ceiling clips the
-# amplitude without causing the instability.
+# m_tot is cached whole and the rest only in time-average: the bifurcation scatter wants the
+# tail of the activity and the spectrogram wants all of it, so this one series has to survive,
+# while sigma and the path entropies are only ever plotted as means. 72 MiB against 687.
 MEANS = ("sigma_tot", "H_fwd_tot", "H_rev_tot")
 
 
@@ -79,9 +62,9 @@ MEANS = ("sigma_tot", "H_fwd_tot", "H_rev_tot")
 
 CACHE_DIR = Path(__file__).parents[1] / "cache"
 STEM      = Path(__file__).stem
-CACHE_SIM = hlp.cache_path(STEM, dict(PARAMS, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
+CACHE_SIM = hlp.cache_path(STEM, dict(PARAMS, preset=PRESET, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
                            tag="traj", root=CACHE_DIR)
-CACHE_FP  = hlp.cache_path(STEM, dict(PARAMS, n_lead=N_LEAD, n_pts=N_THETA_FP, n_scan=N_SCAN, tol=TOL),
+CACHE_FP  = hlp.cache_path(STEM, dict(PARAMS, preset=PRESET, n_lead=N_LEAD, n_J=N_J_FP, n_scan=N_SCAN, tol=TOL),
                            tag="fp", root=CACHE_DIR)
 
 @functools.cache
@@ -158,7 +141,7 @@ if run_fp and (overwrite or not CACHE_FP.exists()):
     # on CPU: the fixed-point pass is tiny and LAPACK's eig has no GPU equivalent here
     Qm_fp  = age_grid()
     mf_fp  = RDMIsingModelBatch(**PARAMS, Qm=Qm_fp, device="cpu")
-    stride = max(1, mf_fp.B // N_THETA_FP)
+    stride = max(1, mf_fp.B // N_J_FP)
     idx    = torch.arange(0, mf_fp.B, stride)
 
     print(f"Finding fixed points at {len(idx)} of {mf_fp.B} {AXIS} values (Q={mf_fp.Qm[0]})...")

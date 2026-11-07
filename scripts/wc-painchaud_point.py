@@ -24,6 +24,32 @@ Everything else -- the panels, the plotting, the entropy comparison -- is wc-mf_
 unchanged.
 """
 
+# ── NOT RUNNABLE (2026-11-07) ─────────────────────────────────────────────────
+#
+# Ported to the route-B API mechanically and nothing more: `dt0` is gone, the dead hazard keys
+# are mapped, and the model builds. It is NOT wired to a preset and has NOT been re-run, because
+# the two-population presets it needs (`EI`, `EE-P`) are still `PENDING` in rdme.presets and
+# their values are a vault decision that has not been made. Running it produces numbers that
+# belong to no named parameter set, so do not.
+#
+# What the port changed, and why it is a change of MODEL and not a rename:
+#   `dt0`         removed. There is no time quantum under route B; `nu0` is the rate unit of
+#                 the Poisson reference and `t_abs` the physical dead time.
+#   "async"    -> "poisson_exact". The route-B kernel with async's per-bin FORM is "bernoulli"
+#                 (nu0*dt*sigma), not this one; the 2026-11-07 brief asks for the solver here
+#                 instead, so the rate function changes from saturating to exponential.
+#   "sync"/"synchronous"
+#              -> "bernoulli", which at nu0*dt = 1 is the sigmoid bit for bit.
+#
+#   the TIME-UNIT ANCHOR is unresolved. This script fixes its physical time unit by
+#                 T_u = alpha_1 * dt0, i.e. by identifying Painchaud's maximal rate with the
+#                 old lam0 = 1/dt0 RATE CEILING. Route B has no rate ceiling: the hazard is
+#                 exponential and the only cap is 1/t_abs. The arithmetic below is left
+#                 EXACTLY as it was and the old dt0 survives only as DT0_ANCHOR, a number
+#                 feeding T_u; it is no longer passed to any model. Choosing the new anchor
+#                 is a vault decision and is what blocks the EE-P preset.
+# ──────────────────────────────────────────────────────────────────────────────
+
 import math
 
 import matplotlib.pyplot as plt
@@ -68,12 +94,17 @@ tau_int_E, tau_int_I = 1.0, 1.0
 tau_ref_E, tau_ref_I = 4.053, 3.602
 K_ref_E, K_ref_I = 30.0, 30.0
 
-# dt is the resolution, dt0 the model's time quantum: lam0 = 1/dt0 = 2/ms. They are NOT the
-# same knob -- see latex/app_timescales.tex. lam0*dt = 0.2 here, well away from the saturated
-# 2-cycle that dt = dt0 produces.
+# dt is the solver step. DT0_ANCHOR is the old time quantum, kept ONLY as the number that
+# fixes this port's physical time unit through T_u = alpha_1 * dt0 (see wc-painchaud.py): the
+# anchor identified Painchaud's maximal rate with the route-A ceiling lam0 = 1/dt0 = 2/ms,
+# which route B does not have. UNRESOLVED -- a vault decision, not something to invent here.
+# It is no longer passed to any model.
 dt  = 0.1
-dt0 = 0.5
-hazard = "async"
+DT0_ANCHOR = 0.5
+# nu0 is the rate unit of the Poisson reference and is NOT 1/DT0_ANCHOR; it is the repo's
+# 1 /ms. Stated so that the two numbers are not confused back together.
+nu0 = 1.0
+hazard = "poisson_exact"
 
 # Absolute refractory period, as a hard floor on the first round(T_ABS/dt) age bins. Without
 # it the exponential kernel is overwhelmed at this coupling and the population runs at >1 kHz.
@@ -111,15 +142,15 @@ torch.set_default_dtype(torch.float64)
 sm = SpinWilsonCowan(N, E_ratio, w_EE, w_EI, w_IE, w_II, 
                     E_exc, E_inh, beta_E, beta_I, theta_E, theta_I, 
                     tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I, 
-                    dt=dt, dt0=dt0, hazard=hazard, t_abs=T_ABS,
+                    dt=dt, nu0=nu0, hazard=hazard, t_abs=T_ABS,
                     device=device, ic="silent")
 
 # Both models take the weights in physical units -- no /dt, since both build the input
-# from the rate -- and hazard="synchronous" is the sigmoid of the original model.
+# from the rate. "synchronous" is "bernoulli" at nu0*dt = 1 under route B.
 mf = RDMWilsonCowan(E_ratio, w_EE, w_EI, w_IE, w_II, 
                     E_exc, E_inh, beta_E, beta_I, theta_E, theta_I, 
                     tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I,
-                    dt=dt, dt0=dt0, hazard=hazard, t_abs=T_ABS, Qm=Qm, device=device)
+                    dt=dt, nu0=nu0, hazard=hazard, t_abs=T_ABS, Qm=Qm, device=device)
 
 print(mf.Qm)
 
@@ -379,13 +410,13 @@ if True: # Lyapunov spectrum of the mean field
     wu_lyap  = int(1000 / dt)       # settle the tangent BASIS: a random one is not aligned
     T_lyap   = int(30000 / dt)      # accumulation; windows in ms, so dt can be refined
 
-    # Same model as above -- same hazard, same dt0, same age grid, same window. The original
+    # Same model as above -- same hazard, same nu0, same age grid, same window. The original
     # script built this one with hazard="synchronous" and no dt0, which here would measure a
     # different model from the one the panels show.
     lmf = RDMWilsonCowan(E_ratio, w_EE, w_EI, w_IE, w_II,
                          E_exc, E_inh, beta_E, beta_I, theta_E, theta_I,
                          tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I,
-                         dt=dt, dt0=dt0, hazard=hazard, t_abs=T_ABS, Qm=Qm, device=device)
+                         dt=dt, nu0=nu0, hazard=hazard, t_abs=T_ABS, Qm=Qm, device=device)
 
     print(f"\nLyapunov: equilibrating {eq_lyap} steps, then {wu_lyap} warmup + {T_lyap} "
           f"accumulation, k={k_lyap} ...")
@@ -411,9 +442,9 @@ if True: # Lyapunov spectrum of the mean field
     cv = (m_E.std() / m_E.mean().clamp_min(1e-300))
     moving = torch.tensor(bool(cv > 1e-4))
     tol = max(5e-4, 3 * spec.se[0].item())      # floor, or 3 sigma, whichever binds
-    # dt < dt0, so these exponents describe a FLOW sampled every dt: a limit cycle keeps its
+    # `lmf.is_flow`, so these exponents describe a FLOW sampled every dt: a limit cycle keeps its
     # phase direction and sits at lam_1 ~ 0, which the map table would file as quasiperiodic.
-    cls = lyap.classify_spectrum(spec.lam, tol=tol, moving=moving, continuous=(dt < dt0),
+    cls = lyap.classify_spectrum(spec.lam, tol=tol, moving=moving, continuous=lmf.is_flow,
                                  se=spec.se, n_sigma=3.0)
     print(f"  CV(m_E) = {cv:.3e} -> moving={bool(moving)};  band = +/-{tol:.1e} /ms")
     print(f"  => {lyap.CLASS_NAMES[int(cls)]}")

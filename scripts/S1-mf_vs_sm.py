@@ -7,6 +7,7 @@ import torch
 import rdme.fixed_points as fpts
 import rdme.helpers as hlp
 import rdme.plots as rp
+import rdme.presets as pre
 
 from rdme.rdm_single import RDMIsingModel
 from rdme.spin_model import SpinIsingModel
@@ -14,54 +15,56 @@ from rdme.spin_model import SpinIsingModel
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 
-# A regime is the WHOLE model: every argument both constructors take, so two regimes differ
-# in whatever they differ in and nothing is inherited silently from a shared default. Each one
-# is cached under its own name, so switching back and forth costs nothing after the first run.
-# Annotated `dict` rather than left to inference: the values are floats and a string, so an
-# inferred `dict[str, float | str]` makes the type checker reject every splat below.
+# A regime is a PRESET plus the overrides that make it a system, which is what presets.py
+# asks of every run. Before the route-B port these were four inline dicts with no names; the
+# check, done rather than assumed:
+#
+#   ref_lowbeta          = S1      + tau_int = 20, J = 30
+#   noref_lowbeta        = S1-sat  + tau_int = 15, K_ref = 0, J = 20
+#   ref_lowbeta_strong   = S1-sat  EXACTLY (J = 40 included) -- it is the preset, not a variant
+#   noref_driven_strong  = no preset at all; it is now PRESETS["D2"] (provisional name)
+#
+# The old comment above this block claimed the first two "differ in K_ref and in NOTHING else".
+# They do not: they differ in beta, tau_int, tau_ref, K_ref and J. That claim belonged to an
+# earlier pairing and is removed rather than repaired, because the pair it describes does not
+# exist in this file. A genuine K_ref contrast is S1-sat against S1-sat with K_ref = 0, and
+# nothing here has been re-run to say what that contrast now looks like under route B.
+#
+# Each regime is cached under its own name, so switching back and forth costs nothing after
+# the first run of each.
+HAZARD = "poisson_exact"   # stated per script: the hazard is its own axis, not part of a
+                           # preset. The pre-port dicts carried a MIXTURE -- two "async"
+                           # (route A, = "bernoulli" here) and two "poisson" -- which is the
+                           # one thing CLAUDE.md forbids inside a comparison. One key for all
+                           # four, and it is the solver.
+
 REGIMES: dict[str, dict] = {
-
-    # The low-beta refractory pair, and the point of the comparison: the two differ in K_ref
-    # and in NOTHING else, so whatever separates them is refractoriness. At E = 0 the only
-    # thing sustaining activity is sigma(-beta*theta), the softness of the sigmoid itself.
+    # The refractory arm and its low-K_ref partner. dt = 0.5, not coarser: at dt = 1 the
+    # K_ref = 0 arm does not sit at a fixed point, it flips the whole population on and off on
+    # alternate steps (acf1 = -1.000, the two-step artifact) for every J >= 15. Refining halves
+    # it away. Both arms use the same dt, since a contrast whose arms differ in the solver is
+    # not a contrast. The age grid is NOT set here: it is fitted at run time, and the two arms
+    # genuinely need different ones because the control fires far faster and so needs far less
+    # age depth.
     #
-    # dt = 0.5, not dt = dt0: at dt = dt0 the K_ref = 0 arm does not sit at a fixed point, it
-    # flips the whole population on and off on alternate steps (acf1 = -1.000, the two-step
-    # artifact) for every J >= 15. Refining halves it away and the control becomes a genuine
-    # fixed point. Both arms use the same dt, since a contrast whose arms differ in the solver
-    # is not a contrast. The age grid is NOT set here: it is fitted at run time, and the two
-    # arms genuinely need different ones (462 vs 231 bins) because the control fires 80x
-    # faster and so needs far less age depth.
-    #
-    #   K_ref = 25 : rate 0.0073/ms, CV 3.81, acf1 +0.954, bursts to 0.24/ms
-    #   K_ref =  0 : rate 0.598/ms,  CV 0.000 -- a fixed point, flat to machine precision
-    #
-    # tau_ref is kept identical in both although it is inert at K_ref = 0, so the two dicts
-    # differ in exactly one number.
-    "ref_lowbeta":   dict(J=30, E=0, beta=6, theta=0.5,
-                          tau_int=20, tau_ref=15, K_ref=15,
-                          dt=0.5, hazard="poisson"),
+    # The rates quoted below (K_ref = 25 at 0.0073/ms, CV 3.81; K_ref = 0 at 0.598/ms, CV 0)
+    # were measured under route A and are NOT what this now runs.
+    "ref_lowbeta":        dict(preset="S1",     tau_int=20.0, J=30.0, dt=0.5),
+    "noref_lowbeta":      dict(preset="S1-sat", tau_int=15.0, K_ref=0.0, J=20.0, dt=0.5),
 
-    "noref_lowbeta": dict(J=20, E=0, beta=8, theta=0.5,
-                          tau_int=15, tau_ref=25, K_ref=0,
-                          dt=0.5, hazard="async"),
+    # Same mechanism driven harder: a cleaner limit cycle (CV 5.45 under route A) at the cost
+    # of a coupling further from anything defensible. This one IS S1-sat, with no override.
+    "ref_lowbeta_strong": dict(preset="S1-sat", dt=0.5),
 
-    # Same mechanism driven harder: a cleaner limit cycle (CV 5.45) at the cost of a coupling
-    # further from anything defensible. Its K_ref = 0 control is also a clean fixed point.
-    "ref_lowbeta_strong": dict(J=40., E=0, beta=8, theta=0.5,
-                               tau_int=10, tau_ref=25, K_ref=25,
-                               dt=0.5, hazard="async"),
-
-    "noref_driven_strong": dict(J=6, E=1, beta=40, theta=0.5,
-                                tau_int=15, tau_ref=1, K_ref=0,
-                                dt=0.1, hazard="poisson"),
-
+    # Driven, no refraction, beta = 40: the stiff one, which is why its step is 0.1.
+    "noref_driven_strong": dict(preset="D2",    dt=0.1),
 }
 
 regime = "ref_lowbeta"  # pick one of the above regimes to run
 regime = "noref_driven_strong"
 
-DT0    = 1       # the time unit: lam0 = 1/dt0 is the maximal rate, so this is not a knob
+PRESET = REGIMES[regime]["preset"]
+
 TOL    = 1e-2      # age-grid accuracy; Qm is fitted to it rather than set by hand
 N      = 40000     # spins in the network model
 DEVICE = 'cpu'     # 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -74,9 +77,10 @@ DEVICE = 'cpu'     # 'cuda' if torch.cuda.is_available() else 'cpu'
 T_EQUI, T_MEAS = 5000.0, 2500.0   # ms: equilibration, then entropy recording
 SKIP_MS        = 10.0             # ms trimmed from each end of the recording before averaging
 
-RUN_KEYS = ("t_equi", "t_meas")   # regime entries that are the run, not the model
+RUN_KEYS = ("t_equi", "t_meas", "preset")   # regime entries that are the run, not the model
 
-PARAMS: dict = {k: v for k, v in REGIMES[regime].items() if k not in RUN_KEYS} | dict(dt0=DT0)
+PARAMS: dict = pre.params(PRESET, hazard=HAZARD,
+                          **{k: v for k, v in REGIMES[regime].items() if k not in RUN_KEYS})
 
 T_EQUI = REGIMES[regime].get("t_equi", T_EQUI)
 T_MEAS = REGIMES[regime].get("t_meas", T_MEAS)
@@ -95,7 +99,7 @@ SKIP   = hlp.n_steps(SKIP_MS, PARAMS["dt"], name="SKIP_MS")
 # model parameter: two runs at the same physics and the same accuracy are the same run,
 # whatever bin count each turned out to need. A change to the FITTING code is a code change,
 # which the cache does not track and clearing cache/ handles.
-CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, N=N, t_equi=T_EQUI, t_meas=T_MEAS, dt0=DT0, tol=TOL),
+CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, preset=PRESET, N=N, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
                        tag=regime, root=Path(__file__).parents[1] / "cache")
 
 run_sim   = True
@@ -140,7 +144,7 @@ if run_sim and (overwrite or not CACHE.exists()):
 
     out = {
         "params": PARAMS, "t_equi": T_EQUI, "t_meas": T_MEAS, "steps": STEPS,
-        "N": N, "dt": DT0,
+        "N": N, "preset": PRESET,
         "mf_traj1": mf_traj1, "mf_traj2": mf_traj2,
         "sm_traj1": sm_traj1, "sm_traj2": sm_traj2,
         # the two age distributions, on the mean field's grid
@@ -185,7 +189,7 @@ if run_plot:
 
     if True:  # equilibration trajectories
         rp.curves({'Spin Model': sm_traj1["m_tot"], 'Mean Field': mf_traj1["m"]},
-                  dt=dt, title='Equilibration Trajectories')
+                  dt=dt, title=f'Equilibration trajectories\n{pre.banner(PRESET, PARAMS)}')
 
     if True:  # return map (m_t vs m_{t+1}) of the non-transient trajectories
         rp.return_maps({'Spin Model': sm_traj2["m_tot"], 'Mean Field': mf_traj2["m_tot"]},

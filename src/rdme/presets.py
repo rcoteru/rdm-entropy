@@ -79,10 +79,35 @@ PRESETS: dict[str, dict] = {
         t_abs   = 1.0,
     ),
 
+    # Driven, no refractory kernel, strong gain: the fourth of the four parameter sets that
+    # S1-mf_vs_sm.py carried inline (as "noref_driven_strong"). Named here because it matches
+    # no other preset in any parameter -- the other three resolved to S1 and S1-sat with
+    # overrides, this one did not -- and presets.py's own rule is that a set which is a system
+    # gets a name rather than a dict at the top of a script. J IS part of it: the point is that
+    # state. It runs at dt = 0.1, far finer than S1's, because beta = 40 makes the hazard stiff.
+    #
+    # PROVISIONAL NAME. The parameters are the ones that were run; "D2" is this port's choice
+    # and was never a vault decision. Rename freely -- only S1-mf_vs_sm.py refers to it.
+    "D2": dict(
+        E       = 1.0,
+        beta    = 40.0,
+        theta   = 0.5,
+        tau_int = 15.0,
+        tau_ref = 1.0,
+        K_ref   = 0.0,
+        J       = 6.0,
+        nu0     = 1.0,
+        t_abs   = 1.0,
+    ),
+
     # Legacy driven high-beta set. Here to reproduce old figures and for nothing else: no
     # refractory kernel (K_ref = 0), a drive that does the work instead. Its old runs were at
     # dt0 = 0.5 under route A, i.e. hazard="bernoulli" at dt = 0.5 with nu0 = 2; the preset
     # carries the route-B unit instead, so reproducing a figure means stating both.
+    #
+    # LEGACY-ONLY, and deliberately kept with NO live caller (2026-11-07): the paper figures
+    # that used it are frozen at 378bf2a^ and reproduce from their own commit. It stays here
+    # because it is the record of those figures' parameters, not because anything runs it.
     "D1": dict(
         E       = 0.9,
         beta    = 30.0,
@@ -108,7 +133,7 @@ POINTS: dict[str, dict] = {
 
 # Populations per preset, so a caller can tell which constructor a name belongs to without
 # counting parameters.
-POPS: dict[str, int] = {"S1": 1, "S1-sat": 1, "D1": 1, "S1/fp": 1}
+POPS: dict[str, int] = {"S1": 1, "S1-sat": 1, "D1": 1, "D2": 1, "S1/fp": 1}
 
 # Every model parameter a preset of M populations may carry, which is what an override is
 # checked against: a preset leaves J out when J is its swept axis, and that absence should not

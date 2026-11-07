@@ -3,7 +3,7 @@ Convergence of the microscopic model to the mean field in the system size N.
 
 The mean field IS the N -> infinity limit, so the question is not how well the spin network
 agrees but how fast, and what it sees that the mean field cannot. Two operating points, as in
-ising-dt_conv.py: J = 10, a fixed point where the mean field is a flat line with sigma = 0, and
+S1-dt_conv.py: J = 10, a fixed point where the mean field is a flat line with sigma = 0, and
 J = 15, the limit cycle. dt is SHARED by both models and held fixed, so the discretization error
 is common and cancels -- which is what makes a 1e-5 agreement meaningful at a step whose own
 error is 1e-2.
@@ -38,6 +38,7 @@ import torch
 
 import rdme.helpers as hlp
 import rdme.plots as rp
+import rdme.presets as pre
 from rdme.rdm_single import RDMIsingModel
 from rdme.spin_model import SpinIsingModel
 
@@ -45,20 +46,23 @@ from rdme.spin_model import SpinIsingModel
 # ── Parameters ────────────────────────────────────────────────────────────────
 
 # Shared by both models, so a regime is one dict and one J. dt is a SOLVER setting here, not
-# the object of study: fixed at a quarter of the quantum, where the rate is converged to ~1%
-# (see ising-dt_conv.py) and, more to the point, where both models make the same error.
-PARAMS: dict = dict(
-    E       = 0.0,
-    beta    = 6.0,
-    theta   = 0.5,
-    tau_int = 15.0,
-    tau_ref = 15.0,
-    K_ref   = 15.0,
-    dt0     = 1.0,
-    dt      = 0.25,
-    hazard  = "async",
-)
+# the object of study: fixed at 0.25 ms, where the rate is converged to ~1% (see S1-dt_conv.py)
+# and, more to the point, where both models make the same error -- which is what lets a 1e-5
+# agreement mean something at a step whose own error is 1e-2.
+PRESET = "S1"
+HAZARD = "poisson_exact"   # stated per script: the hazard is its own axis, not part of a
+                           # preset. The pre-port dict said "async" (route A, = "bernoulli"
+                           # here). The mean field and the spin model take the SAME key, which
+                           # is the whole point of this comparison -- never mix the two.
 
+# S1 leaves J out -- it is the axis the system is studied along -- so PARAMS is exactly what
+# both constructors take, and REGIMES supplies the J.
+PARAMS: dict = pre.params(PRESET, hazard=HAZARD, dt=0.25)
+
+# The cycle regime is still at the route-A J = 15. Under route B the Hopf moved to an expected
+# J ~ 14.4-14.6 (S1-cycle_point.py measures it), so J = 15 may sit barely past onset where the
+# amplitude goes like sqrt(J - Jc) and the linewidth result this script turns on is read in the
+# worst possible place. Re-point it at POINTS["S1/cycle"] once that is set.
 REGIMES: dict[str, float] = {"fixed point": 10.0, "limit cycle": 15.0}
 
 # Four decades. The spin step is O(N) but launch-latency bound well past 1e5 -- 1e6 neurons cost
@@ -94,7 +98,7 @@ COLS = ("r", "var", "period", "decay", "f0", "peak", "fwhm")
 
 CACHE_DIR = Path(__file__).parents[1] / "cache"
 STEM      = Path(__file__).stem
-CACHE     = hlp.cache_path(STEM, dict(PARAMS, regimes=REGIMES, ns=NS, ns_epr=NS_EPR,
+CACHE     = hlp.cache_path(STEM, dict(PARAMS, preset=PRESET, regimes=REGIMES, ns=NS, ns_epr=NS_EPR,
                                       seeds=list(SEEDS), equi=EQUI_MS, rec=REC_MS,
                                       epr=EPR_MS, seg=SEG_MS, tol=TOL),
                            root=CACHE_DIR)

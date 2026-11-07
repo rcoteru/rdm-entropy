@@ -6,22 +6,23 @@ import torch
 
 import rdme.helpers as hlp
 import rdme.plots as rp
+import rdme.presets as pre
 from rdme.rdm_batch import RDMIsingModelBatch
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 
-PARAMS: dict = dict(
+PRESET = "S1"
+HAZARD = "poisson_exact"   # stated per script: the hazard is its own axis, not part of a
+                           # preset. The pre-port dict said "async" (route A, = "bernoulli"
+                           # here), so this plane is a different model from the one the old
+                           # cache held -- which is why the preset name is in the hash below.
+
+PARAMS: dict = pre.params(
+    PRESET, hazard=HAZARD,
     J       = torch.linspace(0, 60.0, 81),
-    E       = torch.linspace(0, 2, 81),
-    beta    = 6.0,
-    theta   = 1.0,
-    tau_int = 15.0,
-    tau_ref = 15.0,
-    K_ref   = 15.0,
-    dt0     = 1.0,
-    dt      = 0.5,
-    hazard  = "async",
+    beta    = torch.linspace(1.0, 20.0, 81),
+    dt      = 1.0,
 )
 
 # The age grid is FITTED per tile, not declared: the model's q_from_tau default is the
@@ -33,20 +34,20 @@ TOL = 1e-2   # age-grid accuracy; Qm is fitted to it
 # helpers.n_steps). A step count says nothing about the system -- the same 20000 steps is a
 # different physical window at every dt -- so refining dt here keeps the window and buys
 # resolution, which is what refining a solver is supposed to do.
-T_EQUI, T_MEAS = 2500, 2500        # ms (= the 5000 + 5000 steps this script ran at dt = 0.5)
+T_EQUI, T_MEAS = 10000, 10000        # ms (= the 10000 + 10000 steps this script ran at dt = 1)
 
 EQUI  = hlp.n_steps(T_EQUI, PARAMS["dt"], name="T_EQUI")
 STEPS = hlp.n_steps(T_MEAS, PARAMS["dt"], name="T_MEAS")
 
 # Reduced at the end of each tile rather than cached whole: the plot stage only ever takes a
-# mean and a std over time, and the full (n_J, n_E, T) trajectories of this grid are 2.5 GiB
+# mean and a std over time, and the full (n_J, n_beta, T) trajectories of this grid are 7.6 GiB
 # against the ~1 MiB below. Re-run if a trajectory itself is ever the question.
 KEYS = ("m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot")
 
 
 # ── Paths & switches ──────────────────────────────────────────────────────────
 
-CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
+CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, preset=PRESET, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
                        root=Path(__file__).parents[1] / "cache")
 
 run_sim   = True
@@ -60,7 +61,7 @@ torch.set_default_dtype(torch.float64)
 if run_sim and (overwrite or not CACHE.exists()):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    J, E = PARAMS["J"], PARAMS["E"]
+    J, beta = PARAMS["J"], PARAMS["beta"]
 
     Q = hlp.fit_age_grid(lambda qm: RDMIsingModelBatch(**PARAMS, Qm=qm, device=device),
                          tol=TOL, equi=EQUI + STEPS)[0]
@@ -70,8 +71,8 @@ if run_sim and (overwrite or not CACHE.exists()):
     # signature -- under-counts the peak by between 2x and 5x. epr_plan reads the memory that
     # is actually free and returns both the tile size and the chunk, so there is no budget
     # constant to keep in step with the regime.
-    B_tile, CHUNK = hlp.epr_plan(len(J) * len(E), Q, device=device)
-    n_tiles = max(1, -(-len(J) // max(1, B_tile // len(E))))
+    B_tile, CHUNK = hlp.epr_plan(len(J) * len(beta), Q, device=device)
+    n_tiles = max(1, -(-len(J) // max(1, B_tile // len(beta))))
     J_tiles = torch.tensor_split(J, n_tiles)
     assert all(len(t) >= 2 for t in J_tiles), "tiles of one J value would drop the J axis"
 
@@ -120,29 +121,35 @@ if run_plot:
     d = torch.load(CACHE, weights_only=False)
 
     hlp.pub_style()
+    banner = pre.banner(PRESET, PARAMS)
 
-    J, E = PARAMS["J"], PARAMS["E"]
-    extent = (E.min().item(), E.max().item(), J.min().item(), J.max().item())
+    # NOTE: the J axis is plotted in the units it was passed in, i.e. physical units. The
+    # pre-port version of this script multiplied it by dt here, which was right when J
+    # carried a 1/dt and is wrong now that the input is built from the rate. Nothing in the
+    # cache can tell the two apart, so check this against the plot before quoting a number.
+    J, beta = PARAMS["J"], PARAMS["beta"]
+    extent = (beta.min().item(), beta.max().item(), J.min().item(), J.max().item())
 
     if True:  # average / std of each quantity over the plane
-        rp.maps({'Mean Activity':  d["m_tot_mean"],
+        rp.maps({'Mean Activity':   d["m_tot_mean"],
                  'Std of Activity': d["m_tot_std"],
                  'Mean Sigma':      d["sigma_tot_mean"],
                  'Std of Sigma':    d["sigma_tot_std"]},
-                extent=extent, xlabel='E (External Input)', ylabel='J (Coupling Strength)',
-                suptitle='Mean and std over the (E, J) plane')
+                extent=extent, xlabel='beta (Inverse Temperature)',
+                ylabel='J (Coupling Strength)',
+                suptitle=f'Mean and std over the (beta, J) plane\n{banner}')
 
     if True:  # slices of the grid at a handful of J values
         for key, name in (("m_tot", 'Activity'), ("sigma_tot", 'Sigma')):
             avg, std = d[f"{key}_mean"], d[f"{key}_std"]
-            idxs = hlp.grab_closest_idxs(J, [0.0, 5.0, 10.0, 15.0])
+            idxs = hlp.grab_closest_idxs(J, [5.0, 10.0, 15.0, ])
 
-            ax = rp.curves({f'J={J[i].item():.2f}': avg[i] for i in idxs}, x=E,
-                           title=f'{name} vs E for Different J Values',
-                           xlabel='E (External Input)', ylabel=f'Mean {name}',
+            ax = rp.curves({f'J={J[i].item():.2f}': avg[i] for i in idxs}, x=beta,
+                           title=f'{name} vs beta for Different J Values',
+                           xlabel='beta (Inverse Temperature)', ylabel=f'Mean {name}',
                            figsize=(8, 6))
             for i, line in zip(idxs, ax.get_lines()):
-                ax.fill_between(E, avg[i] - std[i], avg[i] + std[i],
+                ax.fill_between(beta, avg[i] - std[i], avg[i] + std[i],
                                 color=line.get_color(), alpha=0.3)
 
     rp.show()

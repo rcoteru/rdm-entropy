@@ -1,3 +1,9 @@
+# FROZEN (2026-11-07). This file reproduces stale route-A `D1` figures and is deliberately
+# NOT ported to the route-B API: run it from `git checkout 378bf2a^`, the last commit whose
+# `rdme` it matches. Against the current library it will not even import the names it wants.
+# The `S1` maps replace these figures; `D1` stays in rdme.presets as the record of their
+# parameters and has no live caller.
+
 """ One-dimensional cuts through the (E, J) plane of fig_ising_EJ_maps: the drive sweep at
 fixed coupling and the coupling sweep at fixed drive, side by side.
 

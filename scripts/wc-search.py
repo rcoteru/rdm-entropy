@@ -59,6 +59,25 @@ maps, 0-1 test, Lyapunov) can pick up the flagged cells without re-running
 anything.
 """
 
+# ── NOT RUNNABLE (2026-11-07) ─────────────────────────────────────────────────
+#
+# Ported to the route-B API mechanically and nothing more: `dt0` is gone, the dead hazard keys
+# are mapped, and the model builds. It is NOT wired to a preset and has NOT been re-run, because
+# the two-population presets it needs (`EI`, `EE-P`) are still `PENDING` in rdme.presets and
+# their values are a vault decision that has not been made. Running it produces numbers that
+# belong to no named parameter set, so do not.
+#
+# What the port changed, and why it is a change of MODEL and not a rename:
+#   `dt0`         removed. There is no time quantum under route B; `nu0` is the rate unit of
+#                 the Poisson reference and `t_abs` the physical dead time.
+#   "async"    -> "poisson_exact". The route-B kernel with async's per-bin FORM is "bernoulli"
+#                 (nu0*dt*sigma), not this one; the 2026-11-07 brief asks for the solver here
+#                 instead, so the rate function changes from saturating to exponential.
+#   "sync"/"synchronous"
+#              -> "bernoulli", which at nu0*dt = 1 is the sigmoid bit for bit.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+
 from itertools import combinations
 from pathlib import Path
 import time
@@ -243,13 +262,14 @@ if run_sim:
             # a search uses is a modelling choice, while zipping columns is plumbing.
             gc = flat["g"][sl]
             # srm takes the weights in physical units -- the 1/dt the old call site applied
-            # is internal now, since the input is built from the rate. hazard="synchronous"
-            # is the sigmoid of the original model, so the numbers are unchanged.
+            # is internal now, since the input is built from the rate. The old call passed
+            # dt0=dt (lam0*dt = 1, the sigmoid); route B has no dt0, so this is the solver at
+            # nu0 = 1 and the numbers are NOT unchanged.
             mf = RDMWilsonCowanPoints(
                 E_ratio, flat["w_EE"][sl], gc*rho, -gc/rho, flat["w_II"][sl],
                 flat["E_ext"][sl], flat["E_ext"][sl], beta, beta, theta, theta,
                 tau_int_E, tau_int_I, tau_ref, tau_ref, K_ref_E, K_ref_I,
-                dt0=dt, hazard="async", Qm=Qm, device=device)
+                dt=dt, hazard="poisson_exact", Qm=Qm, device=device)
             mf.forward(equi, pb=False)
             parts.append({k: v.cpu() for k, v in streaming_stats(mf, steps).items()})
             del mf

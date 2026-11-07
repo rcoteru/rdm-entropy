@@ -7,28 +7,33 @@ import torch
 
 import rdme.helpers as hlp
 import rdme.plots as rp
+import rdme.presets as pre
 from rdme.rdm_batch import RDMIsingModelBatch
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 
-# The refractory plane at the zero-input soft-sigmoid point of ising_1Dscan_theta: amplitude
-# against timescale, with everything else held at that script's values. K_ref = 0 is kept in
-# the range deliberately -- it is the null arm, and that whole row should come out dead.
+# The refractory plane through S1-sat: amplitude against timescale, with everything else held
+# at the preset. K_ref = 0 is kept in the range deliberately -- it is the null arm, and that
+# whole row should come out dead.
 #
 # Std of the activity is the oscillation indicator here, not its mean: at E = 0 a stable cell
 # sits at a nonzero fixed point, so only the variance separates the two.
-PARAMS: dict = dict(
-    J       = 40.0,
-    E       = 0.0,
-    beta    = 8.0,
-    theta   = 0.5,
-    tau_int = 10.0,
+#
+# The preset is S1-sat, not S1. The pre-port dict here was E = 0, beta = 8, theta = 0.5,
+# tau_int = 10, J = 40, which is S1-sat exactly, with (tau_ref, K_ref) as the swept axes and
+# the preset's own (25, 25) inside the plane. The 2026-11-07 brief guessed "S1" for this one;
+# S1 is beta = 6, tau_int = 15, so that would have been a different plane. Flagged in the dump.
+PRESET = "S1-sat"
+HAZARD = "poisson_exact"   # stated per script: the hazard is its own axis, not part of a
+                           # preset. The pre-port dict said "async" (route A, = "bernoulli"
+                           # here), so this plane is a different model from the old cache's.
+
+PARAMS: dict = pre.params(
+    PRESET, hazard=HAZARD,
     tau_ref = torch.linspace(2.0, 60.0, 59),
     K_ref   = torch.linspace(0.0, 50.0, 51),
-    dt0     = 1.0,
     dt      = 1.0,
-    hazard  = "async",
     eps     = 0.01,
 )
 
@@ -61,7 +66,7 @@ KEYS = ("m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot")
 
 # ── Paths & switches ──────────────────────────────────────────────────────────
 
-CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
+CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, preset=PRESET, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
                        root=Path(__file__).parents[1] / "cache")
 
 run_sim   = True
@@ -173,6 +178,7 @@ if run_plot:
     d = torch.load(CACHE, weights_only=False)
 
     hlp.pub_style()
+    banner = pre.banner(PRESET, PARAMS)
 
     tau_ref, K_ref = PARAMS["tau_ref"], PARAMS["K_ref"]
     extent = (K_ref.min().item(), K_ref.max().item(),
@@ -189,7 +195,7 @@ if run_plot:
                  'Std of Sigma':     d["sigma_tot_std"]},
                 extent=extent, xlabel='K_ref (refractory amplitude)',
                 ylabel='τ_ref (refractory timescale, ms)',
-                suptitle='Oscillation and its cost over the (K_ref, tau_ref) plane')
+                suptitle=f'Oscillation and its cost over the (K_ref, tau_ref) plane\n{banner}')
 
     if True:  # the K_ref = 0 null arm against a few nonzero ones
         idxs = hlp.grab_closest_idxs(K_ref, [0.0, 6.0, 12.0, 25.0])

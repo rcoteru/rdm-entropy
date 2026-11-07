@@ -1,3 +1,22 @@
+# ── NOT RUNNABLE (2026-11-07) ─────────────────────────────────────────────────
+#
+# Ported to the route-B API mechanically and nothing more: `dt0` is gone, the dead hazard keys
+# are mapped, and the model builds. It is NOT wired to a preset and has NOT been re-run, because
+# the two-population presets it needs (`EI`, `EE-P`) are still `PENDING` in rdme.presets and
+# their values are a vault decision that has not been made. Running it produces numbers that
+# belong to no named parameter set, so do not.
+#
+# What the port changed, and why it is a change of MODEL and not a rename:
+#   `dt0`         removed. There is no time quantum under route B; `nu0` is the rate unit of
+#                 the Poisson reference and `t_abs` the physical dead time.
+#   "async"    -> "poisson_exact". The route-B kernel with async's per-bin FORM is "bernoulli"
+#                 (nu0*dt*sigma), not this one; the 2026-11-07 brief asks for the solver here
+#                 instead, so the rate function changes from saturating to exponential.
+#   "sync"/"synchronous"
+#              -> "bernoulli", which at nu0*dt = 1 is the sigmoid bit for bit.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+
 from pathlib import Path
 import time
 
@@ -54,12 +73,14 @@ if run_sim:
     else:
         # w_EE and w_II are passed as vectors, so the batch is their outer product and the
         # trajectory comes back shaped (n_EE, n_II, T) — no meshgrid/reshape bookkeeping.
-        # srm takes the weights in physical units -- no /dt, since the input is built
-        # from the rate -- and hazard="async" at dt = dt0 IS the sigmoid of the original model
+        # srm takes the weights in physical units -- no /dt, since the input is built from
+        # the rate. The old call passed dt0=dt, i.e. lam0*dt = 1, which made this the sigmoid;
+        # route B has no dt0 to equate to anything, so nu0 keeps its own unit and the kernel
+        # is the solver. This is the recorded violation, and fixing it CHANGES the model.
         mf = RDMWilsonCowanBatch(E_ratio, w_EE, w_EI, w_IE, w_II,
                                   E, E, beta, beta, theta, theta,
                                   tau_int, tau_int, tau_ref, tau_ref, K_ref, K_ref,
-                                 dt0=dt, hazard="async", device=device)
+                                 dt=dt, hazard="poisson_exact", device=device)
         print(f"Running {mf.B} mean-fields. Grid axes: "
               f"{ {k: len(v) for k, v in mf.grid_axes.items()} }.")
         print(f"Batch steps: {equi+steps} per mean-field. ({equi} equilibration + {steps} recording)")

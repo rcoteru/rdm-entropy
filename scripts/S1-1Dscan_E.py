@@ -15,7 +15,10 @@ from rdme.rdm_batch import RDMIsingModelBatch
 # ── Parameters ────────────────────────────────────────────────────────────────
 
 PRESET = "S1"
-HAZARD = "poisson"        # stated per script: the hazard is its own axis, not part of a preset
+HAZARD = "poisson_exact"   # stated per script: the hazard is its own axis, not part of a
+                           # preset. This is a SCAN, so it wants the solver (exact survival,
+                           # single-signed error, monotone in dt) and not "poisson", which is
+                           # the per-bin model of binned data.
 
 PARAMS: dict = pre.params(
     PRESET, hazard=HAZARD,
@@ -60,9 +63,9 @@ MEANS = ("sigma_tot", "H_fwd_tot", "H_rev_tot")
 
 CACHE_DIR = Path(__file__).parents[1] / "cache"
 STEM      = Path(__file__).stem
-CACHE_SIM = hlp.cache_path(STEM, dict(PARAMS, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
+CACHE_SIM = hlp.cache_path(STEM, dict(PARAMS, preset=PRESET, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
                            tag="traj", root=CACHE_DIR)
-CACHE_FP  = hlp.cache_path(STEM, dict(PARAMS, n_lead=N_LEAD, n_pts=N_E_FP, n_scan=N_SCAN, tol=TOL),
+CACHE_FP  = hlp.cache_path(STEM, dict(PARAMS, preset=PRESET, n_lead=N_LEAD, n_pts=N_E_FP, n_scan=N_SCAN, tol=TOL),
                            tag="fp", root=CACHE_DIR)
 
 @functools.cache

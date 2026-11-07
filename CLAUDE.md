@@ -75,17 +75,20 @@ banner = pre.banner(PRESET, PARAMS)      # "S1 · hazard=poisson · dt=0.25 · t
 - `diff(name, params)` returns the `overrides:` field for a dump's frontmatter, built from the dict that built the model rather than retyped; `banner(name, params)` is the figure line CLAUDE.md asks for.
 - `PENDING` holds the two-population names that are **not encoded yet** (`EI`, `EE-P`); asking for one raises with the reason.
 
-Wired so far: the four `ising_1Dscan_*.py` scripts. Everything else still carries its own dict.
+Wired so far: every `S1*` script in `scripts/`. The `wc-*.py` scripts are not, and cannot be until the two-population presets land — they carry a header saying so and are not runnable.
 
 | Preset | Pops | Parameters | Notes |
 |---|---|---|---|
 | `S1` | 1 | E = 0, β = 6, θ = 0.5, τ_int = 15, τ_ref = 15, K_ref = 15, `nu0` = 1, `t_abs` = 1 | Main one-population system (formerly "Ising set"). Self-sustained activity, no drive. Named points: `S1/fp` (J = 10). Cycle point to be re-chosen from a converged scan (the Hopf sits at J ≈ 14.4–14.6 under route B, against 12.06 with the legacy sigmoid kernel; J = 17 is the candidate) |
 | `S1-sat` | 1 | E = 0, β = 8, θ = 0.5, τ_int = 10, τ_ref = 25, K_ref = 25, `nu0` = 1, `t_abs` = 1, J = 40 | Formerly "low-β point". The rate-ceiling test. Under route B the ceiling is the dead time, not the kernel, so the realised rate should sit at 1/`t_abs` |
-| `D1` | 1 | E = 0.9, β = 30, θ = 1, τ_int = 20, τ_ref = 3, K_ref = 0, `nu0` = 1, `t_abs` = 1 | Legacy driven high-β set. Only to reproduce old figures, which were route A at `dt0` = 0.5, i.e. `bernoulli` at `dt` = 0.5 with `nu0` = 2 — state both |
+| `D1` | 1 | E = 0.9, β = 30, θ = 1, τ_int = 20, τ_ref = 3, K_ref = 0, `nu0` = 1, `t_abs` = 1 | Legacy driven high-β set. **Legacy-only, no live caller**: the `paper/fig_*.py` that used it are frozen and reproduce from `378bf2a^`. Kept as the record of those figures' parameters. Their runs were route A at `dt0` = 0.5, i.e. `bernoulli` at `dt` = 0.5 with `nu0` = 2 — state both |
+| `D2` | 1 | E = 1, β = 40, θ = 0.5, τ_int = 15, τ_ref = 1, K_ref = 0, `nu0` = 1, `t_abs` = 1, J = 6 | Driven, no refractory kernel, strong gain; `dt` = 0.1, since β = 40 is stiff. Adopted 2026-11-07 from `S1-mf_vs_sm.py`'s inline `noref_driven_strong`, which matched no other preset. **The name is provisional** — it was this port's choice, not a vault decision |
 | `EI` | 2 | E = 1, β = 30, θ = 1, τ_int = 20, τ_ref = 3, K_ref = 0, E_ratio = 0.8, w_IE = −6, w_II = −1 | From `wc-EEEI_sweep.py`; **to be confirmed**. `wc-mf_vs_sm.py` has two other E–I sets: reconcile or name them |
 | `EE-P` | 2 | Painchaud et al. 2022 mapping, built in `wc-painchaud.py` | Painchaud cell. The mapping needs a new time-unit anchor under route B — it was anchored on the rate ceiling, which route B does not have |
 
-**Every script in `scripts/` is unported** as of 2026-11-07: they all still pass `dt0=`, and most carry their own parameter dict rather than a preset. Porting them is one job, not several, and it folds in the violations recorded before the rename: `wc-EEII_sweep.py` and `wc-lyapunov.py` passed `dt0=dt`; `ising_2Dscan_EJ.py` uses θ = 1.0 (not `S1`); `ising_mf-vs-sm.py` uses three unnamed combinations; `wc-EEEI_sweep.py` mentions the removed `"sync"` hazard. Rename each to `<preset>-<study>.py` at the same time.
+**Ported 2026-11-07.** The eleven `ising_*.py` scripts are now `S1*` under `<preset>-<study>.py`, wired to `presets.params`, on route-B kernel keys, with the preset name in every cache key. The violations recorded before the rename are closed with them: `wc-EEII_sweep.py`/`wc-lyapunov.py` no longer pass `dt0=dt`; `S1-2Dscan_EJ.py` takes θ = 0.5 from the preset (which **moves the plane** — do not read the new map against the old); `S1-mf_vs_sm.py`'s four inline sets resolve to `S1` + overrides, `S1-sat` + overrides, `S1-sat` exactly and the new `D2`; `wc-EEEI_sweep.py`'s `"sync"` is gone.
+
+Still open: the `wc-*.py` scripts keep their names and are **not runnable** — they are ported mechanically (no `dt0`, live hazard keys, `is_flow` in place of `dt < dt0`) but not wired to a preset, because `EI` and `EE-P` are `PENDING`. They get their `<preset>-<study>.py` name when those land. The Painchaud time-unit anchor (`T_u = α₁·dt0`, i.e. the route-A rate ceiling) is left exactly as it was, as `DT0_ANCHOR`, and flagged unresolved in both `wc-painchaud*.py`.
 
 ## Figures
 

@@ -1,35 +1,46 @@
 """
 How fine does the solver step have to be, for each hazard, at a fixed point and on a cycle?
 
-dt0 = 1 throughout: the quantum is the MODEL and is held fixed, dt is the SOLVER and is what
-refines (see hazards.resolve_timesteps). At dt = dt0 async, escape and poisson ARE the sigmoid,
-bit for bit, so those three curves start from the same point and separate toward their own
-continuous-time limits. exp_surv does not: it is not calibrated to the quantum at all, being
-poisson's continuum model under exact survival rather than under maximum caliber. It is here
-as a SOLVER for that model, and the two must agree in the limit while differing at every
-finite step -- which is the sharpest check in this script, since it is the one pair whose
-limits are required to coincide. Two operating points of the standard Ising set, either side of the Hopf: J = 10, a
-stable fixed point, where sigma vanishes identically and only the rate converges; and J = 17,
-the limit cycle.
+ROUTE B. There is no time quantum and no dt0: `nu0` is the rate unit of the Poisson reference
+(1 /ms), `t_abs` is the physical dead time (1 ms), and `dt` is the solver step and nothing
+else. The three kernels this sweeps are not three models:
 
-Where the Hopf is, and why the cycle is measured well above it. At the quantum all three
-kernels share one spectrum and the fixed point loses stability at J = 12.0588. Refining moves
-it, and not in one direction: async rises to ~12.3, escape falls to ~11.9, and poisson rises
-to ~14.36 (measured at dt = 1, 1/2, 1/4, 1/8 as 12.06, 13.33, 13.87, 14.13, the increments
-halving cleanly). J = 15 therefore sat only 0.64 above poisson's OWN bifurcation while the
-other two sat 2.7-3.1 above theirs, and since the amplitude of a Hopf cycle goes like
-sqrt(J - Jc) that halved poisson's peak-to-peak and left it the worst-converging row in the
-table -- a small amplitude measured in the sensitive neighbourhood of a bifurcation that is
-itself still moving with dt. At J = 17 every kernel sits 2.7 or more above its own Hopf and
-the three amplitudes come within 30% of each other.
+  poisson_exact   Phi = 1 - exp(-nu0 e^{beta h} dt)      the SOLVER, and the default
+  poisson         Phi = sigma(beta h + logit(nu0 dt))    the same continuum model, discretized
+                                                         by maximum caliber at each bin
+  bernoulli       Phi = nu0 dt sigma(beta h)             route A, comparison only
 
-Not further, though, and that bound is poisson's: its rate is exponential, so the drive that
-buys margin also buys stiffness. Peak max(rate)*dt at dt = 1/4 runs 0.08, 0.32, 1.70, 11.7 at
-J = 15, 17, 20, 24 -- resolvable at 17 and hopeless by 24, where the step needed is ~1e-3.
-The strongly-driven regime where the exponential rate takes over is a separate experiment.
+poisson and poisson_exact share a rate function exactly, so they are ONE model under two
+discretization maps and their dt -> 0 limits are required to coincide -- which is the sharpest
+check in this script, being the one pair whose limits must agree while they differ at every
+finite step. bernoulli has a different rate function (saturating at nu0 rather than
+exponential) and so has its OWN limit; it is here because every pre-route-B result in this
+project was computed in it.
+
+What refining does NOT do here is walk across a family. Each kernel converges to its own
+continuous-time model and the two route-B ones converge to the same one.
+
+Two operating points of S1, either side of the Hopf: J = 10 (S1/fp), a stable fixed point,
+where sigma vanishes identically and only the rate converges; and J = 17, the candidate cycle
+point. Both are J overrides on the preset and nothing else.
+
+THE CYCLE POINT IS A CANDIDATE, not a decision. Under route B the Hopf moved: it sat at
+J = 12.0588 with the legacy sigmoid kernel (= `bernoulli` at nu0*dt = 1) and is expected near
+J = 14.4-14.6 under poisson_exact. J = 17 is 2.4-2.6 above that estimate, which is the margin
+this script needs -- the amplitude of a Hopf cycle goes like sqrt(J - Jc), so a point measured
+just past onset has a small amplitude read in the sensitive neighbourhood of a bifurcation
+that is itself still moving with dt. S1-cycle_point.py is what fixes J_c; when it does, re-read
+this script's margin against the number it reports rather than against the estimate above.
+
+Not further than 17, though, and that bound is the exponential rate's: the drive that buys
+margin also buys stiffness. Under route A, peak max(rate)*dt at dt = 1/4 ran 0.08, 0.32, 1.70,
+11.7 at J = 15, 17, 20, 24 -- resolvable at 17 and hopeless by 24. The strongly-driven regime
+where the exponential rate takes over is a separate experiment.
 
 Converging: r = m/dt [1/ms], sigma/dt [nats/ms], the period, the amplitude. Diverging, and kept
-as the control: H_fwd/dt and H_rev/dt, which grow as -r ln dt at the predicted rate.
+as the control: H_fwd/dt and H_rev/dt, which grow as -r ln dt at the predicted rate. CLAUDE.md
+asks for the Poisson-REFERENCED entropies as the finite quantity; this script reports the raw
+pair as the control, which is the other half of the same rule.
 
 Two things are held fixed so that only the step varies, and both bite if they are not:
 
@@ -43,34 +54,39 @@ Two things are held fixed so that only the step varies, and both bite if they ar
       a phase error that moved the mean in the third digit; this one is flat in the
       equilibration to eight.
 
-What came out of it -- the ordering of the kernels, the hierarchy of observables, and the
-peak-rate diagnostic that explains both -- is in the companion write-up, beside the tables and
-figures below that it is drawn from.
+Steps. dt must divide t_abs = 1 ms (kernels.n_abs_bins refuses otherwise), so the admissible
+sweep is 1, 1/2, 1/4, ... -- which is what the halvings below walk down. `poisson` additionally
+needs c = nu0*dt < 1 STRICTLY, so at nu0 = 1 it has no dt = 1 entry and its column starts one
+halving in; `bernoulli` allows the equality; `poisson_exact` has no arithmetic cap and its step
+is set by accuracy alone (hazards.step_error). Skipped combinations are reported, not clamped.
 """
 
 import time
-import warnings
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
 
+import rdme.hazards as hzd
 import rdme.helpers as hlp
 import rdme.plots as rp
+import rdme.presets as pre
+from rdme.helpers import converged_at, orders, richardson
 from rdme.rdm_single import RDMIsingModel
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 
-PARAMS: dict = dict(
-    E       = 0.0,    # no external drive: the activity is self-sustained
-    beta    = 6.0,
-    theta   = 0.5,
-    tau_int = 15.0,
-    tau_ref = 15.0,   # long: the refractory delay sets the oscillation period
-    K_ref   = 15.0,
-    dt0     = 1.0,    # the MODEL's time quantum, fixed; dt is what this script sweeps
-)
+PRESET = "S1"
+# No single hazard: the sweep IS over the three kernels, so the hazard is this script's second
+# axis and is passed per measurement rather than baked into PARAMS.
+HAZARDS = ("bernoulli", "poisson", "poisson_exact")
+COLORS  = {"bernoulli": "#2e6fb7", "poisson": "#3f8f5c", "poisson_exact": "#8a6bbf"}
+
+# dt comes from DTS per measurement; params() requires one, so PARAMS is built at the coarsest
+# and the step is overridden below. J comes from REGIMES for the same reason.
+PARAMS: dict = pre.params(PRESET, hazard=HAZARDS[0], dt=1.0)
+MODEL: dict = {k: v for k, v in PARAMS.items() if k not in ("dt", "hazard", "J")}
 
 # J either side of the Hopf, with the recording window each needs. The cycle gets 35 periods
 # because the cycle-aligned average only removes the PHASE error, not the sampling noise of a
@@ -80,31 +96,30 @@ REGIMES: dict[str, dict] = {
     # averages are flat in it from 4000 ms on, which is what it was originally verified
     # against. sigma at the FIXED POINT is not: it is a cancellation that vanishes only when
     # the state has actually stopped moving, so it reports the residual transient rather than
-    # a floor, and it does so at a scale eight orders below the cycle. Measured at dt = 0.25,
-    # J = 10, as the equilibration is lengthened:
-    #
-    #     equi      async      escape     poisson    exp_surv
-    #     1000 ms   1.7e-04    2.4e-04    -5.4e-06   2.0e-06
-    #     4000 ms   5.5e-08    4.6e-08     2.3e-13  -2.0e-15
-    #    16000 ms  -6.5e-18   -9.7e-18    -1.9e-18  -5.2e-18
-    #
-    # i.e. every kernel reaches machine zero, as the recurrence-time argument says it must,
-    # and 4000 ms is simply not settled for async and escape. Reading that 5e-8 as a property
-    # of a kernel would have been a claim about nothing.
-    "fixed point": dict(J=10.0, rec_ms=500.0, equi_ms=16000.0),
-    "limit cycle": dict(J=17.0, rec_ms=2500.0, equi_ms=4000.0),
+    # a floor, and it does so at a scale eight orders below the cycle. Measured under route A
+    # at dt = 0.25, J = 10, as the equilibration is lengthened, every kernel reached machine
+    # zero by 16000 ms while 4000 ms was simply not settled for the sigmoid kernels -- reading
+    # that residual 5e-8 as a property of a kernel would have been a claim about nothing.
+    "fixed point": dict(J=10.0, rec_ms=500.0, equi_ms=16000.0),   # = POINTS["S1/fp"]
+    "limit cycle": dict(J=17.0, rec_ms=2500.0, equi_ms=4000.0),   # candidate; see the docstring
 }
 
-HAZARDS = ("async", "escape", "poisson", "exp_surv")
-COLORS  = {"async": "#2e6fb7", "escape": "#b4453c", "poisson": "#3f8f5c",
-           "exp_surv": "#8a6bbf"}
+# Each halving costs about four times the previous one -- twice the steps on twice the age
+# bins, and the EPR's ring buffer is (Q, Q) -- so the last entry is most of the wall time and
+# most of the memory (~3 min and ~6 GiB at 1/32, on the cycle). Dropping it costs a factor of
+# two in the resolved error and leaves the whole sweep at about three minutes.
+#
+# It starts at 1/2, not at 1. Under route A dt = dt0 = 1 was the control point where three
+# kernels were one map; route B has no such coincidence, and c = nu0*dt < 1 is required
+# STRICTLY by `poisson`, so dt = 1 at nu0 = 1 would be a row with a hole in it for no gain.
+DTS = [0.5, 0.25, 0.125, 0.0625, 0.03125]
 
-# lam0*dt <= 1 caps async at dt <= dt0, so the sweep starts at the quantum and halves. Each
-# halving costs about four times the previous one -- twice the steps on twice the age bins, and
-# the EPR's ring buffer is (Q, Q) -- so the last entry is most of the wall time and most of the
-# memory (~3 min and ~6 GiB at 1/32, on the cycle). Dropping it costs a factor of two in the
-# resolved error and leaves the whole sweep at about three minutes.
-DTS = [1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125]
+# Every (hazard, dt) this sweep will build, checked once, here, rather than discovered three
+# minutes into a run: check_step enforces what each kernel's algebra requires of c = nu0*dt,
+# and n_abs_bins (inside the model) requires dt to divide t_abs.
+for _h in HAZARDS:
+    for _dt in DTS:
+        hzd.check_step(_h, PARAMS["nu0"], _dt)
 
 EQUI_MS = 4000.0   # the default; REGIMES overrides it per regime, and says why
 DT_FIT  = 0.25     # step the age window is fitted at; U_max in ms is dt-independent
@@ -152,7 +167,7 @@ REPORTED: dict[str, tuple[str, ...]] = {
 
 CACHE_DIR = Path(__file__).parents[1] / "cache"
 STEM      = Path(__file__).stem
-CACHE     = hlp.cache_path(STEM, dict(PARAMS, regimes=REGIMES, hazards=list(HAZARDS),
+CACHE     = hlp.cache_path(STEM, dict(PARAMS, preset=PRESET, regimes=REGIMES, hazards=list(HAZARDS),
                                       dts=DTS, equi=EQUI_MS, dt_fit=DT_FIT, tol=TOL,
                                       tol_fit=TOL_FIT),
                            root=CACHE_DIR)
@@ -194,7 +209,7 @@ def checkpoint(res: dict) -> None:
 # ── Measurement ───────────────────────────────────────────────────────────────
 
 def build(J: float, hazard: str, dt: float, Qm: list[int] | None = None) -> RDMIsingModel:
-    return RDMIsingModel(J, **PARAMS, dt=dt, hazard=hazard, Qm=Qm, device=DEVICE)
+    return RDMIsingModel(J, **MODEL, dt=dt, hazard=hazard, Qm=Qm, device=DEVICE)
 
 
 def measure(J: float, hazard: str, dt: float, Qm: list[int], rec_ms: float,
@@ -293,61 +308,6 @@ if run_sim:
 
 
 # ── Analysis ──────────────────────────────────────────────────────────────────
-
-def orders(vals: torch.Tensor) -> torch.Tensor:
-    """ Observed order of convergence from successive differences, dt halving each step:
-    p_k = log2(|x_k - x_{k-1}| / |x_{k+1} - x_k|). A first-order method gives 1. """
-    d = vals.diff().abs()
-    return torch.log2(d[:-1] / d[1:].clamp_min(1e-300))
-
-
-def richardson(vals: torch.Tensor) -> tuple[float, float]:
-    """ (extrapolated limit, order used), from the two finest steps and the order the last
-    triple shows. Falls back to first order when the differences are too noisy to read one off
-    -- near the limit they are differences of nearly equal numbers and the log2 of their ratio
-    is meaningless, which is exactly when the extrapolation is also a small correction.
-
-    REFUSES, returning nan, when the sequence is not in its asymptotic regime at all. Two
-    symptoms, either of which is disqualifying:
-
-      the successive differences change sign.  The sequence has a turning point, so it is not
-          approaching the limit from one side and `vals[-1] - vals[-2]` is not an error
-          estimate. Measured on poisson's sigma at J = 17, which falls to dt ~ 1/3 and then
-          climbs: the old fallback read an "order" off the turning point and returned a limit
-          with four digits, every one of them meaningless.
-      an observed order above ~3 or below zero.  Same disease, caught one step earlier -- a
-          first-order method cannot show p = 8, so a triple that says so is measuring
-          something other than the discretization error.
-
-    Returning nan rather than a cautious number is the point. The caller formats it as a
-    refusal and the convergence verdicts fall through to "not resolved", which is the honest
-    answer; a plausible-looking limit with a relative-error column beside it is not. """
-    if len(vals) > 2:
-        o = orders(vals)
-        d = vals.diff()
-        turning = bool(((d[:-1] * d[1:]) < 0).any())
-        wild = bool((o.abs() > 3.0).any()) or bool((o < 0).any())
-        if turning or wild:
-            why = "differences change sign" if turning else "observed order out of range"
-            warnings.warn(f"richardson refused: {why}; orders "
-                          f"{['%.2f' % v for v in o.tolist()]}", RuntimeWarning, stacklevel=2)
-            return float('nan'), float('nan')
-    p = float(orders(vals)[-1]) if len(vals) > 2 else 1.0
-    if not (0.2 < p < 4.0):
-        p = 1.0
-    return float(vals[-1] + (vals[-1] - vals[-2]) / (2 ** p - 1)), p
-
-
-def converged_at(dts: list[float], vals: torch.Tensor, limit: float, thresh: float) -> float:
-    """ Coarsest dt from which the relative error stays under `thresh` all the way down.
-    'And stays': a curve crossing a threshold once on its way past is not converged there. """
-    err = (vals - limit).abs() / max(abs(limit), 1e-300)
-    ok = float('nan')
-    for k in range(len(dts) - 1, -1, -1):
-        if float(err[k]) < thresh: ok = dts[k]
-        else: break
-    return ok
-
 
 if run_plot:
 
@@ -530,8 +490,9 @@ if run_plot:
             ax_e.set_ylabel('relative error vs extrapolated limit')
             ax_e.set_title(f'Convergence -- {name}')
 
-        fig.suptitle(f'{title} vs the solver step, at $\\Delta t_0 = {PARAMS["dt0"]:g}$ '
-                     f'(all three kernels are the sigmoid at $\\Delta_t = \\Delta t_0$)')
+        # dt is this figure's x axis, so it is kept out of the banner line; MODEL is PARAMS
+        # without dt, the hazard and J, which is exactly the part that is held fixed here.
+        fig.suptitle(f'{title} vs the solver step\n{pre.banner(PRESET, MODEL)}')
         fig.tight_layout()
 
     # The divergent control, which is the one figure here that is NOT a convergence. H is the

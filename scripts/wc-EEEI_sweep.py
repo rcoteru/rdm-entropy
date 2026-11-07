@@ -1,3 +1,22 @@
+# ── NOT RUNNABLE (2026-11-07) ─────────────────────────────────────────────────
+#
+# Ported to the route-B API mechanically and nothing more: `dt0` is gone, the dead hazard keys
+# are mapped, and the model builds. It is NOT wired to a preset and has NOT been re-run, because
+# the two-population presets it needs (`EI`, `EE-P`) are still `PENDING` in rdme.presets and
+# their values are a vault decision that has not been made. Running it produces numbers that
+# belong to no named parameter set, so do not.
+#
+# What the port changed, and why it is a change of MODEL and not a rename:
+#   `dt0`         removed. There is no time quantum under route B; `nu0` is the rate unit of
+#                 the Poisson reference and `t_abs` the physical dead time.
+#   "async"    -> "poisson_exact". The route-B kernel with async's per-bin FORM is "bernoulli"
+#                 (nu0*dt*sigma), not this one; the 2026-11-07 brief asks for the solver here
+#                 instead, so the rate function changes from saturating to exponential.
+#   "sync"/"synchronous"
+#              -> "bernoulli", which at nu0*dt = 1 is the sigmoid bit for bit.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+
 import matplotlib.pyplot as plt
 from pathlib import Path
 import torch
@@ -43,9 +62,10 @@ if run_sim:
 
     equi  = 20000
     steps = 10000
-    dt0   = 1
     dt    = 0.2
-    hazard = "async"  # "async", "sync", "escape"
+    # Was: hazard = "async"  # "async", "sync", "escape"  -- none of those keys exist.
+    # "escape" has no route-B counterpart at all; "sync" is "bernoulli" at nu0*dt = 1.
+    hazard = "poisson_exact"   # "poisson_exact", "poisson", "bernoulli"
     chunk_size = 256
 
     if CACHE_TRAJ_FILE.exists() and not overwrite:
@@ -54,11 +74,11 @@ if run_sim:
         # w_EE and w_EI are passed as vectors, so the batch is their outer product and the
         # trajectory comes back shaped (n_EE, n_EI, T) — no meshgrid/reshape bookkeeping.
         # srm takes the weights in physical units -- no /dt, since the input is built
-        # from the rate -- and hazard="synchronous" is the sigmoid of the original model
+        # from the rate. "synchronous" is "bernoulli" at nu0*dt = 1 under route B.
         mf = RDMWilsonCowanBatch(E_ratio, w_EE, w_EI, w_IE, w_II,
                                   E, E, beta, beta, theta, theta,
                                   tau_int, tau_int, tau_ref, tau_ref, K_ref, K_ref,
-                                  dt0=dt0, dt=dt, device=device, hazard=hazard, eps=0.01)
+                                  dt=dt, device=device, hazard=hazard, eps=0.01)
         print(f"Running {mf.B} mean-fields. Grid axes: "
               f"{ {k: len(v) for k, v in mf.grid_axes.items()} }.")
         print(f"Batch steps: {equi+steps} per mean-field. ({equi} equilibration + {steps} recording)")

@@ -21,14 +21,14 @@ field is h(u) = S(u) + R(u) - theta with S the filtered input. Four of the five 
 groups carry over exactly, one does not, and one has no counterpart at all:
 
   Time unit.  Their rates are quoted in units of gamma_1, ours in 1/ms. The anchor is alpha:
-  the maximal firing rate of a recovered neuron is alpha_J there and lam0 = 1/dt0 here, so
+  the maximal firing rate of a recovered neuron is alpha_J there and lam0 = 1/DT0_ANCHOR here, so
   alpha_1 = lam0 fixes
 
-      T_u = alpha_1 * dt0  ms per unit of 1/gamma_1,
+      T_u = alpha_1 * DT0_ANCHOR  ms per unit of 1/gamma_1,
 
-  which at the dt0 = 0.5 asked for is T_u = 6.25 ms. Every one of their rates is divided by
-  T_u to get 1/ms. Note the direction of the constraint: dt0 is not free once alpha_1 is, and
-  a different dt0 is a different physical time unit, not a refinement.
+  which at the DT0_ANCHOR = 0.5 asked for is T_u = 6.25 ms. Every one of their rates is divided by
+  T_u to get 1/ms. Note the direction of the constraint: DT0_ANCHOR is not free once alpha_1 is, and
+  a different DT0_ANCHOR is a different physical time unit, not a refinement.
 
   Weights.  A_K = r_K/beta_K relates their active fraction to a firing rate, so their
   dimensionless c_JK becomes our w_JK = c_JK / beta_K with beta_K in 1/ms -- the beta of the
@@ -105,12 +105,12 @@ both streamed in O(B):
   cycle repeats both to machine precision, an aperiodic orbit does not. Split in half like
   everything else here, so a slowly-decaying transient is not read as irregularity.
 
-  Step-level alternation.  dt0 = 0.5 with dt = 0.5 puts lam0*dt = 1, where the async hazard
+  Step-level alternation.  DT0_ANCHOR = 0.5 with dt = 0.5 puts lam0*dt = 1, where the async hazard
   coincides with the synchronous one and a saturated population can flip-flop between firing
   everything and firing nothing on alternate steps. That has CV ~ 1 and a huge amplitude and
   would otherwise be the loudest "oscillation" on the grid. It is a discretization artifact,
   not a solution, and the lag-1 autocorrelation identifies it exactly: at -1 the trajectory is
-  a 2-cycle of the map. Cells flagged this way should be re-run at dt < dt0 before anything is
+  a 2-cycle of the map. Cells flagged this way should be re-run at dt < DT0_ANCHOR before anything is
   believed about them.
 
 A positive aperiodicity flag is a candidate, not a result, and stage 2 below is what turns one
@@ -132,7 +132,7 @@ Run as it stands, on a 9**4 grid:
   Stage 1 flags 878 of 6561 cells as aperiodic, against 577 periodic and 785 fixed points.
 
   Stage 2 confirms none of them. The twelve strongest candidates were run at dt = 0.5, 0.25 and
-  0.125 (dt0 pinned at 0.5 throughout, so these are refinements of ONE model and not a walk
+  0.125 (DT0_ANCHOR pinned at 0.5 throughout, so these are refinements of ONE model and not a walk
   across a family). At dt = 0.5 most have lambda_1 clearly negative -- down to -3.6e-2 /ms at
   the top-ranked cell, which therefore has a burst-height dispersion of 0.32 while being a
   perfectly periodic orbit, and is the multi-burst-period false positive above caught in the
@@ -146,10 +146,36 @@ Run as it stands, on a 9**4 grid:
   +2.6e-2 /ms in these units, which would be comfortably resolvable if it were here.
 
   A caveat that limits the whole sweep: 4286 of 6561 cells -- 65% -- are step artifacts. At
-  dt = dt0 = 0.5 the async hazard is the synchronous one, and most of the strong-coupling half
+  dt = DT0_ANCHOR = 0.5 the async hazard is the synchronous one, and most of the strong-coupling half
   of the grid saturates into a 2-cycle of the map. The resolved region is the weak-coupling
-  side, and a sweep that wants the other half has to be run at dt < dt0 from the start.
+  side, and a sweep that wants the other half has to be run at dt < DT0_ANCHOR from the start.
 """
+
+# ── NOT RUNNABLE (2026-11-07) ─────────────────────────────────────────────────
+#
+# Ported to the route-B API mechanically and nothing more: `dt0` is gone, the dead hazard keys
+# are mapped, and the model builds. It is NOT wired to a preset and has NOT been re-run, because
+# the two-population presets it needs (`EI`, `EE-P`) are still `PENDING` in rdme.presets and
+# their values are a vault decision that has not been made. Running it produces numbers that
+# belong to no named parameter set, so do not.
+#
+# What the port changed, and why it is a change of MODEL and not a rename:
+#   `dt0`         removed. There is no time quantum under route B; `nu0` is the rate unit of
+#                 the Poisson reference and `t_abs` the physical dead time.
+#   "async"    -> "poisson_exact". The route-B kernel with async's per-bin FORM is "bernoulli"
+#                 (nu0*dt*sigma), not this one; the 2026-11-07 brief asks for the solver here
+#                 instead, so the rate function changes from saturating to exponential.
+#   "sync"/"synchronous"
+#              -> "bernoulli", which at nu0*dt = 1 is the sigmoid bit for bit.
+#
+#   the TIME-UNIT ANCHOR is unresolved. This script fixes its physical time unit by
+#                 T_u = alpha_1 * dt0, i.e. by identifying Painchaud's maximal rate with the
+#                 old lam0 = 1/dt0 RATE CEILING. Route B has no rate ceiling: the hazard is
+#                 exponential and the only cap is 1/t_abs. The arithmetic below is left
+#                 EXACTLY as it was and the old dt0 survives only as DT0_ANCHOR, a number
+#                 feeding T_u; it is no longer passed to any model. Choosing the new anchor
+#                 is a vault decision and is what blocks the EE-P preset.
+# ──────────────────────────────────────────────────────────────────────────────
 
 import math
 from itertools import combinations
@@ -172,11 +198,11 @@ from rdme.rdm_batch import RDMWilsonCowanPoints, flatten_param_grid
 bname = Path(__file__).stem
 CACHE_DIR = Path(__file__).parents[1] / "cache"
 
-# dt and dt0 are both in the cache name. dt0 because it selects the MODEL -- it fixes the time
-# unit through T_u = alpha_1*dt0, so two dt0 are two different ports of the paper and must not
+# dt and DT0_ANCHOR are both in the cache name. DT0_ANCHOR because it selects the MODEL -- it fixes the time
+# unit through T_u = alpha_1*DT0_ANCHOR, so two DT0_ANCHOR are two different ports of the paper and must not
 # share a file. dt because it is the resolution, and the whole point of varying it is to put
 # the two answers side by side rather than to overwrite one with the other.
-_tag = lambda: f"{bname}_dt{dt:g}_dt0{dt0:g}" + (f"_tabs{T_ABS:g}" if T_ABS else "")
+_tag = lambda: f"{bname}_dt{dt:g}_dt0{DT0_ANCHOR:g}" + (f"_tabs{T_ABS:g}" if T_ABS else "")
 
 run_probe = True    # stage 0: each translated population on its own
 run_sim   = True
@@ -201,7 +227,7 @@ P_C     = ((8.0, 0.6),
            (0.01, 14.0))
 
 
-def translate(dt0: float, K_ref: float, kappa: float = 1.0,
+def translate(dt0_anchor: float, K_ref: float, kappa: float = 1.0,
               tau_scale: float = 1.0, cross: float = 1.0) -> dict:
     """ The paper's parameters in this model's units; see the module docstring for the
     derivation of each line.
@@ -209,7 +235,7 @@ def translate(dt0: float, K_ref: float, kappa: float = 1.0,
     kappa scales the whole weight matrix, cross only its off-diagonal, and tau_scale the
     calibrated refractory time constants. All three are 1 at the nominal translation, which is
     a point on the grid rather than the answer. """
-    T_u   = P_ALPHA[0] * dt0                                  # ms per unit of 1/gamma_1
+    T_u   = P_ALPHA[0] * dt0_anchor                           # ms per unit of 1/gamma_1
     beta  = [b / T_u for b in P_BETA]                         # 1/ms
     gamma = [g / T_u for g in P_GAMMA]
     bgain = [1.0 / s for s in P_S]
@@ -242,7 +268,7 @@ def translate_columns(kappa: torch.Tensor, K_ref: torch.Tensor,
     weight of two others -- so there is nothing for an outer product to do and the columns have
     to be zipped. This is why the sweep goes through RDMWilsonCowanPoints and not
     RDMWilsonCowanBatch; see that factory's docstring. """
-    T_u   = P_ALPHA[0] * dt0
+    T_u   = P_ALPHA[0] * DT0_ANCHOR
     bphys = [b / T_u for b in P_BETA]
     bgain = [1.0 / s for s in P_S]
     return dict(
@@ -276,12 +302,16 @@ def translate_columns(kappa: torch.Tensor, K_ref: torch.Tensor,
 
 # ── Fixed parameters ──────────────────────────────────────────────────────────
 
-# dt is the resolution and dt0 the model's time quantum; see the module docstring for why
-# only their RATIO lam0*dt controls the step artifact, and why dt = dt0 is not a refinement of
-# anything. lam0*dt = 0.2 here, i.e. a neuron is offered an update on one step in five.
-dt, dt0 = 0.1, 0.5
-HAZARD  = "async"
-LAM0    = 1.0 / dt0
+# dt is the solver step. DT0_ANCHOR is the old time quantum, kept ONLY as the number that
+# fixes the physical time unit through T_u = alpha_1 * DT0_ANCHOR below: the anchor identified
+# Painchaud's maximal rate with the route-A ceiling lam0 = 1/DT0_ANCHOR, which route B does not have.
+# UNRESOLVED -- a vault decision. It is no longer passed to any model.
+dt, DT0_ANCHOR = 0.1, 0.5
+HAZARD  = "poisson_exact"
+# The old ceiling, kept because the saturation diagnostics below are written against it. It is
+# NOT nu0: nu0 is the rate unit of the Poisson reference and is the repo's 1 /ms.
+LAM0    = 1.0 / DT0_ANCHOR
+NU0     = 1.0
 
 # 1000 neurons per population, as in their Figs. 11 and 14. Structural only: N sets the
 # N-weighted `activity` observable and nothing in the dynamics.
@@ -303,9 +333,9 @@ K_REF_I_ON = True   # both populations refractory; theirs are, and the asymmetry
 # is not a rate any neuron sustains, and it is the corner that was pure step artifact at
 # dt = 0.5 -- so two thirds of that grid was in a regime with no physiological counterpart.
 #
-# 1 ms is the short end of the cortical range (1-2 ms); with lam0 = 1/dt0 the two together cap
-# the sustained rate at 1/(T_ABS + dt0) = 667 Hz at the current dt0 = 0.5 ms. Both mechanisms
-# contribute, which is worth stating rather than hiding: T_ABS is recovery, dt0 is how fast a
+# 1 ms is the short end of the cortical range (1-2 ms); with lam0 = 1/DT0_ANCHOR the two together cap
+# the sustained rate at 1/(T_ABS + DT0_ANCHOR) = 667 Hz at the current DT0_ANCHOR = 0.5 ms. Both mechanisms
+# contribute, which is worth stating rather than hiding: T_ABS is recovery, DT0_ANCHOR is how fast a
 # recovered neuron can respond at all.
 T_ABS = 1.0
 # How far below threshold the field is held inside the window, in units of 1/beta. 40 puts the
@@ -492,8 +522,8 @@ if run_probe:
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print("── Stage 0: each translated population alone ──────────────────────────")
-    print(f"dt = {dt}, dt0 = {dt0}, hazard = {HAZARD!r}, lam0 = {LAM0} /ms")
-    nom = translate(dt0, K_ref=10.0)
+    print(f"dt = {dt}, DT0_ANCHOR = {DT0_ANCHOR}, hazard = {HAZARD!r}, lam0 = {LAM0} /ms")
+    nom = translate(DT0_ANCHOR, K_ref=10.0)
     print(f"Time unit T_u = {nom['T_u']} ms per 1/gamma_1 "
           f"(from alpha_1 = {P_ALPHA[0]} = lam0); alpha_2/alpha_1 = "
           f"{P_ALPHA[1]/P_ALPHA[0]:.3f} is NOT representable.")
@@ -510,7 +540,7 @@ if run_probe:
     Kr  = torch.logspace(math.log10(2.0), math.log10(30.0), nK)
     for j in (0, 1):
         bg, th = 1.0 / P_S[j], P_THETA[j]
-        T_u = P_ALPHA[0] * dt0
+        T_u = P_ALPHA[0] * DT0_ANCHOR
         w0  = P_C[j][j] / (P_BETA[j] / T_u)
         td  = (1.0 / P_BETA[j] + 1.0 / P_GAMMA[j]) * T_u
         # Flattened by hand, and RDMNetworkBatch rather than RDMIsingModelBatch: the latter
@@ -528,7 +558,7 @@ if run_probe:
         mf = RDMNetworkBatch(
             M=1, w=(kk * w0).reshape(-1, 1, 1), N=[1000], E=col(0.0), beta=col(bg),
             theta=col(th), tau_int=col(TAU_INT), tau_ref=tr.reshape(-1, 1),
-            K_ref=KK.reshape(-1, 1), dt=dt, dt0=dt0, hazard=HAZARD, t_abs=T_ABS,
+            K_ref=KK.reshape(-1, 1), dt=dt, nu0=NU0, hazard=HAZARD, t_abs=T_ABS,
             Qm=Qm, device=device)
         mf.forward(int(4000 / dt), pb=False)
         st = streaming_stats(mf, int(1500 / dt))
@@ -580,7 +610,7 @@ if run_sim:
         cols = translate_columns(flat["kappa"], flat["K_ref"],
                                  flat["tau_scale"], flat["cross"])
         Kr, bgain = flat["K_ref"], [1.0 / s for s in P_S]
-        T_u = P_ALPHA[0] * dt0
+        T_u = P_ALPHA[0] * DT0_ANCHOR
 
         def build(idx, Qm):
             """ The batch for an arbitrary set of flat indices, on the given age grid.
@@ -593,7 +623,7 @@ if run_sim:
                 P_Q[0], P_Q[1], bgain[0], bgain[1], P_THETA[0], P_THETA[1],
                 TAU_INT, TAU_INT, g("tau_ref_E"), g("tau_ref_I"),
                 Kr[idx], Kr[idx] if K_REF_I_ON else 0.0 * Kr[idx],
-                dt=dt, dt0=dt0, hazard=HAZARD, t_abs=T_ABS, Qm=Qm, device=device)
+                dt=dt, nu0=NU0, hazard=HAZARD, t_abs=T_ABS, Qm=Qm, device=device)
             return mf
 
         # ── Pass 0: pilot rates ───────────────────────────────────────────────
@@ -700,7 +730,7 @@ if run_sim:
         stats["drift"]     = stats["drift"] / dt
         stats["isi_ms"]    = stats["isi_mean"] * dt
         stats["axes"]      = swept
-        stats["dt"], stats["dt0"], stats["hazard"] = dt, dt0, HAZARD
+        stats["dt"], stats["dt0_anchor"], stats["hazard"] = dt, DT0_ANCHOR, HAZARD
         stats["steps"], stats["equi"], stats["T_u"] = steps, equi, T_u
         stats["tau_int"], stats["E_ratio"] = TAU_INT, E_RATIO
         stats["eps_Q"], stats["U_max_cap"] = EPS_Q, U_MAX_CAP
@@ -730,7 +760,7 @@ if run_lyap or run_plot:
 
     # Artifact first: a step-level 2-cycle has a large CV and a sustained spread, so every later
     # test would pass it, and none of them mean anything on a trajectory the map itself invents.
-    artifact = (stats["acf1"] < ALT_TOL) | (stats["max_rate"] > SAT_FRAC / stats["dt0"])
+    artifact = (stats["acf1"] < ALT_TOL) | (stats["max_rate"] > SAT_FRAC / stats["dt0_anchor"])
 
     label = torch.full(cv.shape, FIXED, dtype=torch.long)
     moving = (cv > CV_TOL) & ~artifact
@@ -757,7 +787,7 @@ if run_lyap or run_plot:
                   f"isiCV={stats['isi_cv'][ii]:.3f}  ISI={stats['isi_ms'][ii]:6.1f}ms  "
                   f"rate={stats['mean_rate'][ii]:.3e}/ms  n_pk={int(stats['pk_n'][ii])}")
         print("\nThese are candidates only: re-run them through wc-lyapunov.py and at "
-              "dt < dt0 before calling any of them chaos.")
+              "dt < DT0_ANCHOR before calling any of them chaos.")
     else:
         print("\nNo aperiodic cells -- every sustained orbit repeats its bursts.")
 
@@ -770,8 +800,8 @@ if run_lyap:
     # direction, so this is a confirmation pass over the top of the ranking and not a second
     # sweep. Ties in the ranking are broken by flat index, which is arbitrary but reproducible.
     N_CAND = 12
-    # dt0 is held at its production value while dt is refined, so these are three resolutions
-    # of ONE model. Refining dt0 with it would be a walk across a family of different models,
+    # DT0_ANCHOR is held at its production value while dt is refined, so these are three resolutions
+    # of ONE model. Refining DT0_ANCHOR with it would be a walk across a family of different models,
     # which is the mistake this model's two-timescale parametrisation exists to make visible.
     # The production dt and two refinements of it, always as a descending sequence from dt
     # itself: the question stage 2 answers is whether a sign survives refinement, so the
@@ -794,7 +824,7 @@ if run_lyap:
         cand  = {a: axes[a][sel[:, i]] for i, a in enumerate(AXES)}
 
         print(f"\nStage 2: Benettin spectra for the top {len(sel)} candidates, "
-              f"k={k_lyap}, at dt = {DTS} (dt0 = {dt0} throughout).")
+              f"k={k_lyap}, at dt = {DTS} (DT0_ANCHOR = {DT0_ANCHOR} throughout).")
         res = {}
         for dt_r in DTS:
             cols = translate_columns(cand["kappa"], cand["K_ref"],
@@ -808,7 +838,7 @@ if run_lyap:
                 P_Q[0], P_Q[1], 1/P_S[0], 1/P_S[1], P_THETA[0], P_THETA[1],
                 TAU_INT, TAU_INT, cols["tau_ref_E"], cols["tau_ref_I"],
                 cand["K_ref"], cand["K_ref"] if K_REF_I_ON else 0.0 * cand["K_ref"],
-                dt=dt_r, dt0=dt0, hazard=HAZARD, t_abs=T_ABS, Qm=[Q, Q], device=device)
+                dt=dt_r, nu0=NU0, hazard=HAZARD, t_abs=T_ABS, Qm=[Q, Q], device=device)
 
             mf.forward(int(EQUI_MS / dt_r), pb=False)  # state only; tangents here are waste
             gen = torch.Generator(device=device).manual_seed(0)
@@ -822,7 +852,7 @@ if run_lyap:
             del mf, blocks
             if device == 'cuda': torch.cuda.empty_cache()
 
-            print(f"\n  dt = {dt_r} (lam0*dt = {dt_r/dt0:.3g}), Qm = {Q}")
+            print(f"\n  dt = {dt_r} (lam0*dt = {dt_r/DT0_ANCHOR:.3g}), Qm = {Q}")
             for j in range(len(sel)):
                 l1, l2 = res[dt_r]["lam"][j, 0].item(), res[dt_r]["lam"][j, 1].item()
                 e1 = res[dt_r]["se"][j, 0].item()
@@ -832,7 +862,7 @@ if run_lyap:
                       f"{'   CHAOS' if chaos else ''}")
 
         CACHE_DIR.mkdir(exist_ok=True)
-        torch.save({"cand": cand, "sel": sel, "res": res, "dts": DTS, "dt0": dt0,
+        torch.save({"cand": cand, "sel": sel, "res": res, "dts": DTS, "dt0_anchor": DT0_ANCHOR,
                     "k": k_lyap, "U_max_ms": U_MAX_PILOT, "tol": LYAP_TOL}, CACHE_LYAP_FILE)
         print(f"\nSpectra saved to {CACHE_LYAP_FILE}.")
         print("A sign that does not survive the finest dt is a resolution artifact, not a "
