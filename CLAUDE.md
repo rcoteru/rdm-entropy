@@ -24,7 +24,7 @@ Code for P1, *Irreversibility in Integrate-and-Fire Neural Populations*: refract
 | `cache/` | Hashed `.pt` caches written by scripts |
 | `scripts/figures/` | Figures, auto-saved by scripts |
 | `agents/dumps/` | Result dumps, one Markdown file per run (spec below) |
-| `agents/briefs/` | Briefs dropped in from the vault: decisions the vault made that this repo can't see (prior/parameter/convention choices). Read the newest one before starting if present |
+| `agents/briefs/` | Briefs dropped in from the vault: decisions the vault made that this repo can't see (prior/parameter/convention choices). Read the newest one before starting if present, and write a dump when you are done with it, measurement or not (see Result dumps) |
 | `tests/` | Tests. Split fast/slow: `pytest` runs the fast suite (~40 s), `pytest -m slow` the convergence studies and large-N spin runs (~50 s). No test reads a cache; every oracle is a closed form, a second representation, or a literal in the test file |
 
 ## Model conventions (non-negotiable)
@@ -95,21 +95,28 @@ The saving is `rdme.plots.show()`, which every script calls in place of `plt.sho
 
 ## Result dumps
 
-One file per run in `agents/dumps/<YYYY-MM-DD>_<script>_<slug>.md`, written after the run finishes.
+One file in `agents/dumps/P1_<YYYY-MM-DD>_<script>_<slug>.md`. The `P1_` prefix is what the vault files it under; keep the filename identical on both sides, since `superseded_by:` and every cross-dump citation is by filename.
+
+**When to write one.** Two triggers, and the second is the one that gets forgotten:
+
+1. **Every measurement run**, after it finishes.
+2. **Every session that worked from a brief**, when that work is done -- *including a session that ran no measurement at all*. An API port, a test audit, a round of fixes, a commit: if a brief sent you here, the dump is how the result travels back, and it is written **before** your closing report, not instead of it. The report is a pointer to the dump plus whatever needs a decision; it is not a substitute, and the dump is not something to produce afterwards when asked. If the brief's checklist is only partly done, the dump is still written now, with the rest under Follow-ups -- one dump per brief-session, not one per finished brief.
+
+A non-measurement dump uses the same frontmatter and body, with the run-shaped fields filled honestly rather than dropped: `script:` is the command that stands in for the run (`pytest tests`, or the commit alone), `preset: n/a`, `overrides: {}`, `sweep: {}`, `figures: []`, and `status:` judged by the same rule (a dirty tree is at best `partial`). Results is what changed and what now holds; Checks is how you know it (the suite, a regression check, a hand check). `P1_2026-11-07_api-B_commit-blockers-landed.md` is the worked example.
 
 Dumps are **not committed** -- they are local run records, like the figures they embed, and travel to the vault by hand (`agents/` -- dumps and briefs -- is gitignored, and so is `scripts/figures/`). What the `commit:` field in the frontmatter pins down is the code the run used, which is what makes the dump reproducible without the dump itself being in the history.
 
-**A dump is never rewritten.** A re-run writes a new dump with `supersedes:`. The only edit allowed on an old dump is its frontmatter: `status: stale` (or `bug`) and `superseded_by:`.
+**A dump is never rewritten.** A re-run writes a new dump, and the only edit allowed on the old one is its frontmatter: `status: stale` (or `bug`) and `superseded_by: [<the new dump's filename>]`. Set it in the same session that writes the replacement -- the vault reads that field to mark every claim resting on the old dump **[stale]**, so a replacement that leaves it empty silently keeps a dead number alive.
 
 ### Frontmatter
 
 ```yaml
 ---
-script: scripts/S1-dt_conv.py
+script: scripts/S1-dt_conv.py   # or the stand-in command, for a dump that ran no measurement
 commit: 0ab4453          # append "-dirty" if the working tree had uncommitted changes
 date: 2026-11-05
 brief: agents/briefs/P1 2026-11-05 route-B API and re-runs.md   # omit if not run from a brief
-preset: S1
+preset: S1               # "n/a" when no model was run
 overrides: {J: 17}       # everything that differs from the preset, except the swept axes
 sweep: {dt: [1, 0.5, 0.25, 0.125]}
 hazard: poisson_exact
@@ -121,8 +128,7 @@ tolerance: 1e-10         # age-grid tolerance
 cache: [cache/S1-dt_conv_a6421594.pt]
 figures: [2026-11-05_S1-dt_conv_rate.png]
 status: measured         # measured | partial | stale | bug
-supersedes: []
-superseded_by: []
+superseded_by: []        # set on the OLD dump when a re-run replaces it, never on this one
 ---
 ```
 
