@@ -2,9 +2,16 @@
 
 Code for P1, *Irreversibility in Integrate-and-Fire Neural Populations*: refractory density method (RDM) + mean-field entropy production rate (EPR) for SRM₀ populations, and microscopic spin simulations to check it.
 
+## Principles
+
+1. **State assumptions, don't silently pick one.** If a request has more than one reasonable reading, or conflicts with a convention below, say so and ask rather than guessing.
+2. **Minimum code for the task.** No speculative features, abstractions for single-use code, configurability nobody asked for, or error handling for scenarios that can't happen.
+3. **Touch only what the task needs.** Don't refactor or "improve" adjacent code, comments or formatting; match existing style; remove only the imports/variables your own change orphaned, and mention (don't delete) unrelated dead code you notice.
+4. **Define done before starting.** Multi-step or bug-fix tasks get a verification step stated up front (the test that reproduces the bug, the check that proves the fix) and run before reporting the task complete.
+
 ## Scope: stay in this repo
 
-- Work only inside `~/code/rdm-entropy`. **Never write to the Obsidian vault** (`~/code/research-notes`); results are copied across by hand.
+- Work only inside this repository. **Never write to the notes vault** that tracks this project (a separate, private repo); results are copied across by hand. `agents/briefs/` (below) is the one channel from the vault into this repo — read it, never write back through it.
 - Your output is code, figures and **result dumps** (below). No interpretation, framing or literature. What the numbers *mean* for the paper is decided in the vault.
 - Commit only when asked. The repo may be mid-refactor: never stash, reset or revert changes you didn't make.
 
@@ -15,43 +22,55 @@ Code for P1, *Irreversibility in Integrate-and-Fire Neural Populations*: refract
 | `src/rdme/` | Library: `rdm.py`, `rdm_batch.py`, `rdm_single.py` (RDM), `spin_model.py` (microscopic), `hazards.py`, `kernels.py`, `epr.py`, `fixed_points.py`, `lyapunov.py` |
 | `scripts/` | One script per study. Naming: `<system>-<study>.py` |
 | `cache/` | Hashed `.pt` caches written by scripts |
-| `scripts/dumps/` | Result dumps, one Markdown file per run (spec below) |
 | `scripts/figures/` | Figures, auto-saved by scripts |
-| `tests/` | Tests |
+| `agents/dumps/` | Result dumps, one Markdown file per run (spec below) |
+| `agents/briefs/` | Briefs dropped in from the vault: decisions the vault made that this repo can't see (prior/parameter/convention choices). Read the newest one before starting if present |
+| `tests/` | Tests. Split fast/slow: `pytest` runs the fast suite (~40 s), `pytest -m slow` the convergence studies and large-N spin runs (~50 s). No test reads a cache; every oracle is a closed form, a second representation, or a literal in the test file |
 
 ## Model conventions (non-negotiable)
 
-- **`dt0` vs `dt`.** `dt0` is the model's time quantum (λ₀ = 1/`dt0`), part of the model and fixed within a study. `dt` is the solver step and defaults to `dt0`. Both are **keyword-only**. **Never pass `dt0=dt`**: refining `dt` with `dt0` dragged along walks through different models, it doesn't converge to one.
-- **`t_abs`** (absolute refractory window) defaults to `dt0`. Leave it there unless the study is about it.
+- **`nu0`, `t_abs`, `dt`.** There is no time quantum and no `dt0` (route B, 2026-11-07). `nu0` is the **rate unit** of the Poisson reference measure, fixed at 1 ms⁻¹: it is not identifiable on its own, since (ν₀, θ) → (ν₀e^{βδ}, θ+δ) leaves Φ unchanged, so only ν₀e^{−βθ} is a parameter. `t_abs` is the **physical dead time** in ms, default 1 ms, and under an exponential hazard it is the *only* thing that caps the realised rate (at 1/`t_abs`); `t_abs = 0` has to be asked for explicitly and means no ceiling. `dt` is the **solver step** and nothing else — it is **required**, with no default, and is keyword-only along with the rest.
+- **`dt` must divide `t_abs`.** `kernels.n_abs_bins` refuses a `dt` above `t_abs` or one that does not divide it: a window that rounds moves with the step, which is the one thing an absolute refractory period must not do. With `t_abs` = 1 ms the admissible steps are 1, 1/2, 1/4, … — which is what the (`dt`, `dt`/2) Richardson pairs walk down.
 - **Couplings act on rates:** $I = \sum_b w^{ab} r^b + E$, with $r = m/dt$ in 1/ms. Pass `J`, never `J/dt`.
-- **Reporting rule:** every number is either labelled `dt = dt0` (the discrete model) or comes with a `dt → 0` check, preferably Richardson-extrapolated, reporting the `dt` pair it came from and the observed order. Nothing in between.
+- **Reporting rule:** every number comes with a `dt → 0` check. The default is **Richardson extrapolation from a coarse pair (`dt`, `dt`/2)** with `poisson_exact`, reporting the pair it came from and the observed order. There is no second case: the discrete model it used to be contrasted with no longer exists. Run the extrapolation on `poisson_exact` only — `poisson`'s per-bin error changes sign at threshold, so Richardson on it fails on an attractor that crosses one; quote `poisson` at a stated `dt`, or extrapolate the solver and compare.
+- **Step validity:** `poisson` needs c = ν₀·`dt` < 1 (strictly); `bernoulli` needs ν₀·`dt` ≤ 1; `poisson_exact` has no arithmetic cap, and its step is set by accuracy alone — the local relative error is λ`dt`/2 at the peak rate (`hazards.step_error`, `hazards.check_accuracy`), read off the attractor rather than from ν₀.
 - **Units:** time in ms, rates in 1/ms, σ in nats/ms (σ/dt per step → per ms).
 - **Durations in ms, never in steps.** Equilibration, recording and any trimmed window are set as physical durations (`T_EQUI`, `T_MEAS`, `SKIP_MS`, …) and converted with `helpers.n_steps(ms, dt)`. A step count means a different window at every `dt`, so refining `dt` on a fixed step count silently shortens what is measured, and two scripts at different `dt` cannot be compared by the numbers at the top of them. The duration, not the step count, goes in the cache key and in the dump. Plot time axes are in ms for the same reason (`rdme.plots` takes `dt` and labels in ms; a figure without `dt` falls back to steps).
-- **EPR:** report σ. The forward/reverse terms H and H̃ diverge as rate·ln(1/dt); report them only as a control (increment per halving → r ln 2).
+- **EPR:** report σ. The forward/reverse terms H and H̃ diverge as rate·ln(1/`dt`) against a counting measure, so report them **relative to the Poisson reference** (`epr.poisson_reference_entropy`), which is finite as `dt` → 0 and is the model's own reference measure under route B. Record both: raw (as the control — increment per halving → r ln 2) and referenced. σ is unchanged by the referencing, both halves subtracting the same offset.
 - **Oscillatory states:** average over whole cycles (between upward mean-crossings), not over a fixed window.
 - **Age grid:** size it by the tolerance (truncation-error bound), not by a fixed Q. An undersized grid can give a different attractor.
-- **Step artifact:** at strong drive and `dt = dt0`, check lag-1 autocorrelation of the rate. −1 means the whole population fires in alternate bins; refine `dt`.
+- **Step artifact:** at strong drive and a coarse `dt`, check lag-1 autocorrelation of the rate. −1 means the whole population fires in alternate bins; refine `dt`. `max_step_prob()` is the companion diagnostic — the realised max Φ along a trajectory, which is what says whether the step resolves an unbounded hazard.
 
 ## Hazard
 
-**Default hazard: TBD** (to be set after the 2026-11-04 meeting; most likely route B, the Poisson prior: `poisson` = the MaxCal model kernel at each bin, `exp_surv` = exact-survival solver for the same continuum). Until then, every script states its hazard explicitly. Never mix hazards within one comparison. The hazard is **not** part of a preset; it is its own axis.
+**Route B, the Poisson reference, is the model** (decided 2026-11-07). Three kernel keys, hard-renamed with no aliases:
+
+| Key | Φ per bin | rate | What it is |
+|---|---|---|---|
+| `poisson` | σ(βh + ℓ), ℓ = logit(c), c = ν₀·`dt` | ν₀e^{βh} | MaxCal against the reference at **every** bin width: the model of binned data |
+| `poisson_exact` | 1 − exp(−ν₀e^{βh}`dt`) | ν₀e^{βh} | Exact survival for the **same** continuum: the solver, and the **default hazard** |
+| `bernoulli` | ν₀·`dt`·σ(βh) | ν₀σ(βh) | Route A, the legacy construction. Comparison and equivalence claims only — never the hazard of a measurement |
+
+`poisson` and `poisson_exact` share a rate function *as the same object*, which is how one reads off that they are one model under two discretization maps. `poisson_exact` is the default (`hazards.DEFAULT_HAZARD`) because its per-bin error is single-signed and its convergence monotone, which is what a `dt → 0` limit is taken with.
+
+Every script still states its hazard explicitly — it is its own axis, not part of a preset, and the dump's frontmatter has to carry it. Never mix hazards within one comparison.
 
 ## Parameter presets
 
 Every run starts from a **named preset** plus explicit overrides. No unnamed parameter sets: if a run differs from a preset in anything other than the swept axes and listed overrides, it is a new preset and gets added here and in `src/rdme/presets.py`.
 
-`src/rdme/presets.py` holds them as `PRESETS: dict[str, dict]` of model kwargs, including `dt0` and `t_abs`. This table is the spec; keep the two in sync. A script builds its run with one call:
+`src/rdme/presets.py` holds them as `PRESETS: dict[str, dict]` of model kwargs, including `nu0` and `t_abs`. This table is the spec; keep the two in sync. A script builds its run with one call:
 
 ```python
 PRESET = "S1"
 HAZARD = "poisson"       # stated per script: the hazard is its own axis, not part of a preset
 
-PARAMS = pre.params(PRESET, hazard=HAZARD, J=torch.linspace(0, 20, 300), dt=0.2)
-banner = pre.banner(PRESET, PARAMS)      # "S1 · hazard=poisson · dt=0.2 (dt0=1) — E=0, β=6, …"
+PARAMS = pre.params(PRESET, hazard=HAZARD, J=torch.linspace(0, 20, 300), dt=0.25)
+banner = pre.banner(PRESET, PARAMS)      # "S1 · hazard=poisson · dt=0.25 · t_abs=1 ms — E=0, β=6, …"
 ```
 
-- `params(name, *, hazard, **overrides)`: the preset, the hazard (**required** — there is no `DEFAULT_HAZARD` until the convention is fixed) and the overrides. An override that is neither a model parameter of that preset nor a solver key (`dt`, `Qm`, `eps`, `device`, `N`, `ic`) raises: a typo is not something to find in the figure, and a genuinely new parameter means a new preset.
-- `t_abs` is stored as `None`, the model's own default (= `dt0`), so overriding `dt0` carries the window with it.
+- `params(name, *, hazard, **overrides)`: the preset, the hazard (falls back to `hazards.DEFAULT_HAZARD`) and the overrides. **`dt` is required**: there is no quantum to default to, so a run that has not named its step has not said how it was solved. An override that is neither a model parameter of that preset nor a solver key (`dt`, `Qm`, `eps`, `device`, `N`, `ic`) raises: a typo is not something to find in the figure, and a genuinely new parameter means a new preset.
+- `nu0` and `t_abs` are stored as numbers (1 ms⁻¹ and 1 ms), in physical units, and do not move when `dt` does.
 - Named points (`POINTS`) are a preset plus the coupling that makes it a system: `params("S1/fp")` is `S1` with J = 10.
 - `diff(name, params)` returns the `overrides:` field for a dump's frontmatter, built from the dict that built the model rather than retyped; `banner(name, params)` is the figure line CLAUDE.md asks for.
 - `PENDING` holds the two-population names that are **not encoded yet** (`EI`, `EE-P`); asking for one raises with the reason.
@@ -60,13 +79,13 @@ Wired so far: the four `ising_1Dscan_*.py` scripts. Everything else still carrie
 
 | Preset | Pops | Parameters | Notes |
 |---|---|---|---|
-| `S1` | 1 | E = 0, β = 6, θ = 0.5, τ_int = 15, τ_ref = 15, K_ref = 15, `dt0` = 1, `t_abs` = `dt0` | Main one-population system (formerly "Ising set"). Self-sustained activity, no drive. Named points: `S1/fp` (J = 10). Cycle point to be re-chosen under the new hazard (its Hopf moves to J ≈ 14.4–14.6 under route B; J = 17 is the candidate) |
-| `S1-sat` | 1 | E = 0, β = 8, θ = 0.5, τ_int = 10, τ_ref = 25, K_ref = 25, `dt0` = 1, J = 40 | Formerly "low-β point". The rate-ceiling test (peaks at 100% λ₀ under the sigmoid kernel). Old runs used `dt0` = 0.5 and 1 inconsistently; use `dt0` = 1 |
-| `D1` | 1 | E = 0.9, β = 30, θ = 1, τ_int = 20, τ_ref = 3, K_ref = 0, `dt0` = 0.5 | Legacy driven high-β set. Only to reproduce old figures |
-| `EI` | 2 | E = 1, β = 30, θ = 1, τ_int = 20, τ_ref = 3, K_ref = 0, E_ratio = 0.8, w_IE = −6, w_II = −1, `dt0` = 1 | From `wc-EEEI_sweep.py`; **to be confirmed**. `wc-mf_vs_sm.py` has two other E–I sets: reconcile or name them |
-| `EE-P` | 2 | Painchaud et al. 2022 mapping, built in `wc-painchaud.py`, `dt0` = 0.5 | Painchaud cell. The τ_m mapping may change |
+| `S1` | 1 | E = 0, β = 6, θ = 0.5, τ_int = 15, τ_ref = 15, K_ref = 15, `nu0` = 1, `t_abs` = 1 | Main one-population system (formerly "Ising set"). Self-sustained activity, no drive. Named points: `S1/fp` (J = 10). Cycle point to be re-chosen from a converged scan (the Hopf sits at J ≈ 14.4–14.6 under route B, against 12.06 with the legacy sigmoid kernel; J = 17 is the candidate) |
+| `S1-sat` | 1 | E = 0, β = 8, θ = 0.5, τ_int = 10, τ_ref = 25, K_ref = 25, `nu0` = 1, `t_abs` = 1, J = 40 | Formerly "low-β point". The rate-ceiling test. Under route B the ceiling is the dead time, not the kernel, so the realised rate should sit at 1/`t_abs` |
+| `D1` | 1 | E = 0.9, β = 30, θ = 1, τ_int = 20, τ_ref = 3, K_ref = 0, `nu0` = 1, `t_abs` = 1 | Legacy driven high-β set. Only to reproduce old figures, which were route A at `dt0` = 0.5, i.e. `bernoulli` at `dt` = 0.5 with `nu0` = 2 — state both |
+| `EI` | 2 | E = 1, β = 30, θ = 1, τ_int = 20, τ_ref = 3, K_ref = 0, E_ratio = 0.8, w_IE = −6, w_II = −1 | From `wc-EEEI_sweep.py`; **to be confirmed**. `wc-mf_vs_sm.py` has two other E–I sets: reconcile or name them |
+| `EE-P` | 2 | Painchaud et al. 2022 mapping, built in `wc-painchaud.py` | Painchaud cell. The mapping needs a new time-unit anchor under route B — it was anchored on the rate ceiling, which route B does not have |
 
-Known violations to fix: `wc-EEII_sweep.py` and `wc-lyapunov.py` pass `dt0=dt`; `ising_2Dscan_EJ.py` uses θ = 1.0 (not `S1`); `ising_mf-vs-sm.py` uses three unnamed combinations; `ising_1Dscan_beta.py` still says "Hopf at J ~ 14.5" (it is 12.06 at `dt = dt0` with the sigmoid kernel); `wc-EEEI_sweep.py` mentions the removed `"sync"` hazard.
+**Every script in `scripts/` is unported** as of 2026-11-07: they all still pass `dt0=`, and most carry their own parameter dict rather than a preset. Porting them is one job, not several, and it folds in the violations recorded before the rename: `wc-EEII_sweep.py` and `wc-lyapunov.py` passed `dt0=dt`; `ising_2Dscan_EJ.py` uses θ = 1.0 (not `S1`); `ising_mf-vs-sm.py` uses three unnamed combinations; `wc-EEEI_sweep.py` mentions the removed `"sync"` hazard. Rename each to `<preset>-<study>.py` at the same time.
 
 ## Figures
 
@@ -76,9 +95,9 @@ The saving is `rdme.plots.show()`, which every script calls in place of `plt.sho
 
 ## Result dumps
 
-One file per run in `scripts/dumps/<YYYY-MM-DD>_<script>_<slug>.md`, written after the run finishes.
+One file per run in `agents/dumps/<YYYY-MM-DD>_<script>_<slug>.md`, written after the run finishes.
 
-Dumps are **not committed** -- they are local run records, like the figures beside them, and travel to the vault by hand. `scripts/dumps/` and `scripts/figures/` are both gitignored. What the `commit:` field in the frontmatter pins down is the code the run used, which is what makes the dump reproducible without the dump itself being in the history.
+Dumps are **not committed** -- they are local run records, like the figures they embed, and travel to the vault by hand (`agents/` -- dumps and briefs -- is gitignored, and so is `scripts/figures/`). What the `commit:` field in the frontmatter pins down is the code the run used, which is what makes the dump reproducible without the dump itself being in the history.
 
 **A dump is never rewritten.** A re-run writes a new dump with `supersedes:`. The only edit allowed on an old dump is its frontmatter: `status: stale` (or `bug`) and `superseded_by:`.
 
@@ -89,10 +108,13 @@ Dumps are **not committed** -- they are local run records, like the figures besi
 script: scripts/S1-dt_conv.py
 commit: 0ab4453          # append "-dirty" if the working tree had uncommitted changes
 date: 2026-11-05
+brief: agents/briefs/P1 2026-11-05 route-B API and re-runs.md   # omit if not run from a brief
 preset: S1
 overrides: {J: 17}       # everything that differs from the preset, except the swept axes
 sweep: {dt: [1, 0.5, 0.25, 0.125]}
-hazard: exp_surv
+hazard: poisson_exact
+nu0: 1                   # rate unit, 1/ms
+t_abs: 1                 # dead time, ms -- dt must divide it
 N: mf                    # "mf", or the list of N for spin simulations
 seeds: [0, 1]
 tolerance: 1e-10         # age-grid tolerance
@@ -106,10 +128,10 @@ superseded_by: []
 
 ### Body
 
-1. **Question**: one line, what the run answers.
+1. **Question**: one line, what the run answers. If run from a brief, name it (`brief:` in the frontmatter) rather than restating its decisions here.
 2. **Reproduce**: the exact command.
-3. **Results**: tables with units. Every number carries its `dt` (or "dt → 0, Richardson from (dt₁, dt₂), order p"). Embed figures as `![[<figure filename>]]`.
-4. **Checks**: convergence orders, numerical floors, the H control (−r ln 2 per halving), grid tolerance, lag-1 autocorrelation where relevant, MF vs spins agreement if both ran.
+3. **Results**: tables with units. Every number is a `dt → 0` value and says where it came from: "Richardson from (dt₁, dt₂), order p". Embed figures as `![[<figure filename>]]`.
+4. **Checks**: convergence orders, numerical floors, the H control (+r ln 2 per halving on the raw pair) alongside the Poisson-referenced H, grid tolerance, the λ`dt`/2 step bound at the peak rate, lag-1 autocorrelation where relevant, MF vs spins agreement if both ran.
 5. **Caveats**: what is not converged, what is near a floor, what differs from earlier runs (link the old dump by filename).
 6. **Follow-ups**: checkboxes, each with exactly one tag: `- [ ] #run ...` (numerical work) or `- [ ] #code ...` (code chores).
 

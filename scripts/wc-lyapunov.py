@@ -55,7 +55,8 @@ import tqdm
 
 import rdme.kernels as krn
 import rdme.lyapunov as lyap
-from rdme.batch import RDMWilsonCowanPoints, flatten_param_grid, unflatten_batch
+import rdme.plots as rp
+from rdme.rdm_batch import RDMWilsonCowanPoints, flatten_param_grid, unflatten_batch
 
 
 # ── Cache paths ───────────────────────────────────────────────────────────────
@@ -150,7 +151,7 @@ if run_sim:
                 E_ratio, flat["w_EE"][sl], gc*rho, -gc/rho, flat["w_II"][sl],
                 flat["E_ext"][sl], flat["E_ext"][sl], beta, beta, theta, theta,
                 tau_int_E, tau_int_I, tau_ref, tau_ref, K_ref_E, K_ref_I,
-                dt=dt, hazard="synchronous", Qm=Qm, device=device)
+                dt0=dt, hazard="async", Qm=Qm, device=device)
 
             mf.forward(equi, pb=False)          # state only: tangents here would be wasted
             blocks = mf.init_tangent(k, generator=gen)
@@ -211,7 +212,11 @@ if run_plot:
     print(f"\nCell counts by class ({label.numel()} total): {counts}")
     print(f"unequilibrated (stage-1 decaying/growing): {int(unequilibrated.sum())}")
     print(f"degenerate leading pair: {int(res['degenerate'][..., 0].sum())}")
-    print(f"|lam|*dt >= 0.1 (lam/dt not a rate):      {int((~res['valid']).sum())}")
+    # map regime here (dt = dt0), so this flag still means something: a direction whose
+    # per-step contraction is O(1) is not resolved by the step. At dt < dt0 it would pass
+    # vacuously -- see Spectrum.valid.
+    print(f"|lam|*dt >= 0.1 (step does not resolve the direction): "
+          f"{int((~res['valid']).sum())}")
     se1 = res["se"][..., 0]
     print(f"\ntol = {tol:.1e} /ms (floor) over T = {res['T_ms']:.0f} ms; "
           f"SE of lam_1: median {se1.median():.1e}, 90th pct {se1.flatten().quantile(0.9):.1e}")
@@ -280,4 +285,4 @@ if run_plot:
     ax.set_xlabel(labels["w_EE"]); ax.set_ylabel(labels["E_ext"])
     fig.tight_layout()
 
-    plt.show()
+    rp.show()

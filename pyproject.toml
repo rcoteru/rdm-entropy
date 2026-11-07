@@ -1,6 +1,29 @@
 [project]
-name = "rdme"
+name = "rdm-entropy"
 version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Raúl Coterillo", email = "rcoterillo@bcamath.org" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "torch>=2.15.0",
+    "tqdm>=4.70.1",
+]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "rdme"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: convergence studies and large-N spin runs; deselected by default"]
+addopts = "-m 'not slow'"

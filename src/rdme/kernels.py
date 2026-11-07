@@ -33,11 +33,33 @@ def n_abs_bins(t_abs: float, dt: float) -> int:
     nominal t_abs = 1 ms at dt = 0.5, 0.2, 0.1. A dead time that depends on dt is not an
     absolute refractory period.
 
-    At t_abs = dt this returns 0, i.e. no blocking, which is the identity the whole mechanism
-    rests on: with t_abs = dt0 the window is INVISIBLE at the baseline dt = dt0 and switches on
-    only as dt is refined below it. It therefore does not change the discrete model; it is what
-    makes refining dt refine that model rather than a different one. """
-    return max(int(round(t_abs / dt)) - 1, 0)
+    Two guards, both for that same failure. dt > t_abs is refused: the expression would go
+    negative, and there is no way to represent a dead time shorter than one bin -- the realised
+    one would be dt, i.e. the solver step, which is exactly the dt-dependent window this is
+    here to prevent. A t_abs that is not an integer number of bins is refused for the same
+    reason: it rounds, and a window that rounds moves with dt. Refine dt onto a divisor of
+    t_abs instead (with t_abs = 1 ms, dt = 1, 1/2, 1/4, ... all divide it, which is what the
+    (dt, dt/2) Richardson pairs are built from).
+
+    t_abs = 0 is the one exemption and returns 0: no window at all, the plain exponential
+    kernel, and an unbounded realised rate under an exponential hazard. It has to be asked for
+    explicitly. """
+    if t_abs == 0.0:
+        return 0
+    if not t_abs > 0.0:
+        raise ValueError(f"t_abs must be non-negative, got {t_abs}")
+    if dt > t_abs * (1.0 + 1e-9):
+        raise ValueError(
+            f"dt={dt:g} ms exceeds t_abs={t_abs:g} ms: the dead time cannot be shorter than "
+            "one solver step, and rounding it to one would make the window move with dt. "
+            "Refine dt to a divisor of t_abs, or set t_abs=0 for no window.")
+    ratio = t_abs / dt
+    if abs(ratio - round(ratio)) > 1e-9 * max(1.0, abs(ratio)):
+        raise ValueError(
+            f"t_abs={t_abs:g} ms is not an integer number of dt={dt:g} ms bins "
+            f"(t_abs/dt = {ratio:.12g}): the window would round, and a dead time that rounds "
+            "moves with the solver step. Pick dt as a divisor of t_abs.")
+    return max(int(round(ratio)) - 1, 0)
 
 
 def abs_refractory_floor(w: torch.Tensor,        # (M, M) weights, row = target
@@ -61,17 +83,27 @@ def abs_refractory_floor(w: torch.Tensor,        # (M, M) weights, row = target
 
     S_max is bounded self-consistently. The window itself caps the rate at r_max = 1/t_abs, so
     S_max <= sum_b max(w_ab, 0) * r_max + max(E_a, 0) -- the argument closes on itself, which
-    is why this works for an unbounded hazard like "escape" as well as for "async".
+    is why this works for the unbounded route-B kernels as well as for "bernoulli".
 
-    It also covers "poisson", whose rate is exponential rather than linear in the field, and
-    that is worth checking rather than assuming: an exponential outruns a softplus, so a rule
-    sized on the latter need not hold for the former. It does here because the margin is a
-    bound on the FIELD and not on the rate -- the floor puts beta*h at -margin, where the
-    growth of the rate function is irrelevant and all three kernels sit on the same Arrhenius
-    tail. Measured at margin = 40, beta = 6: Phi = 4.2e-18 for async and escape and
-    2.1e-18 for poisson at dt = dt0 (the reference log-odds only ever shift the field DOWN,
-    ell <= 0 for dt <= dt0, so poisson is the mildest of the three here, not the worst), and
-    Phi falls by a further decade or two as dt refines. """
+    That the rule covers "poisson" and "poisson_exact", whose rate is exponential rather than
+    linear in the field, is worth checking rather than assuming: an exponential outruns a
+    softplus, so a rule sized on the latter need not hold for the former. It does here because
+    the margin is a bound on the FIELD and not on the rate -- the floor puts beta*h at
+    -margin, where the growth of the rate function is irrelevant and every kernel sits on the
+    same Arrhenius tail. At margin = 40 the residual per-bin probability is of order
+    e^{-40} * nu0*dt, i.e. below 4e-18 for every dt <= 1 ms at nu0 = 1/ms, and it falls
+    linearly with dt as the step refines. The reference log-odds of "poisson" only ever shift
+    the field DOWN (ell < 0 for c < 1/2), so that kernel is the mildest of the three here
+    rather than the worst.
+
+    Requires beta > 0: at zero gain the hazard does not depend on the field at all, so no
+    finite floor suppresses firing and margin/beta is +inf -- which then reaches the hazard
+    as beta*h = 0 * -inf = nan. Raised here rather than returned as inf, because a nan born
+    in the first step only shows up much later, as a nan truncation_error. """
+    if not bool((beta > 0).all()):
+        raise ValueError("abs_refractory_floor needs beta > 0 everywhere; the absolute "
+                         "refractory window is undefined at zero gain (got min beta = "
+                         f"{float(beta.min()):g}).")
     S_max = w.clamp_min(0.0).sum(dim=-1) * r_max + E.clamp_min(0.0)
     return (S_max - theta + margin / beta).clamp_min(margin / beta)
 
@@ -84,7 +116,8 @@ def refractory_kernel(Q: int, K, tau_r, dt: float = 1.0,
         R(u) = -K exp(-u/tau_r),          u >= t_abs
              = -R_abs,                    u <  t_abs
 
-    t_abs = 0 (the default) is the plain exponential kernel and the historical behaviour.
+    t_abs = 0 is the plain exponential kernel, the pre-window behaviour, and an explicit
+    choice to run with no rate ceiling at all; the model classes default to 1 ms instead.
 
     Why the window exists at all, in two independent senses:
 
@@ -97,15 +130,17 @@ def refractory_kernel(Q: int, K, tau_r, dt: float = 1.0,
        enough not to be overwhelmed" is a statement about the drive range. A hard window is
        drive-independent, which is the point.
 
-    2. CONSISTENCY UNDER REFINEMENT, which is why t_abs defaults to dt0 in the model classes.
-       The model is defined on binary spike trains binned at dt0, and such a train cannot carry
-       two spikes closer than dt0. Nothing in the hazard enforces that: "async" caps the RATE
-       at lam0 = 1/dt0 but not the interval, so refining dt below dt0 admits ISIs of dt. The
-       cost is not marginal -- measured in the spin model at dt0 = 1 ms with weak
-       refractoriness and strong drive, 25%, 51% and 56% of all interspike intervals fall below
-       dt0 at dt = 0.5, 0.2 and 0.1, and the population rate inflates from 0.67 to 0.90 /ms.
-       Setting t_abs = dt0 restores the floor exactly and costs nothing at dt = dt0, where the
-       window is empty (see n_abs_bins).
+    2. WELL-POSEDNESS UNDER AN EXPONENTIAL HAZARD, which is why t_abs is a parameter of the
+       model in its own right (1 ms by default) rather than a shadow of the solver step. The
+       route-B rate nu0 e^{beta*h} is unbounded, so nothing in the kernel caps how fast a
+       cohort fires; the dead time does, at 1/t_abs, and it is the ONLY thing that does. Taken
+       to zero, the realised rate grows without bound with the drive -- measured in the spin
+       model with weak refractoriness and strong drive, 25%, 51% and 56% of all interspike
+       intervals fall below 1 ms at dt = 0.5, 0.2 and 0.1, with the population rate inflating
+       from 0.67 to 0.90 /ms as the step is refined. With t_abs fixed in ms the same run gives
+       the same dead time at every dt, which is what makes the dt -> 0 limit a limit of one
+       model rather than of a family of them. n_abs_bins refuses a dt that does not divide
+       t_abs, for that reason.
 
     This is also the standard SRM treatment, where eta(u) is taken to -infinity below the
     absolute refractory period. Since the kernel enters the model only through S + R - theta,
@@ -187,7 +222,7 @@ def q_from_rate(rate: float, dt: float, eps: float = 0.01,
 
     which is worth it when the dead time dominates the interval -- a strongly refractory
     population at a modest rate, where the Poisson bound overshoots by a factor of a few. The
-    recovered hazard is lam_inf = lam0 * sigma(beta*(S - theta)) for hazard='async' at the
+    recovered hazard is lam_inf = nu0 * exp(beta*(S - theta)) for the route-B kernels at the
     operating point, i.e. the hazard of the oldest bin, which `RDMNetwork.firing_prob()[a][-1]`
     reports directly as a per-bin probability.
 

@@ -488,6 +488,7 @@ if run_plot:
         fig, axs = plt.subplots(len(shown), 2, squeeze=False,
                                 figsize=(11, 4.4 * sum(heights)),
                                 gridspec_kw=dict(height_ratios=heights))
+        fig.set_label(key)          # the figure's filename slug; the suptitle is a sentence
         for i, name in enumerate(shown):
             ax_v, ax_e = axs[i]
 
@@ -541,6 +542,7 @@ if run_plot:
     # curves that converge: it says the EPR machinery is reporting what the theory says it
     # should, in the one place where "stops moving" would have been the wrong answer.
     fig, (ax_h, ax_q) = plt.subplots(1, 2, figsize=(12, 4.8))
+    fig.set_label('H-control')
     styles = {"fixed point": (':', 's'), "limit cycle": ('-', 'o')}
 
     for h in HAZARDS:

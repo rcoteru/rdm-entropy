@@ -32,9 +32,11 @@ def test_every_preset_keys_are_model_parameters(name):
 @pytest.mark.parametrize("name", ONE_POP)
 @pytest.mark.parametrize("hazard", sorted(HAZARDS))
 def test_every_preset_builds_and_runs(name, hazard):
-    """ Both models, at dt = dt0, for a handful of steps: a preset that cannot be handed to a
-    constructor is not a preset. J is supplied for the sets that sweep it. """
-    p = pre.params(name, hazard=hazard, **({} if "J" in pre.resolve(name) else {"J": 10.0}))
+    """ Both models, at a step every kernel admits, for a handful of steps: a preset that
+    cannot be handed to a constructor is not a preset. J is supplied for the sets that sweep
+    it, and dt = 0.5 divides every preset's t_abs. """
+    p = pre.params(name, hazard=hazard, dt=0.5,
+                   **({} if "J" in pre.resolve(name) else {"J": 10.0}))
 
     mf = RDMIsingModel(**p, device="cpu")
     mf.forward(5, pb=False)
@@ -55,20 +57,30 @@ def test_resolve_returns_a_copy():
     assert pre.PRESETS["S1"]["beta"] != 999.0
 
 
-def test_hazard_is_required_while_the_convention_is_open():
-    assert pre.DEFAULT_HAZARD is None, "set DEFAULT_HAZARD and relax this test"
-    with pytest.raises(ValueError, match="hazard"):
-        pre.params("S1", J=10.0)
+def test_the_default_hazard_is_the_route_b_solver():
+    """ The hazard is still its own axis -- every script states it -- but a run that does not
+    gets the kernel a dt -> 0 limit is taken with, not an arbitrary one. """
+    assert pre.DEFAULT_HAZARD == "poisson_exact"
+    assert pre.params("S1", J=10.0, dt=0.5)["hazard"] == "poisson_exact"
+
+
+def test_a_run_must_state_its_step():
+    """ D7. Under route B there is no time quantum to default to, so dt is the one solver key
+    params() insists on: a run that has not named its step has not said how it was solved,
+    and the dump has nothing to record. """
+    with pytest.raises(ValueError, match="needs dt="):
+        pre.params("S1", hazard="poisson_exact", J=10.0)
 
 
 def test_a_typo_is_rejected_rather_than_passed_on():
     with pytest.raises(TypeError, match="tau_m"):
-        pre.params("S1", hazard="poisson", J=10.0, tau_m=20.0)
+        pre.params("S1", hazard="poisson", J=10.0, dt=0.5, tau_m=20.0)
 
 
 def test_solver_keys_pass_through():
     p = pre.params("S1", hazard="poisson", J=10.0, dt=0.25, device="cpu")
-    assert p["dt"] == 0.25 and p["device"] == "cpu" and p["dt0"] == 1.0
+    assert p["dt"] == 0.25 and p["device"] == "cpu"
+    assert p["nu0"] == 1.0 and p["t_abs"] == 1.0
 
 
 def test_pending_presets_say_why():
@@ -76,11 +88,16 @@ def test_pending_presets_say_why():
         pre.resolve("EI")
 
 
-def test_t_abs_defaults_to_dt0_through_the_model():
-    """ t_abs=None in a preset is the model's own default, which is dt0 -- so overriding dt0
-    carries the window, which a hardcoded number would not. """
-    mf = RDMIsingModel(**pre.params("S1", hazard="poisson", J=10.0, dt0=0.5), device="cpu")
-    assert mf.t_abs == pytest.approx(0.5)
+def test_t_abs_is_a_physical_parameter_that_the_step_does_not_move():
+    """ Under route B the dead time is 1 ms whatever dt is, which is what makes a dt -> 0
+    limit a limit of one model. It reaches the model, and it reaches the age grid as a
+    different number of BINS at each step, which is the same window either way. """
+    for dt, n_abs in ((1.0, 0), (0.5, 1), (0.25, 3)):
+        mf = RDMIsingModel(**pre.params("S1", hazard="poisson_exact", J=10.0, dt=dt),
+                           device="cpu")
+        assert mf.t_abs == pytest.approx(1.0)
+        assert mf.n_abs == n_abs
+        assert (mf.n_abs + 1) * mf.dt == pytest.approx(mf.t_abs)
 
 
 def test_diff_reports_only_what_differs():
@@ -90,4 +107,4 @@ def test_diff_reports_only_what_differs():
 
 def test_banner_states_preset_hazard_and_dt():
     line = pre.banner("S1/fp", pre.params("S1/fp", hazard="poisson", dt=0.2))
-    assert "S1/fp" in line and "poisson" in line and "dt=0.2" in line and "dt0=1" in line
+    assert "S1/fp" in line and "poisson" in line and "dt=0.2" in line and "t_abs=1" in line

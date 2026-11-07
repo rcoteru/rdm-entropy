@@ -8,9 +8,9 @@ import torch
 """ Per-bin firing kernels and the rates they represent.
 
 Model-independent: everything here is a pure function of the field h, the gain beta, the rate
-calibration lam0 and the step dt. Nothing knows about populations, age distributions or
-networks, the same way the root finders in rdme.fixed_points know nothing about the
-model whose roots they locate.
+unit nu0 and the step dt. Nothing knows about populations, age distributions or networks, the
+same way the root finders in rdme.fixed_points know nothing about the model whose roots they
+locate.
 
 The kernels and their relationships are documented below; rdme is what applies them.
 """
@@ -19,60 +19,49 @@ The kernels and their relationships are documented below; rdme is what applies t
 # Hazards
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #
-# Three per-bin kernels, all of which have a dt -> 0 limit and all of which reduce to the
-# sigmoid at lam0*dt = 1. Writing x = beta*h, sigma for the logistic function, c = lam0*dt/2
-# and ell = logit(c) = ln(c) - ln(1-c):
+# THE MODEL IS THE POISSON REFERENCE (route B). Writing x = beta*h, sigma for the logistic
+# function, nu0 for the rate unit and c = nu0*dt for the reference's per-bin firing
+# probability:
 #
-#   async         Phi = lam0*dt * sigma(x)            rate lam0*sigma(x)
-#   escape        Phi = 1 - (1 + e^x)^(-lam0*dt)      rate lam0*softplus(x)
-#   poisson       Phi = sigma(x + ell)                rate (lam0/2)*e^x
-#   exp_surv      Phi = 1 - exp(-(lam0/2) e^x dt)     rate (lam0/2)*e^x
+#   poisson        Phi = sigma(x + ell),  ell = logit(c)      rate nu0 e^x
+#   poisson_exact  Phi = 1 - exp(-nu0 e^x dt)                 rate nu0 e^x
+#   bernoulli      Phi = nu0*dt * sigma(x)                    rate nu0*sigma(x)
 #
-# THREE models, FOUR kernels: exp_surv shares poisson's rate function exactly and so is the
-# same continuous-time model, reached by exact survival instead of by maximum caliber. The
-# pair exists because the two discretization maps have different error structure, which is a
-# question about the solver rather than about the model -- see exp_surv_hazard.
+# ONE model, TWO kernels for it. poisson and poisson_exact share a rate function exactly and
+# so are the same continuous-time model, reached by two different discretization maps:
+# maximum caliber at each bin, and exact survival. The pair exists because the two maps have
+# different error structure, which is a question about the solver rather than about the model
+# -- see poisson_exact_hazard.
 #
-# poisson is the only one of the three that is MAXIMUM CALIBER at every dt. Maximum caliber
-# against a Poisson reference measure -- one that fires with probability c per bin regardless
-# of the field -- with a mean-activity constraint gives a logistic kernel with the reference's
-# log-odds added to the field, at EVERY step, and c = lam0*dt/2 is the calibration that makes
-# the reference unbiased (c = 1/2, ell = 0) exactly at the quantum. async and escape are
-# MaxCal only there, at the single step where all three coincide; refining either of them
-# leaves the variational family, while refining poisson stays inside it.
+# bernoulli is NOT the model. It is route A, kept for comparison and for equivalence claims
+# about the time-discrete construction the project started from: a neuron is offered an update
+# with probability nu0*dt per bin and, if updated, fires with the synchronous probability
+# sigma(x). At nu0*dt = 1 it IS the sigmoid, bit for bit on all four branches -- see
+# bernoulli_log1m_phi, where that edge is taken deliberately -- which is the discrete model
+# every pre-route-B result was computed in. Nothing in this repo should pick it as the hazard
+# of a measurement.
 #
-# At lam0*dt = 1 (dt = dt0, the time quantum) async IS the sigmoid, bit for bit on all four
-# branches -- see async_log1m_phi, where that edge is taken deliberately. The synchronous
-# model is therefore not a third kernel but async evaluated at the boundary of its own
-# validity domain, and is not carried separately.
+# Why the Poisson reference is the model. Maximum caliber against a reference measure that
+# fires with probability c per bin regardless of the field, under a mean-activity constraint,
+# gives a logistic kernel with the reference's log-odds added to the field, at EVERY step.
+# That is `poisson`, and it is MaxCal at every dt rather than at one privileged step, so
+# refining dt refines one variational problem instead of walking across a family of them. The
+# reference is a Poisson process of rate nu0, which is also the model's own reference measure
+# in the entropy production: H and H_rev are reported against it (finite as dt -> 0) rather
+# than against a counting measure (divergent as rate*ln(1/dt)).
 #
-# The two differ in two independent ways (App. "Discretization map and rate function"). The
-# discretization map -- linear thinning against exact survival -- differs at second order,
-# 1 - e^{-lam*dt} = lam*dt[1 - lam*dt/2 + ...], so it only changes the speed of convergence.
-# The rate function persists in the limit, so async and escape converge to DIFFERENT
-# continuous-time models. Their rates agree for weak drive, where both go like lam0*e^x -- so
-# both are escape-noise models in Gerstner's sense, sharing the Arrhenius tail -- and separate
-# for strong drive: the async rate saturates at lam0, one spike per quantum, while the escape
-# rate grows like lam0*beta*h without bound.
+# nu0 is a UNIT, not a calibration. It is the rate at which the reference process fires, fixed
+# at 1 ms^-1, and the exponential tilt e^{beta*h} is measured against it; (nu0, theta) ->
+# (nu0 e^{beta delta}, theta + delta) leaves Phi unchanged for poisson_exact exactly, which is
+# the reparametrization the tests pin down. There is no time quantum: dt is the solver step
+# and nothing else, and t_abs -- the physical dead time -- is an independent parameter of the
+# model rather than a shadow of the step.
 #
-# That ceiling is the substantive difference, and the models put it in different places.
-# async caps the hazard itself: a binary spike train binned at dt0 cannot encode a rate above
-# 1/dt0, so the saturation is a property of the state space the model is defined on. escape
-# leaves the hazard unbounded and delegates the limit to the refractory kernel, which is the
-# SRM convention and is why a run without an absolute refractory window can reach >1 kHz.
-#
-# poisson has no ceiling either, and goes further than escape: its rate is exponential rather
-# than linear at strong drive, so it is the stiffest of the three and the one whose step has to
-# be checked against max(rate)*dt rather than against lam0*dt. At WEAK drive it carries a
-# factor of one half -- async and escape both tend to lam0*e^x, poisson to (lam0/2)*e^x, the
-# same Arrhenius tail shifted by ln2/beta in the threshold. That is a consequence of pinning
-# the reference at the quantum and is deliberately not corrected for: moving the prefactor
-# would move the dt = dt0 agreement, which is the fixed point of the whole construction.
-#
-# That difference is the point of carrying all three models: it is a statement about the
-# model, not about the numerics, and it shows up in the entropy production, which is a
-# functional of Phi and so sees the rate function directly. exp_surv is the one member added
-# for a reason that IS about the numerics, and it is labelled as such.
+# The ceiling. poisson and poisson_exact have an UNBOUNDED, exponential rate, so nothing in
+# the kernel caps the firing rate; the cap is the absolute refractory window t_abs, which
+# bounds the realised rate by 1/t_abs. That is the SRM convention and is why a run with
+# t_abs = 0 can reach arbitrary rates. bernoulli's rate saturates at nu0 instead, one spike
+# per update interval, a property of the discrete state space it was built on.
 #
 # Every kernel takes `inplace`, with the same meaning as in rdme.rdm: the out-of-place
 # branch is the definition and the oracle, the in-place branch is the same arithmetic in the
@@ -83,61 +72,66 @@ The kernels and their relationships are documented below; rdme is what applies t
 # caller holding a field it still needs would be silently corrupted.
 #
 # The saving is not marginal where it matters. The entropy production evaluates a hazard on a
-# (B, K, Q) buffer, so each avoided temporary is the size of that buffer; async_hazard alone
-# goes from three of them to none. Only softplus is irreducible, torch exposing no in-place
-# form and no `out=`, so the kernels built on it keep exactly one.
+# (B, K, Q) buffer, so each avoided temporary is the size of that buffer; bernoulli_hazard
+# alone goes from three of them to none. Only softplus is irreducible, torch exposing no
+# in-place form and no `out=`, so the kernels built on it keep exactly one.
 
-def async_hazard(h, beta, lam0, dt, inplace: bool = False):
-    """ Phi = lam0*dt * sigma(beta*h): asynchronous updates, i.e. linear thinning.
 
-    Each neuron is updated with probability lam0*dt per step and, if updated, fires with the
+# Route A: the Bernoulli (linear-thinning) kernel
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+def bernoulli_hazard(h, beta, nu0, dt, inplace: bool = False):
+    """ Phi = nu0*dt * sigma(beta*h): asynchronous updates, i.e. linear thinning.
+
+    Each neuron is updated with probability nu0*dt per step and, if updated, fires with the
     synchronous probability; a neuron that is not updated stays silent. Marginalizing the
-    update schedule gives this per-bin kernel, with rate lam0*sigma(beta*h).
+    update schedule gives this per-bin kernel, with rate nu0*sigma(beta*h).
 
-    Valid only for lam0*dt <= 1 -- beyond that this is not a probability, since sigma
-    approaches 1 and Phi would exceed it. RDMNetwork enforces that at construction. """
+    Route A, kept for comparison only. Valid for nu0*dt <= 1 -- beyond that this is not a
+    probability, since sigma approaches 1 and Phi would exceed it; `check_step` enforces it. """
     if inplace:
-        return h.mul_(beta).sigmoid_().mul_(lam0 * dt)
-    return (lam0 * dt) * torch.sigmoid(beta * h)
+        return h.mul_(beta).sigmoid_().mul_(nu0 * dt)
+    return (nu0 * dt) * torch.sigmoid(beta * h)
 
 
-def d_async_hazard(h, beta, lam0, dt, inplace: bool = False):
-    """ dPhi/dh = lam0*dt * beta*sigma*(1 - sigma): the synchronous derivative, thinned. """
+def d_bernoulli_hazard(h, beta, nu0, dt, inplace: bool = False):
+    """ dPhi/dh = nu0*dt * beta*sigma*(1 - sigma): the synchronous derivative, thinned. """
     if inplace:
         sig = h.mul_(beta).sigmoid_()
         comp = 1.0 - sig
-        return sig.mul_((lam0 * dt) * beta).mul_(comp)
+        return sig.mul_((nu0 * dt) * beta).mul_(comp)
     sig = torch.sigmoid(beta * h)
-    return (lam0 * dt) * beta * sig * (1.0 - sig)
+    return (nu0 * dt) * beta * sig * (1.0 - sig)
 
 
-def async_rate(h, beta, lam0, dt, inplace: bool = False):
-    """ lam0*sigma(beta*h), bounded by lam0: at most one spike per update interval on average,
+def bernoulli_rate(h, beta, nu0, dt, inplace: bool = False):
+    """ nu0*sigma(beta*h), bounded by nu0: at most one spike per update interval on average,
     which is exactly the assumption the synchronous model rests on. """
     if inplace:
-        return h.mul_(beta).sigmoid_().mul_(lam0)
-    return lam0 * torch.sigmoid(beta * h)
+        return h.mul_(beta).sigmoid_().mul_(nu0)
+    return nu0 * torch.sigmoid(beta * h)
 
 
-def async_logphi(h, beta, lam0, dt, inplace: bool = False):
-    """ ln Phi = ln(lam0*dt) - softplus(-beta*h): the synchronous log-probability, shifted by
+def bernoulli_logphi(h, beta, nu0, dt, inplace: bool = False):
+    """ ln Phi = ln(nu0*dt) - softplus(-beta*h): the synchronous log-probability, shifted by
     the thinning factor. """
     if inplace:
-        return torch.nn.functional.softplus(h.mul_(-beta)).neg_().add_(math.log(lam0 * dt))
-    return math.log(lam0 * dt) - torch.nn.functional.softplus(-beta * h)
+        return torch.nn.functional.softplus(h.mul_(-beta)).neg_().add_(math.log(nu0 * dt))
+    return math.log(nu0 * dt) - torch.nn.functional.softplus(-beta * h)
 
 
-def async_log1m_phi(h, beta, lam0, dt, inplace: bool = False):
-    """ ln(1 - lam0*dt*sigma(beta*h)), written as ln(1 + (1-c)e^x) - softplus(x) with
-    c = lam0*dt.
+def bernoulli_log1m_phi(h, beta, nu0, dt, inplace: bool = False):
+    """ ln(1 - nu0*dt*sigma(beta*h)), written as ln(1 + (1-c)e^x) - softplus(x) with
+    c = nu0*dt.
 
     The algebraic rearrangement, rather than log1p of the hazard: at c < 1 this is bounded
     below by ln(1 - c) -- a thinned neuron cannot fire with probability one -- but at c = 1 the
     silent branch does close, and the naive form reaches it as log1p(-1) = -inf several digits
-    before the exact -softplus(x) does. Taking the limit here instead keeps the lam0*dt = 1
-    edge, where async coincides with the synchronous kernel, agreeing with it to the last bit
-    rather than collapsing. """
-    c = lam0 * dt
+    before the exact -softplus(x) does. Taking the limit here instead keeps the nu0*dt = 1
+    edge, where bernoulli coincides with the synchronous sigmoid kernel, agreeing with it to
+    the last bit rather than collapsing. That edge is the legacy discrete model, and is what
+    test_hazards pins against the closed form. """
+    c = nu0 * dt
     log1mc = math.log1p(-c) if c < 1.0 else -math.inf
     if inplace:
         x = h.mul_(beta)
@@ -149,123 +143,66 @@ def async_log1m_phi(h, beta, lam0, dt, inplace: bool = False):
     return torch.logaddexp(torch.zeros_like(x), x + log1mc) - torch.nn.functional.softplus(x)
 
 
-def escape_hazard(h, beta, lam0, dt, inplace: bool = False):
-    """ Phi = 1 - exp(-lam*dt) = 1 - (1 + e^{beta*h})^(-lam0*dt): the exact survival of a
-    Poisson process whose rate lam = lam0*softplus(beta*h) is frozen across the bin.
+# Route B: the Poisson reference, by maximum caliber
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    The rate is calibrated so that the exact survival reproduces the sigmoid at lam0*dt = 1,
-    which is what 1 - sigma(x) = e^{-softplus(x)} gives.
+def _poisson_logit(nu0: float, dt: float) -> float:
+    """ ell = logit(c) with c = nu0*dt, the reference log-odds, in float64 Python.
 
-    Computed as -expm1(-lam0*dt*softplus(beta*h)) rather than from the power form: torch's
-    softplus uses the log1p(exp(-|x|)) + max(x, 0) form and so does not overflow at the large
-    beta*h this model reaches, and expm1 keeps the small lam0*dt regime -- the whole point of
-    refining dt -- from losing precision to 1 - (1 - x). """
-    if inplace:
-        sp = torch.nn.functional.softplus(h.mul_(beta))
-        return sp.mul_(-lam0 * dt).expm1_().neg_()
-    return -torch.expm1(-lam0 * dt * torch.nn.functional.softplus(beta * h))
-
-
-def d_escape_hazard(h, beta, lam0, dt, inplace: bool = False):
-    """ dPhi/dh = (1 - Phi) * lam0*dt * beta*sigma(beta*h).
-
-    Written from (1 - Phi) rather than re-exponentiating, so the two agree to the last bit and
-    a saturated hazard gives a derivative of exactly zero instead of a small negative one. """
-    if inplace:
-        # the two factors both need beta*h, so it is kept and the survival built beside it;
-        # add_(1.0) on expm1(-lam*dt) == -Phi is the same 1.0 - Phi the other branch forms
-        x = h.mul_(beta)
-        comp = torch.nn.functional.softplus(x).mul_(-lam0 * dt).expm1_().add_(1.0)
-        return comp.mul_(lam0 * dt).mul_(beta).mul_(x.sigmoid_())
-    phi = escape_hazard(h, beta, lam0, dt)
-    return (1.0 - phi) * (lam0 * dt) * beta * torch.sigmoid(beta * h)
-
-
-def escape_rate(h, beta, lam0, dt, inplace: bool = False):
-    """ lam0*softplus(beta*h), unbounded: grows like lam0*beta*h at strong drive, describing
-    firing faster than one spike per update interval. """
-    if inplace:
-        return torch.nn.functional.softplus(h.mul_(beta)).mul_(lam0)
-    return lam0 * torch.nn.functional.softplus(beta * h)
-
-
-def escape_logphi(h, beta, lam0, dt, inplace: bool = False):
-    """ ln Phi = ln(-expm1(-lam*dt)). Through expm1 so a rarely-firing neuron, where
-    Phi ~ lam*dt, keeps full precision rather than bottoming out in 1 - (1 - x). The clamp is
-    for lam*dt underflowing to zero at extreme negative drive, where ln Phi is -inf and only
-    multiplies an event that did not happen. """
-    if inplace:
-        y = torch.nn.functional.softplus(h.mul_(beta)).mul_(lam0 * dt)
-        return y.neg_().expm1_().neg_().clamp_min_(torch.finfo(y.dtype).tiny).log_()
-    y = lam0 * dt * torch.nn.functional.softplus(beta * h)
-    return torch.log((-torch.expm1(-y)).clamp_min(torch.finfo(y.dtype).tiny))
-
-
-def escape_log1m_phi(h, beta, lam0, dt, inplace: bool = False):
-    """ ln(1 - Phi) = -lam*dt exactly: the survival this hazard is built from, read off before
-    it is exponentiated. This is why the escape EPR stays finite at drives where Phi itself
-    saturates to one in float32. """
-    if inplace:
-        return torch.nn.functional.softplus(h.mul_(beta)).mul_(-(lam0 * dt))
-    return -(lam0 * dt) * torch.nn.functional.softplus(beta * h)
-
-
-def _poisson_logit(lam0: float, dt: float) -> float:
-    """ ell = logit(c) with c = lam0*dt/2, the reference log-odds, in float64 Python.
-
-    Once per call, not per element: it is a property of the (lam0, dt) pair and folding it into
-    a tensor op would cost a buffer. c = 1/2 -- i.e. lam0*dt = 1, the time quantum -- is taken
-    exactly rather than through log(0.5) - log1p(-0.5), whose two terms cancel to 0.0 in the
-    real arithmetic but are not required to by the standard. That edge is the one that has to
-    be exact: at ell = 0 every branch below must be async's, bit for bit. """
-    c = lam0 * dt / 2.0
-    if c == 0.5:
-        return 0.0
+    Once per call, not per element: it is a property of the (nu0, dt) pair and folding it into
+    a tensor op would cost a buffer. c -> 1 is where the reference fires every bin and ell
+    diverges; `check_step` refuses dt there, so this is only ever called with c < 1. """
+    c = nu0 * dt
+    if not 0.0 < c < 1.0:
+        raise ValueError(f"the poisson kernel needs 0 < c = nu0*dt < 1, got c = {c:.6g} "
+                         f"(nu0={nu0}, dt={dt}).")
     return math.log(c) - math.log1p(-c)
 
 
-def poisson_hazard(h, beta, lam0, dt, inplace: bool = False):
+def poisson_hazard(h, beta, nu0, dt, inplace: bool = False):
     """ Phi = sigma(beta*h + ell): maximum caliber against a Poisson reference measure.
 
-    The reference fires with probability c = lam0*dt/2 per bin, independently of the field, and
+    The reference fires with probability c = nu0*dt per bin, independently of the field, and
     MaxCal with a mean-activity constraint tilts it by e^{beta*h}, giving a logistic kernel
-    whose field is shifted by the reference log-odds ell = logit(c). That is the content of the
-    kernel: async and escape are MaxCal only at the quantum, where the reference is unbiased,
-    while this one is MaxCal at EVERY dt, which is what makes refining dt here a refinement of
-    one variational problem rather than a walk across a family of them.
+    whose field is shifted by the reference log-odds ell = logit(c). That is the content of
+    the kernel, and the reason it is the model: bernoulli is MaxCal only at nu0*dt = 1, where
+    the reference is unbiased, while this one is MaxCal at EVERY dt, so refining dt here is a
+    refinement of one variational problem rather than a walk across a family of them.
 
-    The calibration c = lam0*dt/2 puts c = 1/2 at dt = dt0, where ell = 0 and Phi = sigma(x):
-    the same discrete model the other two reduce to, so every dt = dt0 result carries over
-    unchanged and only the refinement differs. """
+    Its continuum rate is nu0 e^{beta*h}: Phi/dt -> c e^x / dt = nu0 e^x as c -> 0. There is
+    no privileged dt at which it reduces to the sigmoid, and that is the point -- under route
+    B nothing is calibrated to a time quantum. """
     if inplace:
-        return h.mul_(beta).add_(_poisson_logit(lam0, dt)).sigmoid_()
-    return torch.sigmoid(beta * h + _poisson_logit(lam0, dt))
+        return h.mul_(beta).add_(_poisson_logit(nu0, dt)).sigmoid_()
+    return torch.sigmoid(beta * h + _poisson_logit(nu0, dt))
 
 
-def d_poisson_hazard(h, beta, lam0, dt, inplace: bool = False):
+def d_poisson_hazard(h, beta, nu0, dt, inplace: bool = False):
     """ dPhi/dh = beta*Phi*(1 - Phi): the logistic derivative at the shifted field.
 
-    Written in d_async_hazard's order -- the gain folded in first, then the complement -- so
-    that at ell = 0 the two agree to the last bit, async's (lam0*dt)*beta being exactly beta
-    there. """
+    Written in d_bernoulli_hazard's order -- the gain folded in first, then the complement --
+    so that the two forms are the same arithmetic in the same order wherever they are
+    compared. """
     if inplace:
-        sig = h.mul_(beta).add_(_poisson_logit(lam0, dt)).sigmoid_()
+        sig = h.mul_(beta).add_(_poisson_logit(nu0, dt)).sigmoid_()
         comp = 1.0 - sig
         return sig.mul_(beta).mul_(comp)
-    sig = torch.sigmoid(beta * h + _poisson_logit(lam0, dt))
+    sig = torch.sigmoid(beta * h + _poisson_logit(nu0, dt))
     return beta * sig * (1.0 - sig)
 
 
-def poisson_rate(h, beta, lam0, dt, inplace: bool = False):
-    """ (lam0/2) * e^{beta*h}, the dt -> 0 limit of Phi/dt: an exponential escape rate, the
-    exp-link GLM. Unbounded, like escape and unlike async, and growing faster than escape's
-    softplus at strong drive.
+def poisson_rate(h, beta, nu0, dt, inplace: bool = False):
+    """ nu0 * e^{beta*h}, the dt -> 0 limit of Phi/dt: an exponential escape rate, the exp-link
+    GLM, and the rate function of the model under route B.
 
-    The factor one half is real and is not a calibration error. Below threshold async and
-    escape both go like lam0*e^{beta*h}, while this goes like (lam0/2)*e^{beta*h} -- the same
-    Arrhenius tail displaced by ln2/beta in the threshold. It is the price of holding c = 1/2
-    at the quantum: the reference measure that makes the kernel MaxCal at every step is also
-    what halves its prefactor, and moving one moves the other.
+    The prefactor is the rate UNIT nu0 and carries no factor of one half: there is no quantum
+    to pin the reference at, so c = nu0*dt throughout and the tilt is measured against a
+    Poisson process of rate nu0. Equivalently (nu0, theta) -> (nu0 e^{beta delta}, theta +
+    delta) is an exact reparametrization, so only nu0 e^{-beta*theta} is identifiable and nu0
+    may as well be 1 ms^-1.
+
+    Unbounded, unlike bernoulli's: nothing in the kernel caps it, and the cap on the realised
+    rate is the dead time t_abs.
 
     Overflow. The exponential has no ceiling, so at the drives a strongly-coupled run reaches
     beta*h of a few hundred sends e^x past float32's 3.4e38. The RESULT is clamped at
@@ -273,41 +210,44 @@ def poisson_rate(h, beta, lam0, dt, inplace: bool = False):
     observable is read in, and clamping the result keeps the clamp visible as a finite number
     rather than silently flattening the field dependence below it. """
     if inplace:
-        y = h.mul_(beta).exp_().mul_(0.5 * lam0)
+        y = h.mul_(beta).exp_().mul_(nu0)
         return y.clamp_max_(torch.finfo(y.dtype).max)
-    y = torch.exp(beta * h) * (0.5 * lam0)
+    y = torch.exp(beta * h) * nu0
     return y.clamp_max(torch.finfo(y.dtype).max)
 
 
-def poisson_logphi(h, beta, lam0, dt, inplace: bool = False):
+def poisson_logphi(h, beta, nu0, dt, inplace: bool = False):
     """ ln Phi = -softplus(-(beta*h + ell)), exact at both tails: at strong drive it goes to
     0 from below rather than losing the digits of a Phi that has rounded to one, and at weak
     drive it goes to beta*h + ell linearly rather than to ln(0). """
     if inplace:
-        x = h.mul_(beta).add_(_poisson_logit(lam0, dt)).neg_()
+        x = h.mul_(beta).add_(_poisson_logit(nu0, dt)).neg_()
         return torch.nn.functional.softplus(x).neg_()
-    return -torch.nn.functional.softplus(-(beta * h + _poisson_logit(lam0, dt)))
+    return -torch.nn.functional.softplus(-(beta * h + _poisson_logit(nu0, dt)))
 
 
-def poisson_log1m_phi(h, beta, lam0, dt, inplace: bool = False):
+def poisson_log1m_phi(h, beta, nu0, dt, inplace: bool = False):
     """ ln(1 - Phi) = -softplus(beta*h + ell), the mirror image of logphi and exact for the
-    same reason. This is the branch async has to rearrange to keep; here it is the closed form
-    already, the logistic kernel being symmetric under x -> -x. """
+    same reason. This is the branch bernoulli has to rearrange to keep; here it is the closed
+    form already, the logistic kernel being symmetric under x -> -x. """
     if inplace:
-        x = h.mul_(beta).add_(_poisson_logit(lam0, dt))
+        x = h.mul_(beta).add_(_poisson_logit(nu0, dt))
         return torch.nn.functional.softplus(x).neg_()
-    return -torch.nn.functional.softplus(beta * h + _poisson_logit(lam0, dt))
+    return -torch.nn.functional.softplus(beta * h + _poisson_logit(nu0, dt))
 
+
+# Route B: the same model, by exact survival
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # The continuum rate of this kernel IS poisson's, so the function is shared rather than
 # duplicated. Comparing the two rates has to compare the same object: two copies that happened
 # to agree today could drift tomorrow, and the whole point of the pair is that they are one
 # model under two discretization maps.
-exp_surv_rate = poisson_rate
+poisson_exact_rate = poisson_rate
 
 
-def _exp_surv_y(h, beta, lam0, dt, inplace: bool = False):
-    """ y = lambda*dt = (lam0/2) e^{beta*h} dt, the exponent the survival is built from.
+def _poisson_exact_y(h, beta, nu0, dt, inplace: bool = False):
+    """ y = lambda*dt = nu0 e^{beta*h} dt, the exponent the survival is built from.
 
     Factored out because all four branches below need exactly it, in exactly this order, and
     writing it four times is how the in-place and out-of-place forms drift apart. Clamped at
@@ -316,72 +256,76 @@ def _exp_surv_y(h, beta, lam0, dt, inplace: bool = False):
     then 0 * inf = nan in the derivative. Clamped, that corner reads as a saturated hazard
     with a derivative of exactly zero, which is what it is. """
     if inplace:
-        y = poisson_rate(h, beta, lam0, dt, inplace=True).mul_(dt)
+        y = poisson_rate(h, beta, nu0, dt, inplace=True).mul_(dt)
         return y.clamp_max_(torch.finfo(y.dtype).max)
-    y = poisson_rate(h, beta, lam0, dt) * dt
+    y = poisson_rate(h, beta, nu0, dt) * dt
     return y.clamp_max(torch.finfo(y.dtype).max)
 
 
-def exp_surv_hazard(h, beta, lam0, dt, inplace: bool = False):
-    """ Phi = 1 - exp(-lambda*dt) with lambda = (lam0/2) e^{beta*h}: the exact survival of a
-    Poisson process whose EXPONENTIAL rate is frozen across the bin.
+def poisson_exact_hazard(h, beta, nu0, dt, inplace: bool = False):
+    """ Phi = 1 - exp(-lambda*dt) with lambda = nu0 e^{beta*h}: the exact survival of a Poisson
+    process whose EXPONENTIAL rate is frozen across the bin.
 
     The same continuous-time model as "poisson" -- identical rate function, identical dt -> 0
-    limit -- reached by a different discretization map. poisson gets there by maximum caliber
-    at each bin, which makes it the right model for binned data but gives it a per-bin error
-    that CHANGES SIGN at threshold: writing x = beta*h and c = lam0*dt/2,
+    limit -- reached by a different discretization map, and the SOLVER the dt -> 0 reporting
+    rule is run with. poisson gets to the limit by maximum caliber at each bin, which makes it
+    the right model for binned data but gives it a per-bin error that CHANGES SIGN at
+    threshold: writing x = beta*h and c = nu0*dt,
 
-        poisson:  Phi/dt = r0 e^x / (1 + c(e^x - 1)),      r0 = lam0/2
+        poisson:  Phi/dt = nu0 e^x / (1 + c(e^x - 1))
 
     sits above the rate for x < 0 and below it for x > 0. On an attractor that crosses
     threshold the quiet and bursting phases then contribute O(dt) errors of opposite sign, and
-    their balance moves with dt -- which is a non-monotone approach to the limit, not a wrong
-    limit. Exact survival is single-signed (it always underestimates, 1 - e^{-z} <= z), so it
-    approaches the same limit monotonically and is the better SOLVER for this model.
+    their balance moves with dt -- a non-monotone approach to the limit, not a wrong limit, and
+    one that Richardson extrapolation cannot be run on. Exact survival is single-signed (it
+    always underestimates, 1 - e^{-z} <= z), so it approaches the same limit monotonically.
 
-    It does NOT reduce to the sigmoid at lam0*dt = 1, and that is not a defect: it is not
-    claiming to be a MaxCal model at any bin width, only to integrate poisson's continuum
-    model accurately. Use "poisson" to MODEL binned data, "exp_surv" to SOLVE the model. """
+    Use "poisson" to MODEL binned data, "poisson_exact" to SOLVE the model -- and to extrapolate
+    it, which is why it is the default hazard of a measurement. Its local relative error is
+    bounded by lambda*dt/2; `step_error` reports it and `check_accuracy` tests it. """
     if inplace:
-        return _exp_surv_y(h, beta, lam0, dt, inplace=True).neg_().expm1_().neg_()
-    return -torch.expm1(-_exp_surv_y(h, beta, lam0, dt))
+        return _poisson_exact_y(h, beta, nu0, dt, inplace=True).neg_().expm1_().neg_()
+    return -torch.expm1(-_poisson_exact_y(h, beta, nu0, dt))
 
 
-def d_exp_surv_hazard(h, beta, lam0, dt, inplace: bool = False):
+def d_poisson_exact_hazard(h, beta, nu0, dt, inplace: bool = False):
     """ dPhi/dh = (1 - Phi) * beta * y, with y = lambda*dt.
 
-    Through y rather than re-forming r0*dt*beta*e^x: it is the same product with one rounding
-    fewer, and (1 - Phi) is built from the expm1 that produced Phi rather than from Phi
-    itself, so a saturated hazard gives exactly zero -- the same reasoning as
-    d_escape_hazard. """
+    Through y rather than re-forming nu0*dt*beta*e^x: it is the same product with one rounding
+    fewer, and (1 - Phi) is built from the expm1 that produced Phi rather than from Phi itself,
+    so a saturated hazard gives exactly zero. """
     if inplace:
-        y = _exp_surv_y(h, beta, lam0, dt, inplace=True)
+        y = _poisson_exact_y(h, beta, nu0, dt, inplace=True)
         comp = y.neg().expm1_().add_(1.0)
         return comp.mul_(beta).mul_(y)
-    y = _exp_surv_y(h, beta, lam0, dt)
+    y = _poisson_exact_y(h, beta, nu0, dt)
     comp = 1.0 + torch.expm1(-y)
     return comp * beta * y
 
 
-def exp_surv_logphi(h, beta, lam0, dt, inplace: bool = False):
-    """ ln Phi = ln(-expm1(-y)). Through expm1 for the same reason escape_logphi is, and with
-    the same clamp: at extreme negative drive y underflows to zero, ln Phi is -inf, and it
-    only ever multiplies an event that did not happen. """
+def poisson_exact_logphi(h, beta, nu0, dt, inplace: bool = False):
+    """ ln Phi = ln(-expm1(-y)). Through expm1 so a rarely-firing neuron, where Phi ~ lambda*dt,
+    keeps full precision rather than bottoming out in 1 - (1 - x). The clamp is for y
+    underflowing to zero at extreme negative drive, where ln Phi is -inf and only multiplies an
+    event that did not happen. """
     if inplace:
-        y = _exp_surv_y(h, beta, lam0, dt, inplace=True)
+        y = _poisson_exact_y(h, beta, nu0, dt, inplace=True)
         return y.neg_().expm1_().neg_().clamp_min_(torch.finfo(y.dtype).tiny).log_()
-    y = _exp_surv_y(h, beta, lam0, dt)
+    y = _poisson_exact_y(h, beta, nu0, dt)
     return torch.log((-torch.expm1(-y)).clamp_min(torch.finfo(y.dtype).tiny))
 
 
-def exp_surv_log1m_phi(h, beta, lam0, dt, inplace: bool = False):
+def poisson_exact_log1m_phi(h, beta, nu0, dt, inplace: bool = False):
     """ ln(1 - Phi) = -y exactly: the survival the kernel is defined by, read off before it is
     exponentiated. Finite wherever y is, including the drives at which Phi itself rounds to
     one. """
     if inplace:
-        return _exp_surv_y(h, beta, lam0, dt, inplace=True).neg_()
-    return -_exp_surv_y(h, beta, lam0, dt)
+        return _poisson_exact_y(h, beta, nu0, dt, inplace=True).neg_()
+    return -_poisson_exact_y(h, beta, nu0, dt)
 
+
+# The registry
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 class Hazard(NamedTuple):
     """ A per-bin kernel, its field-derivative, the rate it represents, and the two branches
@@ -389,26 +333,29 @@ class Hazard(NamedTuple):
 
     dphi is carried because the tangent dynamics needs dPhi/dh and it is not recoverable from
     Phi alone; rate because the models differ in the limit precisely through it, so comparing
-    rates is comparing models while comparing Phi is comparing models-and-resolutions. The
-    three distinct rate functions are async's, escape's and poisson's; exp_surv shares
+    rates is comparing models while comparing Phi is comparing models-and-resolutions. There
+    are TWO distinct rate functions here, bernoulli's and poisson's; poisson_exact shares
     poisson's, which is exactly how one reads off that the two are one model.
 
     logphi/log1m_phi are carried for the same reason as dphi: ln Phi and ln(1 - Phi) each have
-    a closed form that stays exact where Phi itself has lost its digits -- at strong drive the
-    escape hazard rounds to one in float32, and ln(1 - Phi) computed from it is -inf, while the
-    direct form -lam*dt is perfectly finite. The spin EPR estimator reads single spikes rather
-    than an age distribution, so it pays that cost per neuron and needs the exact branches.
+    a closed form that stays exact where Phi itself has lost its digits -- at strong drive
+    poisson_exact rounds to one in float32, and ln(1 - Phi) computed from it is -inf, while the
+    direct form -lambda*dt is perfectly finite. The spin EPR estimator reads single spikes
+    rather than an age distribution, so it pays that cost per neuron and needs the exact
+    branches.
 
-    All five take the same trailing `inplace` flag; see the note above the kernels. """
-    
+    step_cap is the largest dt the kernel's ARITHMETIC admits at a given nu0, or None when
+    nothing caps it. It is not an accuracy criterion: see step_error. All five callables take
+    the same trailing `inplace` flag; see the note above the kernels. """
+
     phi:  Callable[..., torch.Tensor]
     dphi: Callable[..., torch.Tensor]
     rate: Callable[..., torch.Tensor]
     logphi:     Callable[..., torch.Tensor]
     log1m_phi:  Callable[..., torch.Tensor]
-    bounded_step: bool   # whether lam0*dt <= 1 is required for Phi to be a probability
+    step_cap: Callable[[float], float | None]
 
-    def neg_log_prob(self, s, h, beta, lam0, dt, inplace: bool = False):
+    def neg_log_prob(self, s, h, beta, nu0, dt, inplace: bool = False):
         """ -ln p(s | h) for one Bernoulli spike, s in {0, 1}, broadcast over h.
 
         Selected with where() rather than weighted as -(s*lnPhi + (1-s)*ln(1-Phi)): a branch
@@ -418,86 +365,137 @@ class Hazard(NamedTuple):
         Both branches need h, so inplace can only be handed to the second one -- which is why
         this saves one buffer rather than the two the kernels manage on their own. """
         if inplace:
-            lp = self.logphi(h, beta, lam0, dt)
-            l1 = self.log1m_phi(h, beta, lam0, dt, inplace=True)
+            lp = self.logphi(h, beta, nu0, dt)
+            l1 = self.log1m_phi(h, beta, nu0, dt, inplace=True)
             return torch.where(s > 0, lp, l1).neg_()
         return -torch.where(s > 0,
-                            self.logphi(h, beta, lam0, dt),
-                            self.log1m_phi(h, beta, lam0, dt))
+                            self.logphi(h, beta, nu0, dt),
+                            self.log1m_phi(h, beta, nu0, dt))
+
+
+# The step caps, as functions of nu0. Each returns the largest admissible dt, or None.
+#
+#   bernoulli      Phi = nu0*dt*sigma would exceed 1 above dt = 1/nu0: an update probability
+#                  above one. The edge itself is admissible and is the legacy discrete model.
+#   poisson        c = nu0*dt is a probability and ell = logit(c) diverges as c -> 1, where
+#                  the reference measure fires every bin and the tilt has nothing left to
+#                  tilt. The cap is STRICT: c < 1, not c <= 1.
+#   poisson_exact  Phi = 1 - e^{-y} is a probability for every y, so nothing caps dt here. The
+#                  step is set by accuracy alone -- see step_error -- which is the other half
+#                  of why this is the kernel the dt -> 0 limit is taken with.
+
+def _cap_bernoulli(nu0: float) -> float: return 1.0 / nu0
+def _cap_poisson(nu0: float) -> float:   return math.nextafter(1.0 / nu0, 0.0)
+def _cap_none(nu0: float) -> None:       return None
 
 
 HAZARDS: dict[str, Hazard] = {
-    "async":       Hazard(async_hazard,  d_async_hazard,  async_rate,
-                          async_logphi,  async_log1m_phi,  True),
-    "escape":      Hazard(escape_hazard, d_escape_hazard, escape_rate,
-                          escape_logphi, escape_log1m_phi, False),
-    # bounded_step=True is stricter than this kernel needs: Phi is a sigmoid and so is a
-    # probability for every c < 1, i.e. for lam0*dt < 2. It is kept because the constraint
-    # worth enforcing is not "Phi <= 1" but "dt <= dt0" -- the reference measure is calibrated
-    # to be unbiased at the quantum, and a step above it is a reference that fires more often
-    # than half the time, which is the discrete model running backwards rather than a model
-    # being refined.
-    "poisson":     Hazard(poisson_hazard, d_poisson_hazard, poisson_rate,
-                          poisson_logphi, poisson_log1m_phi, True),
-    # bounded_step=False: Phi = 1 - e^{-y} is a probability for every y, so nothing here caps
-    # dt. The step is set by accuracy alone, max(rate)*dt << 1 on the attractor, exactly as
-    # for escape -- and unlike poisson, which is pinned to dt <= dt0 by its reference measure
-    # rather than by its arithmetic.
-    "exp_surv":    Hazard(exp_surv_hazard, d_exp_surv_hazard, exp_surv_rate,
-                          exp_surv_logphi, exp_surv_log1m_phi, False),
+    "bernoulli":     Hazard(bernoulli_hazard, d_bernoulli_hazard, bernoulli_rate,
+                            bernoulli_logphi, bernoulli_log1m_phi, _cap_bernoulli),
+    "poisson":       Hazard(poisson_hazard, d_poisson_hazard, poisson_rate,
+                            poisson_logphi, poisson_log1m_phi, _cap_poisson),
+    "poisson_exact": Hazard(poisson_exact_hazard, d_poisson_exact_hazard, poisson_exact_rate,
+                            poisson_exact_logphi, poisson_exact_log1m_phi, _cap_none),
 }
 
+#: The hazard a measurement is run with unless it says otherwise (route B, 2026-11-07). It is
+#: still its own axis and every script states it; this is what `presets.params` falls back to.
+DEFAULT_HAZARD = "poisson_exact"
 
-# The (dt0, dt) convention
+
+# Accuracy of the step
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-def resolve_timesteps(dt0: float, dt: float | None, hazard: str) -> tuple[float, float, float]:
-    """ Settle (dt0, dt, lam0) for a model. Shared by RDMNetwork, RDMBatch and SpinNetwork so
-    the convention is stated once rather than three times.
+def step_error(rate_max: float, dt: float) -> float:
+    """ The local RELATIVE error bound of the exact-survival map at a peak rate: lambda*dt/2.
 
-    dt0 is the MODEL. It fixes lam0 = 1/dt0 and so names one member of the hazard family; it is
-    an intrinsic modelling choice -- the time quantum, equivalently the rate scale lam0 -- and
-    is held fixed across a study. It is required, because a model that has not named its
-    quantum has not been specified.
+    Phi = 1 - e^{-lambda dt} = lambda*dt (1 - lambda*dt/2 + ...), so freezing the rate across a
+    bin loses a relative lambda*dt/2 at the fastest-firing cohort, and that is the quantity to
+    size dt against once no arithmetic cap binds. It is a LOCAL bound: the error of an
+    observable accumulated over a trajectory is this per step, and the dt -> 0 reporting rule
+    is what settles the global one.
 
-    dt is the SOLVER. It is the resolution the model is integrated at, and the quantity to
-    refine until observables stop moving. It defaults to dt0.
+    rate_max is read off the attractor, not from nu0: the rate is unbounded and exponential, so
+    nu0*dt says nothing about it. RDMNetwork.hazard_rate() over a trajectory is where it comes
+    from, exactly as max_step_prob is. """
+    return 0.5 * rate_max * dt
 
-    At the default dt = dt0 we sit at lam0*dt = 1, where all three hazards collapse onto the
-    sigmoid: that is the time-discrete model. It is also where Phi can reach 1, so at strong
-    drive a whole population fires in one bin and flips back the next -- the two-step artifact
-    that refining dt is for. So the default is the baseline to refine away from, not a result.
 
-    Refining is hazard-dependent and lam0*dt << 1 is not by itself the criterion:
+def check_accuracy(rate_max: float, dt: float, tol: float) -> None:
+    """ Raise unless the exact-survival step error at `rate_max` is within `tol`.
 
-      async  rate saturates at lam0, so Phi <= lam0*dt bounds the per-step firing probability
-             everywhere and lam0*dt << 1 does suffice.
-      escape rate lam0*softplus(beta*h) is unbounded, so at strong drive Phi can still approach
-             1 at lam0*dt << 1. The criterion there is max(hazard_rate())*dt << 1, read off the
-             actual attractor -- see RDMNetwork.max_step_prob.
-      poisson refines like escape, and for the same reason only more so: the rate
-             (lam0/2)*e^{beta*h} is unbounded and exponential, so lam0*dt << 1 says nothing
-             about the per-step firing probability. The criterion is again
-             max(hazard_rate())*dt << 1 on the attractor, NOT lam0*dt << 1.
-      exp_surv same rate, same criterion, and no cap on dt at all -- it is not calibrated to
-             the quantum, so lam0*dt > 1 is arithmetically fine and merely inaccurate. It is
-             also the member whose approach to that criterion is monotone; poisson's per-bin
-             error changes sign at threshold, so on an attractor that crosses threshold its
-             observables can approach the limit from alternating sides.
+    Separated from check_step because it needs the realised rate, which is an output of the
+    run: construction can only check the arithmetic, a settled trajectory can check this. """
+    err = step_error(rate_max, dt)
+    if err > tol:
+        raise ValueError(
+            f"step error {err:.3g} exceeds tolerance {tol:.3g} at dt={dt:g} with peak rate "
+            f"{rate_max:.4g}/ms; refine dt below {2.0 * tol / rate_max:.4g} ms.")
 
-    Returns (dt0, dt, lam0). """
+
+def check_step(hazard: str, nu0: float, dt: float) -> None:
+    """ Raise unless `dt` is arithmetically admissible for `hazard` at this `nu0`.
+
+    The construction-time half of sizing the step: it sees only (nu0, dt) and so can only
+    enforce what the kernel's algebra requires -- that Phi be a probability, and that the
+    Poisson reference's log-odds be finite. Nothing here says the step is ACCURATE; that is
+    check_accuracy, which needs the attractor. """
     if hazard not in HAZARDS:
         raise ValueError(f"hazard must be one of {sorted(HAZARDS)}, got {hazard!r}")
-    if not dt0 > 0:
-        raise ValueError(f"dt0 must be positive, got {dt0}")
-    dt = dt0 if dt is None else dt
+    cap = HAZARDS[hazard].step_cap(nu0)
+    if cap is not None and dt > cap:
+        raise ValueError(
+            f"hazard {hazard!r} admits dt <= {cap:.6g} ms at nu0 = {nu0:g}/ms "
+            f"(c = nu0*dt = {nu0 * dt:.6g}), got dt = {dt:g}. Refine dt.")
+
+
+# The (dt, t_abs, nu0) convention
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+def resolve_timesteps(dt: float, t_abs: float, nu0: float,
+                      hazard: str) -> tuple[float, float, float]:
+    """ Settle (dt, t_abs, nu0) for a model. Shared by RDMNetwork, RDMNetworkBatch and
+    SpinModel so the convention is stated once rather than three times.
+
+    Under route B there is no time quantum and no `dt0`. The three quantities are:
+
+      nu0   the RATE UNIT, in 1/ms: the rate of the Poisson reference measure the kernel is a
+            tilt of. Fixed at 1 ms^-1. It is not a free parameter -- (nu0, theta) ->
+            (nu0 e^{beta delta}, theta + delta) is an exact reparametrization for
+            poisson_exact, so only nu0 e^{-beta theta} is identifiable -- and it is carried
+            explicitly anyway, so that a model never has to be read as "whatever 1/dt0 was".
+
+      t_abs the absolute refractory period, in ms: a PHYSICAL dead time, an independent
+            parameter of the model, and the only thing that bounds the realised firing rate
+            under an exponential hazard (at 1/t_abs). It no longer defaults to the step; a
+            model that wants no dead time passes t_abs = 0 explicitly and accepts an unbounded
+            rate. kernels.n_abs_bins requires dt to divide it.
+
+      dt    the SOLVER step, and nothing else. REQUIRED: under route B there is no discrete
+            model to default to, so a model that has not named its step has not said how it is
+            being integrated. It is the quantity to refine until observables stop moving.
+
+    The reporting rule reduces to one case: every number comes from a dt -> 0 check, by
+    default Richardson extrapolation from a coarse pair (dt, dt/2) with `poisson_exact`, whose
+    convergence is monotone. `poisson`'s per-bin error changes sign at threshold, so Richardson
+    on it fails on an attractor that crosses threshold; quote `poisson` at a stated dt, or
+    extrapolate the solver and compare.
+
+    Checks only what (dt, t_abs, nu0) can answer on their own -- positivity, and the
+    per-kernel arithmetic cap of check_step. Accuracy needs the attractor: see check_accuracy.
+
+    Returns (dt, t_abs, nu0). """
+    if hazard not in HAZARDS:
+        raise ValueError(f"hazard must be one of {sorted(HAZARDS)}, got {hazard!r}")
+    if dt is None:
+        raise ValueError("dt is required: under route B there is no time quantum to default "
+                         "to, and the solver step is a choice the run has to state.")
     if not dt > 0:
         raise ValueError(f"dt must be positive, got {dt}")
-
-    lam0 = 1.0 / dt0
-    if HAZARDS[hazard].bounded_step and lam0 * dt > 1.0 + 1e-12:
-        # Phi = lam0*dt*sigma would exceed 1: an update probability above one
-        raise ValueError(
-            f"hazard {hazard!r} requires lam0*dt <= 1, got lam0*dt = {lam0 * dt:.4g} "
-            f"(dt={dt}, dt0={dt0}). Refine dt, or raise dt0.")
-    return dt0, dt, lam0
+    if not nu0 > 0:
+        raise ValueError(f"nu0 must be positive, got {nu0}")
+    if t_abs is None or t_abs < 0:
+        raise ValueError(f"t_abs must be a non-negative number of ms, got {t_abs}. Pass "
+                         "t_abs=0.0 explicitly for no dead time (and an unbounded rate).")
+    check_step(hazard, nu0, dt)
+    return float(dt), float(t_abs), float(nu0)

@@ -69,7 +69,8 @@ import torch
 import tqdm
 
 import rdme.kernels as krn
-from rdme.batch import RDMWilsonCowanPoints, flatten_param_grid, unflatten_batch
+import rdme.plots as rp
+from rdme.rdm_batch import RDMWilsonCowanPoints, flatten_param_grid, unflatten_batch
 
 
 # ── Cache paths ───────────────────────────────────────────────────────────────
@@ -248,7 +249,7 @@ if run_sim:
                 E_ratio, flat["w_EE"][sl], gc*rho, -gc/rho, flat["w_II"][sl],
                 flat["E_ext"][sl], flat["E_ext"][sl], beta, beta, theta, theta,
                 tau_int_E, tau_int_I, tau_ref, tau_ref, K_ref_E, K_ref_I,
-                dt=dt, hazard="synchronous", Qm=Qm, device=device)
+                dt0=dt, hazard="async", Qm=Qm, device=device)
             mf.forward(equi, pb=False)
             parts.append({k: v.cpu() for k, v in streaming_stats(mf, steps).items()})
             del mf
@@ -339,4 +340,4 @@ if run_plot:
 
     fig.suptitle('Sustained-oscillation fraction, pairwise projections')
     fig.tight_layout()
-    plt.show()
+    rp.show()

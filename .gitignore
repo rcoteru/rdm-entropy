@@ -225,5 +225,6 @@ __marimo__/
 data/*
 */figures
 
-# Local run records: figures and dumps travel to the vault by hand
-scripts/dumps/
+# Local run records and vault hand-off (dumps, briefs): not git history, travels to/from
+# the research vault by hand
+agents/

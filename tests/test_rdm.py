@@ -48,8 +48,9 @@ def test_wilson_cowan_weight_orientation_matches_the_spin_model():
               theta_E=1.0, theta_I=1.0, tau_int_E=10.0, tau_int_I=5.0,
               tau_ref_E=3.0, tau_ref_I=3.0)
 
-    net = RDMWilsonCowan(K_ref_E=0.0, K_ref_I=0.0, dt0=0.5, hazard="async", **kw)
-    spin = SpinWilsonCowan(N=1000, K_ref1=0.0, K_ref2=0.0, dt0=0.5, **kw)
+    legacy = dict(dt=0.5, nu0=2.0, hazard="bernoulli", t_abs=0.0)
+    net = RDMWilsonCowan(K_ref_E=0.0, K_ref_I=0.0, **legacy, **kw)
+    spin = SpinWilsonCowan(N=1000, K_ref1=0.0, K_ref2=0.0, **legacy, **kw)
 
     assert torch.allclose(net.w.float(), spin.w)
 
@@ -95,7 +96,7 @@ def test_update_synaptic_term():
     assert torch.equal(S_inplace, S_new)
 
 
-def test_async_hazard_at_the_quantum_is_the_sigmoid_of_the_field():
+def test_bernoulli_hazard_at_its_unit_step_is_the_sigmoid_of_the_field():
     """ The kernel the old compute_firing_prob hard-coded, now one member of the family.
     Its derivative and its relatives are tested in test_srm.py; this just pins the form. """
     torch.manual_seed(2)
@@ -103,11 +104,11 @@ def test_async_hazard_at_the_quantum_is_the_sigmoid_of_the_field():
     S = torch.randn(Q, dtype=torch.float64)
     R = torch.randn(Q, dtype=torch.float64)
     beta, theta = 2.5, 0.3
-    got = hzd.async_hazard(S + R - theta, beta, lam0=1.0, dt=1.0)
+    got = hzd.bernoulli_hazard(S + R - theta, beta, nu0=1.0, dt=1.0)
     assert torch.allclose(got, torch.sigmoid(beta * (S + R - theta)))
     # and it does not touch the caller's tensors
     S_before, R_before = S.clone(), R.clone()
-    hzd.async_hazard(S + R - theta, beta, 1.0, 1.0)
+    hzd.bernoulli_hazard(S + R - theta, beta, 1.0, 1.0)
     assert torch.equal(S, S_before) and torch.equal(R, R_before)
 
 
@@ -197,21 +198,21 @@ def test_input_is_built_from_the_rate_in_all_three_models():
     base = dict(beta=3.0, theta=0.4, tau_int=5.0, tau_ref=4.0, K_ref=0.0)
 
     for dt in (1.0, 0.5):
-        s = RDMIsingModel(J=J, E=E, **base, dt0=1.0, dt=dt, hazard="async",
+        s = RDMIsingModel(J=J, E=E, **base, dt=dt, nu0=1.0, hazard="bernoulli",
                           t_abs=0.0, Qm=[60])
         s.forward(200)
         assert s.total_input()[0].item() == pytest.approx(J * s.rates()[0].item() + E, abs=1e-12)
 
-    b = RDMIsingModelBatch(J=torch.tensor([J]), E=E, **base, dt0=1.0, dt=0.5,
-                           hazard="async", t_abs=0.0, Qm=[60])
+    b = RDMIsingModelBatch(J=torch.tensor([J]), E=E, **base, dt=0.5, nu0=1.0,
+                           hazard="bernoulli", t_abs=0.0, Qm=[60])
     b.forward(200)
     assert b.total_input()[0, 0].item() == pytest.approx(J * b.rates()[0, 0].item() + E, abs=1e-12)
 
     prev = torch.get_default_dtype()
     torch.set_default_dtype(torch.float32)
     try:
-        m = SpinIsingModel(N=5000, J=J, E=E, **base, dt0=1.0, dt=0.5,
-                           hazard="async", ic="silent")
+        m = SpinIsingModel(N=5000, J=J, E=E, **base, dt=0.5, nu0=1.0,
+                           hazard="bernoulli", t_abs=0.0, ic="silent")
         m.forward(600)
         assert m.total_input()[0].item() == pytest.approx(J * m.rates()[0].item() + E, rel=1e-5)
     finally:
@@ -233,7 +234,7 @@ def test_a_coupling_does_not_have_to_be_rescaled_when_dt_changes():
     J, E = 4.0, 0.5
     base = dict(beta=3.0, theta=0.4, tau_int=5.0, tau_ref=4.0, K_ref=0.0)
     for dt in (1.0, 0.5, 0.25, 0.125):
-        m = RDMIsingModel(J=J, E=E, **base, dt0=1.0, dt=dt, hazard="async",
+        m = RDMIsingModel(J=J, E=E, **base, dt=dt, nu0=1.0, hazard="bernoulli",
                           t_abs=0.0, Qm=[int(60 / dt)])
         m.forward(int(2000 / dt))
         r = m.rates()[0].item()

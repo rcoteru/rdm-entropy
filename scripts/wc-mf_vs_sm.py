@@ -4,7 +4,8 @@ import time
 
 import rdme.fixed_points as fpts
 import rdme.lyapunov as lyap
-from rdme.single import RDMWilsonCowan
+import rdme.plots as rp
+from rdme.rdm_single import RDMWilsonCowan
 from rdme.spin_model import SpinWilsonCowan
 
 
@@ -61,9 +62,31 @@ tau_ref = 3; tau_ref_E = tau_ref; tau_ref_I = tau_ref
 # Adaptation on the excitatory population only -- K_ref_I made no measurable difference.
 K_ref_E, K_ref_I = 0.5, 0.0
 
-dt = 0.3
-steps1 = 50000
-steps2 = 20000
+
+# new excitatory / excitatory net weights
+E_ratio = 0.8 # ratio of excitatory neurons
+w_EE = 9
+w_EI = 19
+w_II = -1
+w_IE = -6
+
+E = 1.16;
+E_exc = E 
+E_inh = E
+beta = 30; 
+beta_E = 15; 
+beta_I = 30;
+theta = 1; 
+theta_E = theta; 
+theta_I = theta
+
+ta
+
+
+dt = 0.5
+steps1 = 5000
+steps2 = 5000
+hazard="async"
 
 # Model initialization
 # ~~~~~~~~~~~~~~~~~~~~
@@ -72,14 +95,14 @@ torch.set_default_dtype(torch.float64)
 sm = SpinWilsonCowan(N, E_ratio, w_EE, w_EI, w_IE, w_II, 
                     E_exc, E_inh, beta_E, beta_I, theta_E, theta_I, 
                     tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I, 
-                    dt=dt, device=device, ic="silent")
+                    dt=dt, dt0=dt, hazard=hazard, device=device, ic="silent")
 
 # Both models take the weights in physical units -- no /dt, since both build the input
-# from the rate -- and hazard="synchronous" is the sigmoid of the original model.
+# from the rate -- and hazard="async" at dt = dt0 IS the sigmoid of the original model.
 mf = RDMWilsonCowan(E_ratio, w_EE, w_EI, w_IE, w_II, 
                     E_exc, E_inh, beta_E, beta_I, theta_E, theta_I, 
                     tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I,
-                    dt=dt, hazard="synchronous", eps=0.01, device=device)
+                    dt=dt, dt0=dt, hazard=hazard, eps=0.01, device=device)
 
 print(mf.Qm)
 
@@ -245,6 +268,7 @@ if True: # fixed-point objective |G(m)| over the (m_E, m_I) square
 if True: # entropy trajectories
 
     fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, sharex=True, figsize=(12, 12))
+    fig.set_label('entropy-trajectories')   # the figure's filename slug
     # ax1: plt.Axes; ax2: plt.Axes; ax3: plt.Axes; ax4: plt.Axes;
 
     # activity trajectories
@@ -299,6 +323,7 @@ if True: # entropy trajectories, decomposed by population
             ("H_rev", "Backward Entropy")]
 
     fig, axs = plt.subplots(len(ROWS), 2, sharex=True, sharey='row', figsize=(14, 12))
+    fig.set_label('per-population-trajectories')   # the figure's filename slug
 
     for r, (key, title) in enumerate(ROWS):
         for c in range(len(POPS)):
@@ -340,7 +365,7 @@ if True: # Lyapunov spectrum of the mean field
     lmf = RDMWilsonCowan(E_ratio, w_EE, w_EI, w_IE, w_II,
                          E_exc, E_inh, beta_E, beta_I, theta_E, theta_I,
                          tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I,
-                         dt=dt, hazard="synchronous", eps=0.01, device=device)
+                         dt0=dt, hazard="async", eps=0.01, device=device)
 
     print(f"\nLyapunov: equilibrating {eq_lyap} steps, then {wu_lyap} warmup + {T_lyap} "
           f"accumulation, k={k_lyap} ...")
@@ -374,4 +399,4 @@ if True: # Lyapunov spectrum of the mean field
         print("  NOTE: confirm at dt <= 0.1 before believing this. On the parameter sweep every"
               "\n        chaotic candidate at dt = 0.2 flipped sign at dt = 0.1.")
 
-plt.show()
+rp.show()

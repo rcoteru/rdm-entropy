@@ -15,13 +15,13 @@ from rdme.rdm_batch import RDMIsingModelBatch
 # ── Parameters ────────────────────────────────────────────────────────────────
 
 PRESET = "S1"
-HAZARD = "async"        # stated per script: the hazard is its own axis, not part of a preset
+HAZARD = "poisson"        # stated per script: the hazard is its own axis, not part of a preset
 
 PARAMS: dict = pre.params(
     PRESET, hazard=HAZARD,
-    J       = 15.0,
+    J       = 17.0,
     E       = torch.linspace(0, 1.0, 300),
-    dt      = 1.0,
+    dt      = 0.5,
 )
 
 # The age grid is FITTED, not declared: the model's q_from_tau default sizes it from the

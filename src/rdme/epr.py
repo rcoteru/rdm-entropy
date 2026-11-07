@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+import math
+
 import torch
 
 from rdme.hazards import Hazard
@@ -118,7 +120,7 @@ def joint_distribution(p: torch.Tensor,        # (Q,)   p_t(n)
                        beta: float | torch.Tensor,
                        theta: float | torch.Tensor,
                        hazard: Hazard,
-                       lam0: float,
+                       nu0: float,
                        dt: float,
                        inplace: bool = False,
                        ) -> torch.Tensor:      # (Q, K) p_t(n, n_dagger=k)
@@ -147,7 +149,7 @@ def joint_distribution(p: torch.Tensor,        # (Q,)   p_t(n)
     future_age  = torch.clamp(n_idx.unsqueeze(1) + j_idx.unsqueeze(0), max=Q - 1)   # (Q, K)
     future_time = j_idx.unsqueeze(0)                                                # (1, K)
 
-    phi_all = hazard.phi(hazard_field(buff_S, R, theta, inplace), beta, lam0, dt, inplace=inplace)
+    phi_all = hazard.phi(hazard_field(buff_S, R, theta, inplace), beta, nu0, dt, inplace=inplace)
     # the two index tensors consume the last two axes, so the ellipsis carries any batch
     phi = phi_all[..., future_time, future_age]                     # (..., Q, K)
     del phi_all             # the gather already copied; holding the source doubles the peak
@@ -200,6 +202,43 @@ def epr_from_parts(p_fwd: torch.Tensor,    # (..., Q) row sums of the joint == p
     H_fwd = -(sm(spike_f * lo(phi_fwd)) + sm((p_fwd - spike_f) * l1(phi_fwd)))
     H_rev = -(sm(spike_r * lo(phi_rev)) + sm((p_rev - spike_r) * l1(phi_rev)))
     return torch.stack([H_rev - H_fwd, H_fwd, H_rev], dim=-1)
+
+
+def poisson_reference_entropy(m: torch.Tensor,    # (...) per-bin firing probability
+                              nu0: float, dt: float) -> torch.Tensor:
+    """ The per-step entropy of the POISSON REFERENCE at the same spike weights:
+
+        H_ref = -[ m ln c + (1 - m) ln(1 - c) ],      c = nu0*dt
+
+    and the quantity to subtract from H_fwd and H_rev to report them relative to the reference
+    (decided 2026-11-07). Under route B the Poisson process of rate nu0 is the model's own
+    reference measure -- the kernel is a MaxCal tilt of it -- so this is the prior, not a trick
+    to cancel a divergence.
+
+    Why it is needed. H_fwd and H_rev are entropies of a binned process against a COUNTING
+    measure, so each diverges as rate*ln(1/dt): a spike that costs -ln Phi ~ -ln(rate*dt) nats
+    costs more the finer the bin, without limit. H_ref carries exactly that divergence,
+    -m ln(nu0*dt), so
+
+        H_rel = H - H_ref  ->  finite as dt -> 0,
+
+    the spike term going to -<beta*h> and the silent term to O(dt). The RAW values stay the
+    control CLAUDE.md asks for (increment per halving -> r ln 2); the referenced ones are what
+    is comparable across resolutions.
+
+    sigma is untouched by the choice, and that is the check on it: H_fwd and H_rev are built
+    from the same total spike weight m and the same total mass 1, so they subtract the SAME
+    H_ref and sigma = H_rev - H_fwd = H_rel_rev - H_rel_fwd exactly, in float as well as on
+    paper. Reporting the pair relative to the reference therefore adds information about the
+    two half-terms without moving the number the paper quotes.
+
+    m is the per-bin firing probability (rates() * dt), not the rate: this is a per-STEP
+    entropy, like H_fwd and H_rev, and is divided by dt for nats/ms alongside them. """
+    c = nu0 * dt
+    if not 0.0 < c < 1.0:
+        raise ValueError(f"the Poisson reference needs 0 < c = nu0*dt < 1, got {c:.6g}")
+    m = torch.as_tensor(m)
+    return -(m * math.log(c) + (1.0 - m) * math.log1p(-c))
 
 
 def epr_from_joint(p_joint: torch.Tensor,   # (Q, K)
@@ -273,7 +312,7 @@ def make_epr_indices(K: int, Q: int, device: str | torch.device) -> EPRIndices:
                       a_end=torch.clamp(n + (K - 2), max=Q - 1))
 
 
-def init_epr_state(p, buff_S, R, beta, theta, hazard, lam0, dt,
+def init_epr_state(p, buff_S, R, beta, theta, hazard, nu0, dt,
                    inplace: bool = False) -> EPRState:
     """ The sliding state at the first reported step, built from the full joint.
 
@@ -287,7 +326,7 @@ def init_epr_state(p, buff_S, R, beta, theta, hazard, lam0, dt,
     in-place branch clones it, which is numerically inert -- same values, same bits -- and
     frees the gather at the end of this function instead of at the end of the trajectory. """
     Q, K = buff_S.shape[-1], buff_S.shape[-2]
-    G = joint_distribution(p, buff_S, R, beta, theta, hazard, lam0, dt,
+    G = joint_distribution(p, buff_S, R, beta, theta, hazard, nu0, dt,
                            inplace=inplace).sum(dim=-2)
 
     # buff_S carries an extra lag axis that R, beta and theta do not: they are (..., Q) and
@@ -299,7 +338,7 @@ def init_epr_state(p, buff_S, R, beta, theta, hazard, lam0, dt,
     n_idx = torch.arange(Q, device=buff_S.device)
     j_idx = torch.arange(K, device=buff_S.device)
     ages = torch.clamp(n_idx.unsqueeze(1) + j_idx.unsqueeze(0), max=Q - 1)      # (Q, K)
-    phi_all = hazard.phi(hazard_field(buff_S, R, theta, inplace), beta, lam0, dt, inplace=inplace)
+    phi_all = hazard.phi(hazard_field(buff_S, R, theta, inplace), beta, nu0, dt, inplace=inplace)
     phi = phi_all[..., j_idx.unsqueeze(0), ages]                                # (..., Q, K)
     del phi_all             # the gather already copied; holding the source doubles the peak
 
@@ -311,7 +350,7 @@ def init_epr_state(p, buff_S, R, beta, theta, hazard, lam0, dt,
     return EPRState(G, logV, phi[..., K - 2])
 
 
-def step_epr(p, state, buff_S, buff_I, idx, head, R, alpha, beta, theta, hazard, lam0, dt,
+def step_epr(p, state, buff_S, buff_I, idx, head, R, alpha, beta, theta, hazard, nu0, dt,
              inplace: bool = False):
     """ One timestep of EPR plus the advanced state: (epr (3,), p_{t+1}, state_{t+1}).
 
@@ -326,7 +365,7 @@ def step_epr(p, state, buff_S, buff_I, idx, head, R, alpha, beta, theta, hazard,
     on both branches, so the returned state is fresh either way. """
     K = buff_S.shape[-2]
     slots = idx.slots[head % K]
-    phi = lambda h: hazard.phi(h, beta, lam0, dt, inplace=inplace)
+    phi = lambda h: hazard.phi(h, beta, nu0, dt, inplace=inplace)
     fld = lambda S, Rv: hazard_field(S, Rv, theta, inplace)
 
     # -- present: the hazard row at time t, shared by H_fwd, column 0 and the logV slide

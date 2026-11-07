@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import rdme.hazards as hzd
+
 """ The named parameter sets every run starts from.
 
 A run is a PRESET plus explicit overrides, and nothing else. The point is not convenience --
@@ -11,29 +13,31 @@ top of a script on the day. If a run differs from a preset in anything other tha
 axes and its listed overrides, it is a new preset and belongs in this file (and in the table
 in CLAUDE.md, which is the same table in prose).
 
-What a preset holds is the MODEL: the couplings, the kernels, the time quantum `dt0` and the
-absolute refractory window `t_abs`. What it deliberately does not hold:
+What a preset holds is the MODEL: the couplings, the kernels, the rate unit `nu0` and the
+absolute refractory window `t_abs`, both in physical units. What it deliberately does not
+hold:
 
-  the hazard, which is its own axis. Three kernels share these parameters and are different
-  models, so a preset that named one would quietly fold that choice into every comparison.
-  `params()` therefore takes `hazard` as a required keyword -- the script has to say it, and
-  it ends up in the dump's frontmatter because the script had to write it down.
+  the hazard, which is its own axis. Three kernels share these parameters, and `bernoulli` is
+  a different model from the two route-B ones, so a preset that named one would quietly fold
+  that choice into every comparison. `params()` takes `hazard` as a keyword and falls back to
+  hazards.DEFAULT_HAZARD ("poisson_exact"); scripts state it anyway, and it ends up in the
+  dump's frontmatter because the script had to write it down.
 
   the solver step `dt`, the age grid `Qm` and the tolerance, which are numerics rather than
-  model. `dt` defaults to `dt0` (the discrete model) and is overridden per run; `Qm` is fitted
-  to a tolerance by helpers.fit_age_grid rather than declared.
+  model. `dt` is REQUIRED per run -- under route B there is no time quantum to default to --
+  and `Qm` is fitted to a tolerance by helpers.fit_age_grid rather than declared.
 
   N, for the spin runs. The same preset drives the mean field and the microscopic model, and
   N is a property of the simulation, not of the system being simulated.
 
-`t_abs=None` means the model's own default, which is `dt0` -- written as None rather than as a
-number so that overriding `dt0` carries the window with it. A study that is ABOUT the window
-overrides it explicitly.
+`nu0` is the rate unit of the Poisson reference, 1 ms^-1, and is the same in every preset: it
+is not identifiable on its own, (nu0, theta) -> (nu0 e^{beta delta}, theta + delta) being an
+exact reparametrization. `t_abs` is a PHYSICAL dead time in ms, 1 ms by default, and the only
+thing that caps the realised rate under an exponential hazard. A study that is ABOUT the
+window overrides it explicitly; `t_abs = 0` (no ceiling) has to be asked for.
 
-Status: the hazard convention is not settled, so the presets below are the parameters, not a
-full specification of a model; the Hopf points and the named cycle points move with the hazard
-and are recorded where they are known for a stated one. The two-population sets are not here
-yet, see PENDING. """
+Status: the two-population sets are not here yet, see PENDING. The Hopf points and the named
+cycle points move with the hazard and are recorded where they are known for a stated one. """
 
 
 # The presets
@@ -55,13 +59,14 @@ PRESETS: dict[str, dict] = {
         tau_int = 15.0,
         tau_ref = 15.0,
         K_ref   = 15.0,
-        dt0     = 1.0,
-        t_abs   = None,     # = dt0
+        nu0     = 1.0,
+        t_abs   = 1.0,
     ),
 
     # The rate-ceiling test (formerly "the low-beta point"): strong coupling into saturation,
-    # where the sigmoid kernel peaks at 100% of lam0 and the unbounded kernels do not. J is
-    # part of this one, since the point IS the saturated state.
+    # where the legacy sigmoid kernel peaks at 100% of nu0. Under route B the ceiling is the
+    # dead time instead -- the rate is unbounded and exponential -- so this is where the
+    # realised rate should sit at 1/t_abs. J is part of this one: the point IS that state.
     "S1-sat": dict(
         E       = 0.0,
         beta    = 8.0,
@@ -70,12 +75,14 @@ PRESETS: dict[str, dict] = {
         tau_ref = 25.0,
         K_ref   = 25.0,
         J       = 40.0,
-        dt0     = 1.0,
-        t_abs   = None,
+        nu0     = 1.0,
+        t_abs   = 1.0,
     ),
 
     # Legacy driven high-beta set. Here to reproduce old figures and for nothing else: no
-    # refractory kernel (K_ref = 0), a drive that does the work instead, and dt0 = 0.5.
+    # refractory kernel (K_ref = 0), a drive that does the work instead. Its old runs were at
+    # dt0 = 0.5 under route A, i.e. hazard="bernoulli" at dt = 0.5 with nu0 = 2; the preset
+    # carries the route-B unit instead, so reproducing a figure means stating both.
     "D1": dict(
         E       = 0.9,
         beta    = 30.0,
@@ -83,8 +90,8 @@ PRESETS: dict[str, dict] = {
         tau_int = 20.0,
         tau_ref = 3.0,
         K_ref   = 0.0,
-        dt0     = 0.5,
-        t_abs   = None,
+        nu0     = 1.0,
+        t_abs   = 1.0,
     ),
 }
 
@@ -93,8 +100,8 @@ PRESETS: dict[str, dict] = {
 # else, so a script and a dump can name the point instead of quoting the number.
 #
 # The cycle point is deliberately absent: under the Poisson kernel the Hopf sits near
-# J = 14.4-14.6 rather than at the 12.06 measured with the sigmoid at dt = dt0, and the cycle
-# point has to be re-chosen once the hazard is fixed. J = 17 is the candidate.
+# J = 14.4-14.6 rather than at the 12.06 measured with the legacy sigmoid kernel, and the
+# cycle point has to be re-chosen from a converged scan. J = 17 is the candidate.
 POINTS: dict[str, dict] = {
     "S1/fp": {"J": 10.0},                   # the fixed point below the Hopf
 }
@@ -108,7 +115,7 @@ POPS: dict[str, int] = {"S1": 1, "S1-sat": 1, "D1": 1, "S1/fp": 1}
 # make `J=...` an error. Mirrors the signature of RDMIsingModel; tests/test_presets.py checks
 # the two against each other so a parameter added to the model cannot be forgotten here.
 MODEL_KEYS: dict[int, frozenset[str]] = {
-    1: frozenset({"J", "E", "beta", "theta", "tau_int", "tau_ref", "K_ref", "dt0", "t_abs"}),
+    1: frozenset({"J", "E", "beta", "theta", "tau_int", "tau_ref", "K_ref", "nu0", "t_abs"}),
 }
 
 # Two-population sets named in CLAUDE.md but NOT encoded yet, with what is missing. Asking for
@@ -122,10 +129,11 @@ PENDING: dict[str, str] = {
             "step is not settled; encode it here once the mapping is fixed",
 }
 
-# The hazard is its own axis and has no default yet; scripts state it. Set this once the
-# convention is fixed (route B: "poisson" at the quantum, "exp_surv" as its exact-survival
-# solver), and `params()` will take it as the fallback.
-DEFAULT_HAZARD: str | None = None
+# The hazard is its own axis, and scripts state it; this is the fallback for one that does
+# not. It is defined in rdme.hazards, beside the kernels it names, and is "poisson_exact"
+# (route B, 2026-11-07): the exact-survival solver for the Poisson-reference model, whose
+# convergence is monotone and so is the one a dt -> 0 limit is taken with.
+DEFAULT_HAZARD: str | None = hzd.DEFAULT_HAZARD
 
 # Keys a run may pass that are not model parameters: the solver, the grid, the hardware and,
 # for the spin runs, the population size. Separated from the model keys so that `params()` can
@@ -158,9 +166,10 @@ def params(name: str, *, hazard: str | None = None, **overrides) -> dict:
         PARAMS = presets.params("S1", hazard="poisson", J=torch.linspace(0, 20, 300), dt=0.2)
         mf = RDMIsingModelBatch(**PARAMS, Qm=Qm, device=device)
 
-    `hazard` is required while the convention is unsettled (DEFAULT_HAZARD is None), because
-    the hazard is a modelling choice of the same weight as the couplings and a default would
-    let a comparison span two models without saying so.
+    `hazard` falls back to hazards.DEFAULT_HAZARD ("poisson_exact"). A script states it
+    anyway: it is a modelling choice of the same weight as the couplings, `bernoulli` is a
+    different model from the two route-B kernels, and the dump's frontmatter has to carry
+    it.
 
     An override of a name the preset does not have, and that is not a solver key, raises:
     swept axes (J here) are model parameters and pass, while `tau_m=...` or `Jay=...` is a typo
@@ -172,9 +181,16 @@ def params(name: str, *, hazard: str | None = None, **overrides) -> dict:
     hazard = hazard if hazard is not None else DEFAULT_HAZARD
     if hazard is None:
         raise ValueError(
-            "hazard must be given: it is its own axis, not part of a preset, and there is no "
-            "default convention yet. Pass hazard='poisson' (the MaxCal kernel at each bin) or "
-            "hazard='exp_surv' (exact survival for the same continuum).")
+            "hazard must be given: it is its own axis, not part of a preset. Pass "
+            "hazard='poisson_exact' (exact survival, the solver a dt -> 0 limit is taken "
+            "with), hazard='poisson' (the MaxCal kernel at each bin, for binned data) or "
+            "hazard='bernoulli' (route A, comparison only).")
+
+    if "dt" not in overrides:
+        raise ValueError(
+            f"params({name!r}) needs dt=: under route B there is no time quantum to default "
+            "to, so the solver step is a choice the run has to state (and the dump has to "
+            "record). Pass the coarse member of the Richardson pair, e.g. dt=0.5.")
 
     model_keys = MODEL_KEYS[POPS[name]]
     unknown = [k for k in overrides if k not in model_keys and k not in SOLVER_KEYS]
@@ -208,9 +224,11 @@ def banner(name: str, p: Mapping, *, keys: tuple[str, ...] | None = None) -> str
     a figure cannot claim a set it was not run at -- it is built from the dict that built the
     model. """
     head = f'{name}  ·  hazard={p.get("hazard", "?")}'
-    dt, dt0 = p.get("dt"), p.get("dt0")
-    if dt0 is not None:
-        head += f'  ·  dt={dt0 if dt is None else dt:g} (dt0={dt0:g})'
+    dt, t_abs = p.get("dt"), p.get("t_abs")
+    if dt is not None:
+        head += f'  ·  dt={dt:g}'
+    if t_abs is not None:
+        head += f'  ·  t_abs={t_abs:g} ms'
 
     keys = keys or ("J", "E", "beta", "theta", "tau_int", "tau_ref", "K_ref")
     shown = {k: p[k] for k in keys if k in p and not hasattr(p[k], "shape")}

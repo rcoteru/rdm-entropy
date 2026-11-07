@@ -114,7 +114,7 @@ def fp_overlap_map(m: torch.Tensor,        # (M,) trial overlaps
                    theta: torch.Tensor,    # (M,)
                    R: list[torch.Tensor],  # M tensors, (Qm[i],)
                    hazard: Hazard,
-                   lam0: float,
+                   nu0: float,
                    dt: float,
                    ) -> torch.Tensor:      # (M,) F(m)
     """ One evaluation of the overlap map F: trial overlaps -> stationary overlaps.
@@ -132,7 +132,7 @@ def fp_overlap_map(m: torch.Tensor,        # (M,) trial overlaps
     for i, R_i in enumerate(R):
         S_i = compute_stationary_forward_field(I[..., i], alpha[..., i], R_i.shape[-1])
         h_i = S_i + R_i - theta[..., i, None]
-        phi_i = hazard.phi(h_i, beta[..., i, None], lam0, dt)
+        phi_i = hazard.phi(h_i, beta[..., i, None], nu0, dt)
         rates.append(compute_stationary_age_distribution(phi_i)[1])
     return torch.stack(rates, dim=-1)
 
@@ -145,7 +145,7 @@ def fp_state(m: torch.Tensor,
              theta: torch.Tensor,
              R: list[torch.Tensor],
              hazard: Hazard,
-             lam0: float,
+             nu0: float,
              dt: float,
              ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """ The full stationary state (p, S) implied by a set of overlaps. """
@@ -154,7 +154,7 @@ def fp_state(m: torch.Tensor,
     for i, R_i in enumerate(R):
         S_i = compute_stationary_forward_field(I[..., i], alpha[..., i], R_i.shape[-1])
         h_i = S_i + R_i - theta[..., i, None]
-        phi_i = hazard.phi(h_i, beta[..., i, None], lam0, dt)
+        phi_i = hazard.phi(h_i, beta[..., i, None], nu0, dt)
         p_out.append(compute_stationary_age_distribution(phi_i)[0])
         S_out.append(S_i)
     return p_out, S_out

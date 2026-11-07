@@ -4,8 +4,16 @@ RDMNetwork(Batch) methods built on top of them. The reference everything is chec
 a fixed point must be a state forward() does not move, and its spectral radius must predict
 whether a small kick decays.
 
-Every model here uses hazard="async", so these are statements about the fixed-point
-machinery rather than about a particular kernel; the hazards are compared in test_srm.py. """
+Every model here uses hazard="poisson_exact", the route-B default: these are statements about
+the fixed-point MACHINERY rather than about a particular kernel, and the machinery takes the
+hazard as data and never asks which one it has. BISTABLE's beta is picked smaller than the rest
+(15 rather than 30) because the multi-root region it needs is read off through
+fp_eigenvalues -- an eigendecomposition of the age-grid Jacobian -- and poisson_exact's
+rate is exponential rather than bounded by a sigmoid; at beta = 30 the roots near the upper
+branch drive the field far enough that the Jacobian entries overflow and torch.linalg.eig
+segfaults in MKL rather than raising. The other single-root tests below have no such
+constraint and keep beta = 30. test_srm.py runs the same code paths through all three
+kernels. """
 
 import pytest
 import torch
@@ -19,16 +27,18 @@ from rdme.rdm_single import RDMIsingModel, RDMWilsonCowan
 torch.manual_seed(0)
 
 DT = 0.2
-ISING = dict(beta=30.0, theta=1.0, tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt0=DT,
-             hazard="async")
+# nu0 = 1 (the rate unit), poisson_exact; t_abs = 0 leaves the window out, since these tests
+# are about root finding and not about dead time
+LEGACY = dict(dt=DT, nu0=1.0, hazard="poisson_exact", t_abs=0.0)
+ISING = dict(beta=15.0, theta=1.0, tau_int=20.0, tau_ref=3.0, K_ref=0.0, **LEGACY)
 # J/E chosen inside the multi-root region: five fixed points, stable and unstable mixed
-BISTABLE = dict(J=30.0, E=0.4, **ISING)
+BISTABLE = dict(J=30.0, E=0.2, **ISING)
 
 # weights in physical units: srm builds the input from the rate, so no 1/DT here
 WC = dict(E_ratio=0.8, w_EE=3.0, w_EI=3.0, w_IE=-1.0, w_II=-1.0,
           E_exc=1.0, E_inh=1.0, beta_E=30.0, beta_I=30.0, theta_E=1.0, theta_I=1.0,
           tau_int_E=20.0, tau_int_I=20.0, tau_ref_E=3.0, tau_ref_I=3.0,
-          K_ref_E=0.0, K_ref_I=0.0, dt0=DT, hazard="async")
+          K_ref_E=0.0, K_ref_I=0.0, **LEGACY)
 
 
 @pytest.fixture(autouse=True)
@@ -180,9 +190,9 @@ def test_ising_fixed_point_is_stationary():
 
 
 def test_ising_free_run_lands_on_a_stable_root():
-    """ J is kept small on purpose: the slowest mode here has |lambda| ~ 0.9989, so the
-    relaxation already takes ~10^4 steps, and closer to the Hopf boundary (J/dt ~ 10) it
-    takes longer than any test wants to run. """
+    """ J is kept small on purpose: the slowest mode here has |lambda| ~ 0.9965, so the
+    relaxation already takes ~10^4 steps, and closer to a Hopf boundary it takes longer
+    than any test wants to run. """
     model = RDMIsingModel(J=0.5, E=1.0, **ISING)
     roots = model.fixed_points()
     stable = [r for r in roots if model.is_stable(r)]
@@ -278,8 +288,7 @@ def test_fp_sweep_matches_the_single_model():
     J = torch.tensor([1.0, 2.0, 3.0])
     E = torch.tensor([0.9, 1.1])
     batch = RDMIsingModelBatch(J=J, E=E, beta=30.0, theta=1.0,
-                                  tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt0=DT,
-                                   hazard="async")
+                                  tau_int=20.0, tau_ref=3.0, K_ref=0.0, **LEGACY)
 
     roots, converged = batch.fp_sweep(n_per_axis=6)
     assert roots.shape == (batch.B, 6, 1)
@@ -288,8 +297,7 @@ def test_fp_sweep_matches_the_single_model():
     # the grid is the outer product of J and E, in that order (see flatten_param_grid)
     for b, (j, e) in enumerate([(j, e) for j in J for e in E]):
         single = RDMIsingModel(J=j.item(), E=e.item(), beta=30.0, theta=1.0,
-                                   tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt0=DT,
-                                   hazard="async")
+                                   tau_int=20.0, tau_ref=3.0, K_ref=0.0, **LEGACY)
         expected = single.fixed_points(n_grid=2001)
         found = fpts.deduplicate(roots[b][converged[b]])
         # every Newton trajectory that converged must have landed on a genuine root
@@ -298,8 +306,7 @@ def test_fp_sweep_matches_the_single_model():
 
 def test_batch_set_state_is_stationary():
     batch = RDMIsingModelBatch(J=torch.tensor([1.0, 2.0]), E=1.0, beta=30.0,
-                                  theta=1.0, tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt0=DT,
-                                   hazard="async")
+                                  theta=1.0, tau_int=20.0, tau_ref=3.0, K_ref=0.0, **LEGACY)
     roots, converged = batch.fp_sweep(n_per_axis=4)
     m = roots[:, 0, :]                          # first guess converges for every cell here
     assert converged[:, 0].all()
@@ -315,8 +322,7 @@ def test_select_matches_the_batch_element():
     reproduce the batch's own step exactly, kernels and age grid included. """
     batch = RDMIsingModelBatch(J=torch.tensor([1.0, 2.0, 3.0]),
                                   E=torch.tensor([0.9, 1.1]), beta=30.0, theta=1.0,
-                                  tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt0=DT,
-                                   hazard="async")
+                                  tau_int=20.0, tau_ref=3.0, K_ref=0.0, **LEGACY)
     batch.forward(200, pb=False)
 
     for b in (0, 3, batch.B - 1):
@@ -331,8 +337,7 @@ def test_select_matches_the_batch_element():
     for b in (0, 3, batch.B - 1):
         one = RDMIsingModelBatch(J=torch.tensor([1.0, 2.0, 3.0]),
                                     E=torch.tensor([0.9, 1.1]), beta=30.0, theta=1.0,
-                                    tau_int=20.0, tau_ref=3.0, K_ref=0.0, dt0=DT,
-                                   hazard="async")
+                                    tau_int=20.0, tau_ref=3.0, K_ref=0.0, **LEGACY)
         one.forward(200, pb=False)
         sel = one.select(b)
         sel.update()
@@ -358,13 +363,40 @@ def test_bracket_roots_with_no_root_returns_empty():
     assert roots.shape == (0, 1)
 
 
-def test_bracket_roots_beta_zero_is_the_field_free_hazard():
-    """ The end-to-end version of the above: beta = 0 is a legitimate endpoint of a beta scan
-    and must give m* = 1/2 rather than raising. """
+@pytest.mark.parametrize("hazard", ["bernoulli", "poisson", "poisson_exact"])
+def test_bracket_roots_beta_zero_is_the_field_free_hazard(hazard):
+    """ beta = 0 is a legitimate endpoint of a beta scan. The hazard then does not depend on
+    the field at all, so every cohort fires with the same probability Phi(0) and the
+    stationary per-bin overlap IS that probability -- a closed form, and one that is different
+    for each kernel, which is why the oracle is read off the kernel rather than written as 1/2.
+
+    This also pins the one place the window and a zero gain interact: the absolute-refractory
+    floor is a FIELD floor, R_abs = S_max - theta + margin/beta, which is infinite at beta = 0,
+    and the model sizes it eagerly whenever t_abs > 0 -- so beta = 0 is only constructible with
+    no window at all, t_abs = 0.0 (the plain exponential kernel, no rate ceiling). At any t_abs
+    > 0 the same configuration raises regardless of how wide the window is, which is a true
+    statement about the floor rather than a failure of the scan; see
+    test_a_blocked_window_has_no_finite_floor_at_zero_gain. """
+    import rdme.hazards as hzd
     from rdme.rdm_batch import RDMIsingModelBatch
     net = RDMIsingModelBatch(J=15.0, E=0.0, beta=0.0, theta=0.5, tau_int=15.0, tau_ref=15.0,
-                             K_ref=15.0, dt0=1.0, dt=1.0, hazard="async", Qm=[64],
-                             device="cpu").select(0)
+                             K_ref=15.0, dt=0.5, nu0=1.0, t_abs=0.0, hazard=hazard,
+                             Qm=[64], device="cpu").select(0)
+    assert net.n_abs == 0, "the window must be empty, or there is a floor to size"
+    want = float(hzd.HAZARDS[hazard].phi(torch.zeros(1), 0.0, net.nu0, net.dt))
     roots = net.fixed_points(method="bracket", n_grid=401)
     assert roots.shape == (1, 1)
-    assert abs(float(roots[0, 0]) - 0.5) < 1e-12
+    assert abs(float(roots[0, 0]) - want) < 1e-12, (float(roots[0, 0]), want)
+
+
+def test_a_blocked_window_has_no_finite_floor_at_zero_gain():
+    """ The other half, stated as the error it is. The window is enforced by pushing the field
+    to -R_abs with R_abs = S_max - theta + margin/beta, so at beta = 0 no FINITE floor
+    suppresses firing and the model refuses to pretend otherwise. A beta scan that needs the
+    window at its endpoint has to reach zero gain some other way -- an age mask rather than a
+    field floor -- which is an open decision, not something to paper over here. """
+    from rdme.rdm_batch import RDMIsingModelBatch
+    with pytest.raises(ValueError, match="needs beta > 0"):
+        RDMIsingModelBatch(J=15.0, E=0.0, beta=0.0, theta=0.5, tau_int=15.0, tau_ref=15.0,
+                           K_ref=15.0, dt=0.5, nu0=1.0, hazard="poisson_exact", Qm=[64],
+                           device="cpu")

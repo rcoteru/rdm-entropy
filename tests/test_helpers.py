@@ -82,8 +82,8 @@ def test_epr_peak_matches_the_allocator():
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     mf = RDMIsingModelBatch(J=torch.linspace(5.0, 25.0, B), E=0.0, beta=8.0, theta=0.5,
-                            tau_int=15.0, tau_ref=15.0, K_ref=15.0, dt0=1.0, dt=1.0,
-                            hazard="async", Qm=[Q], device="cuda")
+                            tau_int=15.0, tau_ref=15.0, K_ref=15.0, dt=1.0, nu0=1.0,
+                            hazard="poisson_exact", Qm=[Q], device="cuda")
     mf.forward(30, pb=False)
     mf.entropy_trajectory(3, pb=False, chunk=chunk, inplace=True)
     real = torch.cuda.max_memory_allocated()

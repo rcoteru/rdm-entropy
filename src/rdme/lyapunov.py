@@ -24,7 +24,7 @@ the only one comparable across discretizations.
 
 The two differ in what a given spectrum MEANS, and they differ in opposite directions:
 
-                      genuine map (dt = dt0)        flow (dt refined below dt0)
+                      genuine map (legacy)          flow (every route-B model)
     fixed point       all lam < 0, not moving       all lam < 0
     periodic orbit    all lam < 0, moving           lam_1 = 0 > lam_2
     quasiperiodic     lam_1 = 0 > lam_2             lam_1 = lam_2 = 0
@@ -33,7 +33,8 @@ In a genuine map an attracting periodic orbit is a fixed point of its P-th itera
 exponent is strictly negative and `moving` has to supply the dead/oscillating bit. Sample a FLOW
 every dt and its limit cycle keeps the phase direction, so lam_1 sits at zero and the same
 reading would file it as quasiperiodic. Pass `continuous=` to classify_spectrum accordingly;
-with dt0 and dt both on the model, `continuous = mf.dt < mf.dt0` is the test. """
+the model answers it as `mf.is_flow`, which is True for every route-B model and False only for
+the legacy discrete one ("bernoulli" at nu0*dt = 1). """
 
 
 # Tangent dynamics
@@ -313,16 +314,16 @@ def classify_spectrum(lam: torch.Tensor,            # (..., k) exponents per uni
                       moving: torch.Tensor,         # (...) bool: the state varies in time
                       se: torch.Tensor | None = None,   # (..., k) standard error of lam
                       n_sigma: float = 3.0,         # how many SE a nonzero exponent must clear
-                      continuous: bool = False,     # True when dt < dt0, i.e. sampling a flow
+                      continuous: bool = False,     # True when sampling a flow: mf.is_flow
                       ) -> torch.Tensor:            # (...) long, one of the class codes above
     """ Attractor class from the leading exponents.
 
     `continuous` says which regime the spectrum came from, and it is NOT a detail: the map and
     flow readings disagree about exactly the case that dominates these sweeps, an ordinary
-    oscillation. See the module docstring for the two tables. With dt0 and dt both carried on
-    the model, the test is `continuous = mf.dt < mf.dt0`.
+    oscillation. See the module docstring for the two tables. The model answers it:
+    `continuous = mf.is_flow`.
 
-    continuous=False (a genuine map, dt = dt0). An attracting periodic orbit is a fixed point
+    continuous=False (a genuine map: the legacy "bernoulli" kernel at nu0*dt = 1). An attracting periodic orbit is a fixed point
     of its P-th iterate, so every exponent is strictly negative and lam_1 < 0 does NOT separate
     a dead cell from an oscillating one; `moving` -- in practice a variance or CV test from a
     cheaper screening pass -- supplies that bit. A zero exponent means an invariant circle.

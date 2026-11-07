@@ -4,6 +4,8 @@ import hashlib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+import math
+
 import torch
 
 """ Small utilities for the scripts -- the cache naming and the plotting-stage helpers --
@@ -244,6 +246,12 @@ def fit_age_grid(build, *, tol: float = 1e-2, equi: int = 20000,
         err = mf.truncation_error()
         err = float(err.max()) if torch.is_tensor(err) else float(err)
         del mf
+        if math.isnan(err):
+            raise RuntimeError(
+                f"truncation_error is nan at Qm={qm}: the pilot run itself diverged, so "
+                "there is no grid size that will satisfy the tolerance. Check the swept "
+                "axis for degenerate values (beta = 0 gives an infinite R_abs) before "
+                "raising tol or max_doublings.")
         if verbose:
             print(f"  age grid: Qm={qm} -> truncation_error={err:.2e}"
                   f"{'  [ok]' if err < tol else '  [too coarse]'}")
@@ -266,7 +274,6 @@ def fit_age_grid(build, *, tol: float = 1e-2, equi: int = 20000,
     # rather than tol: the interpolation is only approximate, so targeting the threshold
     # itself lands on either side of it with even odds and wastes the probe half the time.
     if lo_err > 0 and err > 0:
-        import math
         target = tol / 3
         f = (math.log(lo_err) - math.log(target)) / (math.log(lo_err) - math.log(err))
         mid = [max(a + 1, int(a + f * (b - a))) for a, b in zip(lo, qm)]

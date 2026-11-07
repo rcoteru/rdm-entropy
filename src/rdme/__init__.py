@@ -1,92 +1,67 @@
-""" The mean field with the hazard as a parameter, spanning the synchronous model of
-the pre-port implementation and the two continuous-time models of App. "Time Discretization and the
-Continuous-Time Limit".
+""" Refractory density method for SRM_0 populations, with the hazard as a parameter.
 
-Three per-bin kernels, all passing through the synchronous model at lam0*dt = 1 (which is
-itself a fourth, the sigmoid, carried only as that limit since it has no dt -> 0 limit of its
-own). With c = lam0*dt/2 and ell = logit(c):
+THE MODEL (route B, decided 2026-11-07). A population of SRM_0 neurons whose firing is a
+maximum-caliber tilt of a Poisson reference process of rate nu0. Writing x = beta*h with
+h(u, t) = S(u, t) + R(u) - theta, c = nu0*dt and ell = logit(c):
 
-    async         Phi = lam0*dt * sigma(beta*h)         -> rate lam0*sigma(beta*h)
-    escape        Phi = 1 - (1 + e^{beta*h})^(-lam0*dt) -> rate lam0*softplus(beta*h)
-    poisson       Phi = sigma(beta*h + ell)             -> rate (lam0/2)*exp(beta*h)
+    poisson        Phi = sigma(x + ell)            -> rate nu0 e^x      (MaxCal at every dt)
+    poisson_exact  Phi = 1 - exp(-nu0 e^x dt)      -> rate nu0 e^x      (exact survival)
+    bernoulli      Phi = nu0*dt * sigma(x)         -> rate nu0 sigma(x) (route A, legacy)
 
-poisson is the only one that is maximum caliber at every dt: MaxCal against a Poisson reference
-firing with probability c per bin gives a logistic kernel with a shifted field at every step,
-and c = lam0*dt/2 makes the reference unbiased exactly at the quantum. The other two are MaxCal
-only there. Its rate is unbounded, like escape's and unlike async's, and exponential rather
-than linear at strong drive; at weak drive it carries a factor of one half against the other
-two, equivalently a threshold shifted by ln2/beta, which is the price of that calibration.
+One model, two kernels for it. `poisson` and `poisson_exact` share a rate function exactly and
+so are the same continuous-time model under two discretization maps; `bernoulli` is route A,
+kept for comparison and for equivalence claims about the time-discrete construction this
+project started from, and is not the hazard of a measurement.
 
-The families differ in the discretization map (linear thinning against exact survival),
-which only changes the speed of convergence, and in the rate function, which changes the
-limit -- so they converge to different continuous-time models. The gap is set by the time
-quantum relative to the kernels, not by the step: measured here at strong drive against
-tau_ref = 3, the two rates differ by 3% at dt0 = 0.5, 27% at dt0 = 3 and 104% at dt0 = 12.
+Which to use. `poisson` is the model of BINNED DATA: maximum caliber against the reference, at
+every bin width, so refining dt refines one variational problem instead of walking across a
+family of them. `poisson_exact` is the SOLVER for the same continuum: its per-bin error is
+single-signed, so it approaches the limit monotonically and can be Richardson-extrapolated,
+while `poisson`'s error changes sign at threshold and the extrapolation fails on an attractor
+that crosses it. Measurements are quoted as a dt -> 0 limit, by default Richardson from a
+coarse pair (dt, dt/2) with `poisson_exact`.
 
-the pre-port implementation stays the reference implementation and is deliberately untouched. Everything
-here is checked against it at hazard="sigmoid", lam0*dt = 1, where the two models coincide --
-so the discrete model is the oracle for the dynamics, the fixed points, the Jacobian spectrum
-and the entropy production alike.
-
-The model of the pre-port implementation fixes the firing probability *per bin*, so its escape rate
-softplus(beta*h)/dt diverges as dt -> 0: it is a discrete-time model tied to the step at which
-it is defined, its time quantum dt0. This module implements the continuous-time model that the
-appendix builds instead, in which the *rate* is held fixed,
-
-    lambda(h) = lam0 * softplus(beta*h),          lam0 = 1/dt0,
-
-so the one-bin survival is exp(-lambda*dt) and the hazard
-
-    Phi(beta*h) = 1 - (1 + exp(beta*h))**(-lam0*dt)
-
-reduces to the sigmoid exactly at lam0*dt = 1. Refining dt here refines the *numerics* of one
-model, instead of walking across a family of different ones, which is what refining dt does in
-the pre-port implementation.
+Parameters, and what is NOT one. nu0 is a rate UNIT, 1 ms^-1: the reference's rate, against
+which the tilt is measured. It is not identifiable on its own -- (nu0, theta) -> (nu0
+e^{beta delta}, theta + delta) leaves Phi unchanged for poisson_exact exactly -- which is why
+it is fixed rather than fitted. t_abs is the absolute refractory period in ms, a PHYSICAL dead
+time and an independent parameter: the route-B rate is unbounded and exponential, so t_abs is
+the only thing that caps the realised firing rate, at 1/t_abs. dt is the solver step and
+nothing else; there is no time quantum, no dt0, and no model parameter that moves when the
+step does.
 
 The continuum equations are the transport pair
 
     d_t q^a + d_u q^a = -lambda(h^a(u,t)) q^a(u,t),      q^a(0,t) = r^a(t),
-    d_t S^a + d_u S^a = (I^a(t) - S^a(u,t)) / tau_m^a,   S^a(0,t) = 0,
+    d_t S^a + d_u S^a = (I^a(t) - S^a(u,t)) / tau_int^a, S^a(0,t) = 0,
 
-with h^a(u,t) = S^a(u,t) + R^a(u) - theta^a, R^a(u) = -K^a exp(-u/tau_ref^a), the input
+with R^a(u) = -K^a exp(-u/tau_ref^a) floored to -R_abs over the dead time, the input
 I^a(t) = sum_b w^{ab} r^b(t) + E^a, and the closure r^a(t) = int lambda(h^a(u,t)) q^a(u,t) du.
 
 Scheme. Age and time are advanced together on a single grid, du = dt, so cohorts move along
 the characteristics u - t = const exactly and no interpolation or numerical diffusion enters.
-Over one bin a cohort's mass is multiplied by 1 - Phi, the exact survival for a rate frozen at
-its value at the start of the bin, and the synaptic recursion with alpha = 1 - exp(-dt/tau_m)
-is the exact solution of the second equation for an input frozen across the bin. The only
-errors are the variation of rate and input within a bin, O(dt) over a fixed physical time.
+Over one bin a cohort's mass is multiplied by 1 - Phi, and the synaptic recursion with
+alpha = 1 - exp(-dt/tau_int) is the exact solution of the second equation for an input frozen
+across the bin. The only errors are the variation of rate and input within a bin, O(dt) over a
+fixed physical time -- bounded locally by lambda*dt/2 for `poisson_exact`
+(hazards.step_error).
 
-That scheme is, deliberately, the update of the pre-port implementation with a different hazard -- which is
-the appendix's point, that the discrete model is an exponential integrator for these equations,
-consistent with them only at dt = dt0. The step functions are imported from there rather than
-re-derived so the two cannot drift apart, and `hazard="sigmoid"` reproduces RDMNetwork exactly,
-which is how the equivalence is tested.
+Call-site conventions:
 
-API mirrors the pre-port RDMNetwork, with two differences that matter at the call site:
-
-  Weights are NOT pre-divided by dt. RDMNetwork is given w/dt and multiplies by the per-bin
-  overlap m; here the input is built from the rate r = m/dt directly, so w is passed in its
-  physical units. Passing w/dt here, out of habit, silently rescales the whole network.
+  Weights are NOT pre-divided by dt. The input is built from the rate r = m/dt directly, so w
+  is passed in physical units. Passing w/dt, out of habit, silently rescales the whole network.
 
   The natural observable is the rate r (per unit time), not the per-bin overlap m. Both are
-  exposed, since m is what RDMNetwork reports and the comparison needs it, but only r is
-  meaningful across different dt.
+  exposed, since m is what the discrete implementation reports and the comparison needs it,
+  but only r is meaningful across different dt.
 
-Single-system only for now; the batched counterpart comes later.
+  t_abs must be an integer number of bins: kernels.n_abs_bins refuses a dt that does not
+  divide it, because a window that rounds moves with the step.
 
-Entropy production is a functional of Phi alone, so it is computed once for every
-hazard: epr_from_joint writes the plain Bernoulli entropy rather than mean_field's
-softplus/logit form, which is an identity of the logistic kernel only. It is computed by the
-O(Q^2) reference path (joint distribution -> EPR), not
-the O(Q) sliding recursions of the pre-port implementation. The sliding version is ~200 lines of
-hand-optimised state updates with the sigmoid baked in, including one bare torch.sigmoid that
-bypasses compute_firing_prob; threading a hazard through it is a much larger change with much
-more to go wrong, and the reference path is what it was validated against in the first place.
-At a few hundred age bins the quadratic cost is seconds per run, not minutes.
-
-A caveat on reading those outputs across resolutions: by the appendix only sigma/dt has a
-continuum limit, while H_fwd and H_rev each diverge as -r ln dt, being entropies of a binned
-process against a counting measure. They are comparable at fixed dt and not across it. """
-
+Entropy production is a functional of Phi alone, so it is computed once for every hazard:
+epr_from_joint writes the plain Bernoulli entropy rather than the softplus/logit form, which
+is an identity of the logistic kernel only. sigma is the reported quantity; the forward and
+reverse terms H and H_rev each diverge as rate*ln(1/dt) against a counting measure, and are
+reported RELATIVE TO THE POISSON REFERENCE, which is finite as dt -> 0 and is the model's own
+reference measure under route B. The raw values are kept as a control (increment per halving
+-> r ln 2). """

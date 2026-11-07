@@ -48,12 +48,18 @@ REGIMES: dict[str, dict] = {
 
     # Same mechanism driven harder: a cleaner limit cycle (CV 5.45) at the cost of a coupling
     # further from anything defensible. Its K_ref = 0 control is also a clean fixed point.
-    "ref_lowbeta_strong": dict(J=40, E=0, beta=8, theta=0.5,
+    "ref_lowbeta_strong": dict(J=40., E=0, beta=8, theta=0.5,
                                tau_int=10, tau_ref=25, K_ref=25,
                                dt=0.5, hazard="async"),
+
+    "noref_driven_strong": dict(J=6, E=1, beta=40, theta=0.5,
+                                tau_int=15, tau_ref=1, K_ref=0,
+                                dt=0.1, hazard="poisson"),
+
 }
 
 regime = "ref_lowbeta"  # pick one of the above regimes to run
+regime = "noref_driven_strong"
 
 DT0    = 1       # the time unit: lam0 = 1/dt0 is the maximal rate, so this is not a knob
 TOL    = 1e-2      # age-grid accuracy; Qm is fitted to it rather than set by hand
@@ -112,7 +118,7 @@ if run_sim and (overwrite or not CACHE.exists()):
 
     # the spin network carries an age per neuron and has no age grid, so Qm is the one thing
     # the two models do not share
-    sm = SpinIsingModel(N, PARAMS["J"], **mf_args, device=DEVICE, ic="silent")
+    sm = SpinIsingModel(N, PARAMS["J"], **mf_args, device=DEVICE, ic="random")
     mf = RDMIsingModel(PARAMS["J"], **mf_args, Qm=Qm, eps=0.01, device=DEVICE)
     print(f"Q = {mf.Qm} age bins. Running {T_EQUI + T_MEAS:g} ms of each model "
           f"({steps1 + steps2} steps at dt={PARAMS['dt']:g}) on {DEVICE}.")

@@ -2,7 +2,6 @@ import functools
 import time
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import torch
 
 import rdme.fixed_points as fpts
@@ -11,16 +10,18 @@ import rdme.plots as rp
 import rdme.presets as pre
 from rdme.rdm_batch import RDMIsingModelBatch
 
-
 # ── Parameters ────────────────────────────────────────────────────────────────
 
 PRESET = "S1"
-HAZARD = "async"        # stated per script: the hazard is its own axis, not part of a preset
+HAZARD = "poisson"        # stated per script: the hazard is its own axis, not part of a preset
 
 PARAMS: dict = pre.params(
     PRESET, hazard=HAZARD,
-    J       = 15.0,                            # inside the oscillatory window; see the docstring
-    beta    = torch.linspace(0.0, 60.0, 300),
+    J       = 17.0,                            # inside the oscillatory window; see the docstring
+    # beta > 0 strictly: the absolute-refractory floor is sized as margin/beta
+    # (kernels.abs_refractory_floor), which is +inf at beta = 0 and makes the field nan.
+    # beta = 0 is a degenerate model anyway -- Phi = lam0*dt/2 at every age, no threshold.
+    beta    = torch.linspace(0.0, 60.0, 301)[1:],   # 0.2 ... 60, spacing 0.2
     dt      = 0.5,
 )
 

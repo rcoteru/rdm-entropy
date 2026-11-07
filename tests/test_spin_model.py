@@ -25,7 +25,8 @@ def test_entropy_trajectories_share_a_time_origin():
 
     torch.manual_seed(3)
     dt = 0.2
-    args = dict(J=4, E=1, beta=30, theta=1, tau_int=12, tau_ref=3, K_ref=0, dt0=dt)
+    args = dict(J=4, E=1, beta=30, theta=1, tau_int=12, tau_ref=3, K_ref=0,
+                dt=dt, nu0=1.0 / dt, t_abs=0.0, hazard="poisson_exact")
     T = 60
 
     def spin():
@@ -44,7 +45,7 @@ def test_entropy_trajectories_share_a_time_origin():
         assert run(m)["m_tot"][0].item() == pytest.approx(m0, abs=1e-6)
 
     # and the mean field agrees: its index 0 is the overlap it was sitting at
-    net = RDMIsingModel(**args, hazard="async", eps=0.01, device="cpu")
+    net = RDMIsingModel(**args, eps=0.01, device="cpu")
     net.forward(50)
     p0 = net.m[0].item()
     assert net.entropy_trajectory(T, pb=False)["m_tot"][0].item() == pytest.approx(p0, abs=1e-12)
@@ -65,27 +66,35 @@ def test_spin_epr_pairs_both_halves_of_the_same_transition():
     from rdme.spin_model import SpinIsingModel
 
     torch.manual_seed(7)
-    dt = 0.2
+    dt, nu0 = 0.2, 5.0
     T = 80
     m = SpinIsingModel(N=3000, J=4, E=1, beta=30, theta=1, tau_int=12, tau_ref=3,
-                       K_ref=0, dt0=dt, device="cpu", ic="silent")
+                       K_ref=0, dt=dt, nu0=nu0, hazard="poisson_exact", t_abs=0.0,
+                       device="cpu", ic="silent")
     m.forward(400)
     out = m.entropy_trajectory(T, buffer=60, s=True, fields=True)
 
-    softplus = torch.nn.functional.softplus
+    # -ln p(s | h) under poisson_exact's closed form, h = beta*(field), y = rate*dt = nu0 e^h dt.
+    # log(1 - Phi) = -y exactly (no cancellation, unlike reconstructing it from a saturated
+    # Phi), which is the whole point of carrying the exact-survival kernel; so build the
+    # silent branch from y directly rather than through phi.
+    def nlp(s, h):
+        y = nu0 * dt * h.exp()
+        return -s * torch.log(-torch.expm1(-y)) + (1 - s) * y
+
     s_t = out["s"].float()                      # s[t], index-aligned with the report
 
     # the reverse half is emitted against s[t] -- this is the pairing under test
-    H_rev = (-s_t * out["hr"] + softplus(out["hr"])).mean(dim=1)
+    H_rev = nlp(s_t, out["hr"]).mean(dim=1)
     assert torch.allclose(H_rev, out["H_rev_tot"].float(), atol=1e-5)
 
     # the forward half against s[t+1], which is s_t shifted by one
-    H_fwd = (-s_t[1:] * out["hf"][:-1] + softplus(out["hf"][:-1])).mean(dim=1)
+    H_fwd = nlp(s_t[1:], out["hf"][:-1]).mean(dim=1)
     assert torch.allclose(H_fwd, out["H_fwd_tot"][:-1].float(), atol=1e-5)
 
     # pairing the reverse half against s[t+1] instead is the old convention, and it is
     # a genuinely different per-step series -- so the assertion above has teeth
-    old = (-s_t[1:] * out["hr"][:-1] + softplus(out["hr"][:-1])).mean(dim=1)
+    old = nlp(s_t[1:], out["hr"][:-1]).mean(dim=1)
     assert not torch.allclose(old, out["H_rev_tot"][:-1].float(), atol=1e-3)
 
     # identical up to float32 rounding: both come from the same ent_f/ent_r reductions
@@ -100,7 +109,8 @@ def test_spin_epr_chunked_matches_the_windowed_reference():
     dt = 0.2
     T = 60
     kw = dict(N=4000, J=4, E=1, beta=30, theta=1, tau_int=12, tau_ref=3,
-              K_ref=0, dt0=dt, device="cpu", ic="silent")
+              K_ref=0, dt=dt, nu0=1.0 / dt, hazard="poisson_exact", t_abs=0.0,
+              device="cpu", ic="silent")
 
     # both runs have to sample the SAME trajectory to be compared step by step, and the
     # draws depend on the default dtype -- so pin it rather than inherit it from whichever
@@ -138,7 +148,8 @@ def test_entropy_trajectory_leaves_the_model_at_index_T():
     dt = 0.2
     T = 300
     kw = dict(N=5000, J=4, E=1, beta=30, theta=1, tau_int=12, tau_ref=3,
-              K_ref=0, dt0=dt, device="cpu", ic="silent")
+              K_ref=0, dt=dt, nu0=1.0 / dt, hazard="poisson_exact", t_abs=0.0,
+              device="cpu", ic="silent")
 
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.float32)
@@ -182,15 +193,18 @@ def test_spin_and_mean_field_entropy_trajectories_share_a_dict_contract():
               tau_int_E=10.0, tau_int_I=5.0, tau_ref_E=3.0, tau_ref_I=3.0)
 
     # both models take w in physical units, so one weight set describes the network
-    net = RDMWilsonCowan(K_ref_E=0.0, K_ref_I=0.0, dt0=dt, hazard="async", **kw)
+    legacy = dict(dt=dt, nu0=1.0 / dt, t_abs=0.0)
+    net = RDMWilsonCowan(K_ref_E=0.0, K_ref_I=0.0, hazard="poisson_exact", **legacy, **kw)
     net.forward(200)
     mf_out = net.entropy_trajectory(T, pb=False)
 
-    spin = SpinWilsonCowan(N=4000, K_ref1=0.0, K_ref2=0.0, dt0=dt, device="cpu",
+    spin = SpinWilsonCowan(N=4000, K_ref1=0.0, K_ref2=0.0, hazard="poisson_exact",
+                           **legacy, device="cpu",
                            ic="silent", **kw)
     spin.forward(200)
     sm_out = spin.entropy_trajectory(T, buffer=60)
-    sm_chunk = SpinWilsonCowan(N=4000, K_ref1=0.0, K_ref2=0.0, dt0=dt, device="cpu",
+    sm_chunk = SpinWilsonCowan(N=4000, K_ref1=0.0, K_ref2=0.0, hazard="poisson_exact",
+                               **legacy, device="cpu",
                                ic="silent", **kw)
     sm_chunk.forward(200)
     ck_out = sm_chunk.entropy_trajectory_chunked(T, chunk=64, overlap=32,
