@@ -24,13 +24,14 @@ Two operating points of S1, either side of the Hopf: J = 10 (S1/fp), a stable fi
 where sigma vanishes identically and only the rate converges; and J = 17, the candidate cycle
 point. Both are J overrides on the preset and nothing else.
 
-THE CYCLE POINT IS A CANDIDATE, not a decision. Under route B the Hopf moved: it sat at
-J = 12.0588 with the legacy sigmoid kernel (= `bernoulli` at nu0*dt = 1) and is expected near
-J = 14.4-14.6 under poisson_exact. J = 17 is 2.4-2.6 above that estimate, which is the margin
-this script needs -- the amplitude of a Hopf cycle goes like sqrt(J - Jc), so a point measured
-just past onset has a small amplitude read in the sensitive neighbourhood of a bifurcation
-that is itself still moving with dt. S1-cycle_point.py is what fixes J_c; when it does, re-read
-this script's margin against the number it reports rather than against the estimate above.
+THE CYCLE POINT IS A WORKING VALUE, not a decision: POINTS["S1/cycle"] is still unset and
+J = 17 is carried here as a literal. The Hopf is now MEASURED rather than estimated --
+J_c = 11.534 +- 0.012 under poisson_exact as a dt -> 0 limit (S1-cycle_point.py), against
+12.0588 with the legacy sigmoid kernel. So J = 17 sits 5.47 past onset, not the 2.4-2.6 this
+script assumed when J_c was guessed at 14.4-14.6 (which was route-A poisson, never a route-B
+prediction). That margin is what the script needs: the amplitude of a Hopf cycle goes like
+sqrt(J - Jc), so a point measured just past onset has a small amplitude read in the sensitive
+neighbourhood of a bifurcation that is itself still moving with dt.
 
 Not further than 17, though, and that bound is the exponential rate's: the drive that buys
 margin also buys stiffness. Under route A, peak max(rate)*dt at dt = 1/4 ran 0.08, 0.32, 1.70,
@@ -61,12 +62,14 @@ halving in; `bernoulli` allows the equality; `poisson_exact` has no arithmetic c
 is set by accuracy alone (hazards.step_error). Skipped combinations are reported, not clamped.
 """
 
+import math
 import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
 
+import rdme.epr as epr
 import rdme.hazards as hzd
 import rdme.helpers as hlp
 import rdme.plots as rp
@@ -101,8 +104,33 @@ REGIMES: dict[str, dict] = {
     # zero by 16000 ms while 4000 ms was simply not settled for the sigmoid kernels -- reading
     # that residual 5e-8 as a property of a kernel would have been a claim about nothing.
     "fixed point": dict(J=10.0, rec_ms=500.0, equi_ms=16000.0),   # = POINTS["S1/fp"]
-    "limit cycle": dict(J=17.0, rec_ms=2500.0, equi_ms=4000.0),   # candidate; see the docstring
+    "limit cycle": dict(J=17.0, rec_ms=2500.0, equi_ms=4000.0),   # working value; see docstring
+    # The SAME cycle, approached kernel by kernel from each one's own onset. A regime's J may
+    # be a dict keyed by hazard, which is what this one is; see J_MATCHED below for why.
+    "matched cycle": dict(J=None, rec_ms=2500.0, equi_ms=4000.0),
 }
+
+# Each kernel's Hopf, as a dt -> 0 limit (S1-hopf_dt.py; dump
+# P1_2026-11-07_S1-cycle_point_hopf-and-cycle-point.md). These are MEASURED numbers, not
+# estimates, and they are what makes the third regime possible.
+J_C = {"bernoulli": 12.3525, "poisson": 11.4646, "poisson_exact": 11.5318}
+
+# Why a third regime at all. Comparing the three kernels at one J compares them at three
+# different distances past three different bifurcations -- bernoulli's onset is 0.82 above
+# poisson_exact's, so at J = 17 it is a fifth less far past its own Hopf, and a cycle's every
+# observable (amplitude, period, sigma) varies steeply with that distance near onset. Any
+# ratio read at fixed J therefore mixes a kernel difference with a distance difference. That
+# is what made the old "route B's sigma is 1.43x bernoulli's" hard to read.
+#
+# At matched Delta each kernel is the same distance past its OWN onset, which is the
+# comparison the kernels can actually be asked for. Delta is set by the working cycle point,
+# so poisson_exact's matched J is exactly the J = 17 of the regime above and the two regimes
+# share a column -- which is itself the control: the difference between the fixed-J and
+# matched-Delta answers is zero for poisson_exact by construction, and is the size of the
+# effect for the other two.
+DELTA = REGIMES["limit cycle"]["J"] - J_C["poisson_exact"]        # 5.468
+J_MATCHED = {h: round(J_C[h] + DELTA, 4) for h in HAZARDS}
+REGIMES["matched cycle"]["J"] = J_MATCHED
 
 # Each halving costs about four times the previous one -- twice the steps on twice the age
 # bins, and the EPR's ring buffer is (Q, Q) -- so the last entry is most of the wall time and
@@ -148,8 +176,13 @@ DEVICE = 'cpu'     # one system stepping a few thousand age bins is launch-laten
                    # there is little for a GPU to do here; the batched scans are where it pays
 
 # Column layout of the per-(hazard, regime) result tensor, (len(DTS), len(COLS)).
-COLS = ("r", "sigma", "H_fwd", "H_rev", "period", "ptp", "Q", "phi_max", "rate_max",
-        "trunc", "secs")
+# H is carried TWICE, raw and relative to the Poisson reference, as CLAUDE.md's EPR rule
+# asks: the raw pair diverges as r ln(1/dt) and is the control (its increment per halving
+# must come out at r ln 2), while the referenced pair is the finite one and is what is
+# comparable across steps. sigma is identical either way -- both halves subtract the same
+# H_ref -- which is the check on the subtraction.
+COLS = ("r", "sigma", "H_fwd", "H_rev", "H_rel_fwd", "H_rel_rev", "period", "ptp", "acf1",
+        "Q", "phi_max", "rate_max", "trunc", "secs")
 
 # The converging observables and the regimes each is reported in, shared by the tables and the
 # figures so the two cannot drift apart. Everything but the rate belongs to the cycle: sigma
@@ -157,10 +190,16 @@ COLS = ("r", "sigma", "H_fwd", "H_rev", "period", "ptp", "Q", "phi_max", "rate_m
 # H_fwd/H_rev are deliberately absent -- they diverge, and are handled as the control.
 REPORTED: dict[str, tuple[str, ...]] = {
     "r":      tuple(REGIMES),
-    "sigma":  ("limit cycle",),
-    "period": ("limit cycle",),
-    "ptp":    ("limit cycle",),
+    "sigma":  ("limit cycle", "matched cycle"),
+    "period": ("limit cycle", "matched cycle"),
+    "ptp":    ("limit cycle", "matched cycle"),
 }
+
+# ptp is reported but NEVER extrapolated (decided 2026-11-08): the cycle amplitude has no
+# dt -> 0 limit -- the observed order is still 0.76 at dt = 1/64 and the value still climbing
+# -- so it is quoted at a stated dt and may not enter an exponent, a scaling fit or a
+# Richardson call. `richardson` refusing it is correct behaviour, not a bug to work around.
+NO_LIMIT = ("ptp",)
 
 
 # ── Paths & switches ──────────────────────────────────────────────────────────
@@ -225,6 +264,17 @@ def measure(J: float, hazard: str, dt: float, Qm: list[int], rec_ms: float,
     a, b, n_cyc = hlp.cycle_window(r)
     period = (b - a) * dt / n_cyc if n_cyc else float('nan')
 
+    # H relative to the Poisson reference, over the same cycle-aligned window. The reference
+    # is the model's own under route B -- the kernel is a MaxCal tilt of it -- so this is the
+    # prior being divided out, not a trick to cancel a divergence.
+    href = epr.poisson_reference_entropy(traj["m_tot"][a:b], MODEL["nu0"], dt)
+
+    # Lag-1 autocorrelation of the rate over the averaged window. -1 is the whole population
+    # firing in alternate bins, which is a step artifact and not a cycle; at the coarse end of
+    # this sweep that is the thing to rule out before reading any number off the row.
+    x = r[a:b] - r[a:b].mean()
+    acf1 = float((x[:-1] * x[1:]).sum() / x.pow(2).sum().clamp_min(1e-300))
+
     # The grid is sized on the attractor the run actually found, so the bound is read off the
     # end of the run rather than trusted from the pilot.
     trunc = net.truncation_error()
@@ -247,8 +297,11 @@ def measure(J: float, hazard: str, dt: float, Qm: list[int], rec_ms: float,
             float(traj["sigma_tot"][a:b].mean()) / dt,
             float(traj["H_fwd_tot"][a:b].mean()) / dt,
             float(traj["H_rev_tot"][a:b].mean()) / dt,
+            float((traj["H_fwd_tot"][a:b] - href).mean()) / dt,
+            float((traj["H_rev_tot"][a:b] - href).mean()) / dt,
             period,
             float(r[a:b].max() - r[a:b].min()),
+            acf1,
             float(Qm[0]), float(phi_max), float(rate_max), float(trunc), time.time() - t0]
 
 
@@ -275,7 +328,10 @@ if run_sim:
             if (hazard, name) in res:
                 print(f"\n[{hazard}, {name}] cached")
                 continue
-            J, rec_ms = reg["J"], reg["rec_ms"]
+            # A regime's J is one number, or one per hazard when the regime is defined by a
+            # distance to onset rather than by a coupling (see J_MATCHED).
+            J = reg["J"][hazard] if isinstance(reg["J"], dict) else reg["J"]
+            rec_ms = reg["rec_ms"]
             equi_ms = reg.get("equi_ms", EQUI_MS)
 
             # One fit per (hazard, regime), in ms. Sized on the attractor at EQUI+REC, as
@@ -322,6 +378,21 @@ if run_plot:
     # Which observables are converged where; REPORTED says where each one means anything.
     for name in REGIMES:
         for key in (k for k, rows in REPORTED.items() if name in rows):
+
+            # The amplitude is quoted, never extrapolated. It has no dt -> 0 limit here, so
+            # there is no limit column to put beside it and no rel err to measure against:
+            # the honest table is the values and the step each was read at.
+            if key in NO_LIMIT:
+                print(f"\n[{name}] {key} at each step -- NOT extrapolated, no dt -> 0 limit:")
+                print(f"    {'dt':>8} " + "".join(f"{h:^16}" for h in HAZARDS))
+                for j, dt in enumerate(dts):
+                    print(f"    {dt:8.4f} " + "".join(
+                        f"{float(res[(h, name)][j, col[key]]):16.8g}" for h in HAZARDS))
+                for h in HAZARDS:
+                    o = ['%.2f' % v for v in orders(res[(h, name)][:, col[key]]).tolist()]
+                    print(f"    {h:>13}: observed orders {o} -- quoted at a stated dt")
+                continue
+
             print(f"\n[{name}] {key}, against the Richardson limit of each hazard:")
             print(f"    {'dt':>8} " + "".join(f"{h:^25}" for h in HAZARDS))
             print(f"    {'':>8} " + "".join(f"{'value':>14}{'rel err':>11}" for _ in HAZARDS))
@@ -363,16 +434,41 @@ if run_plot:
                                    for h in HAZARDS)
                 print(f"    rel err < {t:.0e} from dt = {shown}   ->  {verdict}")
 
-    # The control: H is supposed to diverge, and by a known amount per halving.
-    print(f"\n[control] H/dt per halving of dt, against the -r ln 2 a binned entropy "
+    # The control: the RAW H is supposed to diverge, and by a known amount per halving.
+    print(f"\n[control] raw H/dt per halving of dt, against the r ln 2 a binned entropy "
           f"against a counting measure predicts:")
     for name in REGIMES:
         for h in HAZARDS:
-            pred = float(res[(h, name)][-1, col["r"]]) * float(torch.log(torch.tensor(2.0)))
+            pred = float(res[(h, name)][-1, col["r"]]) * math.log(2.0)
             for key in ("H_fwd", "H_rev"):
                 v = res[(h, name)][:, col[key]]
-                print(f"    {h:>8} {name:>12} {key:>6}: "
+                print(f"    {h:>8} {name:>13} {key:>6}: "
                       f"{['%.5f' % d for d in v.diff().tolist()]}  (predicts {pred:.5f})")
+
+    # The other half of the same rule: relative to the Poisson reference, H is FINITE and has
+    # a dt -> 0 limit like any other reported quantity. Printed beside the raw pair so the
+    # dump carries both, which is what CLAUDE.md's EPR rule asks for.
+    print(f"\n[referenced] H - H_ref, per ms, with its dt -> 0 limit:")
+    for name in REGIMES:
+        for h in HAZARDS:
+            for key in ("H_rel_fwd", "H_rel_rev"):
+                v = res[(h, name)][:, col[key]]
+                lim, pw = richardson(v)
+                tail = ("NO LIMIT (richardson refused)" if lim != lim
+                        else f"limit {lim:.8g} (order {pw:.2f})")
+                print(f"    {h:>8} {name:>13} {key:>10}: "
+                      f"{['%.6f' % x for x in v.tolist()]}  ->  {tail}")
+
+    # sigma is unchanged by the referencing -- both halves subtract the same H_ref -- so the
+    # two differences must agree to float noise. A check on the subtraction, not on the model.
+    print(f"\n[check] sigma vs (H_rel_rev - H_rel_fwd), which must agree exactly:")
+    worst = 0.0
+    for name in REGIMES:
+        for h in HAZARDS:
+            d = (res[(h, name)][:, col["H_rel_rev"]] - res[(h, name)][:, col["H_rel_fwd"]]
+                 - res[(h, name)][:, col["sigma"]]).abs().max()
+            worst = max(worst, float(d))
+    print(f"    worst absolute disagreement over every (hazard, regime, dt): {worst:.3e}")
 
     # The age window each (hazard, regime) was fitted to, held in ms across the sweep.
     print(f"\n[age window] U_max = Qm*dt, fitted once at dt = {DT_FIT} to "
@@ -410,6 +506,24 @@ if run_plot:
 # ── Plots ─────────────────────────────────────────────────────────────────────
 
 if run_plot:
+
+    # The figure line CLAUDE.md asks for. pre.banner would print "hazard=?" here: the hazard
+    # is this script's second swept axis, so it is absent from MODEL by construction. A
+    # figure that compares three kernels states three, and dt is the x axis so it is named as
+    # a range rather than a value.
+    # Wrapped at the em dash: naming three kernels makes this line too long for the figure
+    # width, and a clipped banner states nothing.
+    BANNER = pre.banner(PRESET, MODEL).replace(
+        'hazard=?', 'hazards: ' + ' / '.join(HAZARDS)).replace(
+        '  —  ', f'  ·  $\\Delta_t$ = {dts[0]:g} … 1/{round(1 / dts[-1])} ms\n')
+
+    def reg_label(name: str) -> str:
+        """ A regime's name with the J it was run at, so a panel says which point it is.
+        The matched regime has one J per kernel, which is what defines it, so it names the
+        distance to onset instead and leaves the three J to the table. """
+        J = REGIMES[name]["J"]
+        return (f'{name}:  $J - J_c = {DELTA:.3f}$ per kernel'
+                if isinstance(J, dict) else f'{name}:  $J = {J:g}$')
 
     def dt_axis(ax) -> None:
         """ The shared x axis: log, refining to the right, labelled at the steps actually run.
@@ -465,6 +579,24 @@ if run_plot:
                     ax.set_axis_off()
                 continue
 
+            # A quantity with no dt -> 0 limit gets the value panel and nothing else. There
+            # is no limit to draw a dotted line at and no error to put on the right, and a
+            # convergence panel drawn anyway would be a picture of a limit that is not there.
+            if key in NO_LIMIT:
+                for h in HAZARDS:
+                    ax_v.plot(dts, res[(h, name)][:, col[key]], 'o-', color=COLORS[h],
+                              label=h, markersize=6)
+                ax_e.text(0.5, 0.5,
+                          'no $\\Delta_t \\rightarrow 0$ limit:\nthe amplitude is still '
+                          'climbing\nat the finest step run.\nQuoted at a stated '
+                          '$\\Delta_t$, never extrapolated.',
+                          transform=ax_e.transAxes, ha='center', va='center', fontsize=10,
+                          color='0.35')
+                ax_e.set_axis_off()
+                ax_v.set_ylabel(ylab); ax_v.legend(); dt_axis(ax_v)
+                ax_v.set_title(reg_label(name))
+                continue
+
             errs = {}
             for h in HAZARDS:
                 v = res[(h, name)][:, col[key]]
@@ -486,13 +618,13 @@ if run_plot:
             for ax in (ax_v, ax_e):
                 dt_axis(ax); ax.legend(fontsize=8)
             ax_v.set_ylabel(ylab)
-            ax_v.set_title(f'{title} -- {name}')
+            ax_v.set_title(f'{title} -- {reg_label(name)}')
             ax_e.set_ylabel('relative error vs extrapolated limit')
-            ax_e.set_title(f'Convergence -- {name}')
+            ax_e.set_title(f'Convergence -- {reg_label(name)}')
 
         # dt is this figure's x axis, so it is kept out of the banner line; MODEL is PARAMS
         # without dt, the hazard and J, which is exactly the part that is held fixed here.
-        fig.suptitle(f'{title} vs the solver step\n{pre.banner(PRESET, MODEL)}')
+        fig.suptitle(f'{title} vs the solver step\n{BANNER}')
         fig.tight_layout()
 
     # The divergent control, which is the one figure here that is NOT a convergence. H is the
@@ -504,7 +636,8 @@ if run_plot:
     # should, in the one place where "stops moving" would have been the wrong answer.
     fig, (ax_h, ax_q) = plt.subplots(1, 2, figsize=(12, 4.8))
     fig.set_label('H-control')
-    styles = {"fixed point": (':', 's'), "limit cycle": ('-', 'o')}
+    styles = {"fixed point": (':', 's'), "limit cycle": ('-', 'o'),
+              "matched cycle": ('--', '^')}
 
     for h in HAZARDS:
         for name in REGIMES:

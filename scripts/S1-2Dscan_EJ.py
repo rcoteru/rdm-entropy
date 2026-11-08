@@ -46,7 +46,10 @@ STEPS = hlp.n_steps(T_MEAS, PARAMS["dt"], name="T_MEAS")
 
 # Reduced at the end of each tile rather than cached whole: the plot stage only ever takes a
 # mean and a std over time, and the full (n_J, n_E, T) trajectories of this grid are 2.5 GiB
-# against the ~1 MiB below. Re-run if a trajectory itself is ever the question.
+# against the ~1 MiB below. Re-run if a trajectory itself is ever the question. m_tot_acf1 is
+# the exception -- a scalar per cell, not a (mean, std) pair -- the lag-1 autocorrelation screen
+# the brief asks for: at this coarse, exploration-grade dt, the alternate-bin flip-flop is the
+# artifact a map can hide a cell inside without anyone noticing, and acf1 is what catches it.
 KEYS = ("m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot")
 
 
@@ -54,11 +57,28 @@ KEYS = ("m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot")
 
 CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, preset=PRESET, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
                        root=Path(__file__).parents[1] / "cache")
+PARTIAL = CACHE.with_suffix(".partial.pt")
 
 run_sim   = True
 run_plot  = True
 overwrite = False  # the hash covers every parameter, so this is only for a change to the CODE
 torch.set_default_dtype(torch.float64)
+
+
+def checkpoint(parts: list[dict]) -> None:
+    """ Save the tiles measured so far, atomically. See S1-2Dscan_betaJ.py's twin for why: this
+    script never calls fp_eigenvalues, so the MKL DGEBAL segfault landmine does not apply to it
+    either, but an ordinary crash mid-grid still should not cost the whole run. """
+    tmp = PARTIAL.with_suffix(".tmp")
+    torch.save({"parts": parts}, tmp)
+    tmp.replace(PARTIAL)
+
+
+def acf1_of(traj: torch.Tensor) -> torch.Tensor:
+    """ Lag-1 autocorrelation of m_tot over the recorded window, per batch element (B, T) ->
+    (B,). Same convention as S1-dt_conv.py / S1-cycle_point.py / S1-hopf_type.py. """
+    x = traj - traj.mean(dim=-1, keepdim=True)
+    return (x[..., :-1] * x[..., 1:]).sum(dim=-1) / x.pow(2).sum(dim=-1).clamp_min(1e-300)
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -81,14 +101,29 @@ if run_sim and (overwrite or not CACHE.exists()):
     J_tiles = torch.tensor_split(J, n_tiles)
     assert all(len(t) >= 2 for t in J_tiles), "tiles of one J value would drop the J axis"
 
+    # Resume: a .partial.pt from an earlier, interrupted run of this exact grid (same n_tiles,
+    # since that follows deterministically from PARAMS) means its tiles need not be redone.
+    parts: list[dict] = []
+    if PARTIAL.exists():
+        try:
+            saved = torch.load(PARTIAL, weights_only=False)["parts"]
+        except Exception:
+            saved = []                      # a torn read from an earlier crash: start over
+        if len(saved) <= n_tiles:
+            parts = saved
+    if parts:
+        print(f"Resuming from {PARTIAL.name}: {len(parts)}/{n_tiles} tiles already measured.")
+
     print(f"Q = {Q} age bins; running {n_tiles} tile(s) of <= {max(map(len, J_tiles))} J values.")
     print(f"Per mean-field: {T_EQUI:g} ms equilibration + {T_MEAS:g} ms recording "
           f"= {EQUI + STEPS} steps at dt={PARAMS['dt']:g}")
     print(f"Running on: {device}")
 
     t0 = time.time()
-    parts = []
     for k, J_t in enumerate(J_tiles):
+        if k < len(parts):
+            print(f"[tile {k+1}/{n_tiles}]  cached from {PARTIAL.name}")
+            continue
         tile: dict = dict(PARAMS, Qm=[Q], J=J_t)
         mf = RDMIsingModelBatch(**tile, device=device)
         print(f"[tile {k+1}/{n_tiles}] {mf.B} mean-fields, "
@@ -100,8 +135,13 @@ if run_sim and (overwrite or not CACHE.exists()):
                                    f"is too short (Qm={mf.Qm[0]}). Re-fit with fit_age_grid.")
         # reduce here, inside the loop: holding the tiles whole until the end would put the
         # full grid's trajectories in memory, which is the thing the tiling exists to avoid
-        parts.append({f"{key}_{stat}": getattr(traj[key], stat)(dim=-1)
-                      for key in KEYS for stat in ("mean", "std")})
+        part = {f"{key}_{stat}": getattr(traj[key], stat)(dim=-1)
+               for key in KEYS for stat in ("mean", "std")}
+        part["m_tot_acf1"] = acf1_of(traj["m_tot"])
+        parts.append(part)
+        checkpoint(parts)
+        print(f"    acf1 in [{float(part['m_tot_acf1'].min()):+.3f}, "
+              f"{float(part['m_tot_acf1'].max()):+.3f}]")
         del mf, traj
         if device == 'cuda': torch.cuda.empty_cache()
     print(f"Done in {time.time() - t0:.2f}s")
@@ -112,6 +152,7 @@ if run_sim and (overwrite or not CACHE.exists()):
 
     CACHE.parent.mkdir(exist_ok=True)
     torch.save(out, CACHE)
+    PARTIAL.unlink(missing_ok=True)     # superseded by the finished cache
     print(f"Saved to {CACHE} ({CACHE.stat().st_size/2**20:.1f} MiB).")
 
 
@@ -131,13 +172,21 @@ if run_plot:
     J, E = PARAMS["J"], PARAMS["E"]
     extent = (E.min().item(), E.max().item(), J.min().item(), J.max().item())
 
+    # The acf1 screen: flagged, not silently plotted. See S1-2Dscan_betaJ.py's twin.
+    acf1 = d["m_tot_acf1"]
+    n_flag = int((acf1 < 0.97).sum())
+    print(f"acf1 over the grid: min {float(acf1.min()):+.4f}, "
+          f"{n_flag}/{acf1.numel()} cells below 0.97"
+          + ("  -- see the acf1 map; do not read sigma off a flagged cell" if n_flag else ""))
+
     if True:  # average / std of each quantity over the plane
         rp.maps({'Mean Activity':  d["m_tot_mean"],
                  'Std of Activity': d["m_tot_std"],
                  'Mean Sigma':      d["sigma_tot_mean"],
-                 'Std of Sigma':    d["sigma_tot_std"]},
+                 'Std of Sigma':    d["sigma_tot_std"],
+                 'Lag-1 acf (m_tot)': acf1},
                 extent=extent, xlabel='E (External Input)', ylabel='J (Coupling Strength)',
-                suptitle=f'Mean and std over the (E, J) plane\n{banner}')
+                suptitle=f'Mean and std over the (E, J) plane\n{banner}', ncols=3)
 
     if True:  # slices of the grid at a handful of J values
         for key, name in (("m_tot", 'Activity'), ("sigma_tot", 'Sigma')):

@@ -20,20 +20,32 @@ from rdme.rdm_batch import RDMIsingModelBatch
 # Std of the activity is the oscillation indicator here, not its mean: at E = 0 a stable cell
 # sits at a nonzero fixed point, so only the variance separates the two.
 #
-# The preset is S1-sat, not S1. The pre-port dict here was E = 0, beta = 8, theta = 0.5,
-# tau_int = 10, J = 40, which is S1-sat exactly, with (tau_ref, K_ref) as the swept axes and
-# the preset's own (25, 25) inside the plane. The 2026-11-07 brief guessed "S1" for this one;
-# S1 is beta = 6, tau_int = 15, so that would have been a different plane. Flagged in the dump.
-PRESET = "S1-sat"
+# The preset is S1 (2026-11-08 brief), not S1-sat. The pre-port dict here was E = 0, beta = 8,
+# theta = 0.5, tau_int = 10, J = 40, which is S1-sat exactly -- that was the RIGHT call at the
+# port (CLAUDE.md's "Ported 2026-11-07" note), since the pre-port dict is what it was. But the
+# paper's figures all sit at S1, so this plane needs to as well, and the preset is now a
+# variable rather than a literal: PRESET = "S1-sat" reproduces the original port's plane; this
+# script runs it at S1.
+PRESET = "S1"
 HAZARD = "poisson_exact"   # stated per script: the hazard is its own axis, not part of a
                            # preset. The pre-port dict said "async" (route A, = "bernoulli"
                            # here), so this plane is a different model from the old cache's.
 
+# S1, unlike S1-sat, carries no J of its own -- it is "the axis the system is studied along"
+# for every S1-pointed script, so a run through it has to supply one explicitly. J = 17 is the
+# working cycle point (S1-cycle_point.py, 5.47 past the measured Hopf at J_c = 11.5318): the
+# question this plane asks ("does the oscillation survive at a shallower refractory kernel?")
+# is read against the preset's own operating point, not an arbitrary other one. J = 17 is a
+# WORKING value, not a decision -- POINTS["S1/cycle"] is still unset (presets.py).
+J_S1 = 17.0
+
 PARAMS: dict = pre.params(
     PRESET, hazard=HAZARD,
+    J       = J_S1,
     tau_ref = torch.linspace(2.0, 60.0, 59),
     K_ref   = torch.linspace(0.0, 50.0, 51),
-    dt      = 1.0,
+    dt      = 0.25,   # was 1.0: dt=1 is inadmissible for poisson and risks the alternate-bin
+                       # flip-flop the acf1 screen below exists to catch (2026-11-08 brief).
     eps     = 0.01,
 )
 
@@ -59,7 +71,16 @@ STEPS = hlp.n_steps(T_MEAS, PARAMS["dt"], name="T_MEAS")
 # 94.5% of the population frozen in the last bin and returns a different attractor.
 #
 # # assertion after each tile is the real guard -- it fails loudly if the assumption breaks.
-TOL = 1e-2   # age-grid accuracy; Qm is fitted to it per tile, never set by hand
+#
+# Loosened from the usual 1e-2 to 1e-1 for THIS grid specifically (2026-11-08 session, run at
+# S1 rather than S1-sat): S1's beta = 6 is weaker drive than S1-sat's beta = 8 AND the working
+# J = 17 here is far below S1-sat's J = 40, so at K_ref toward 50 the firing rate is far lower
+# and the tail far longer than the S1-sat original run already found pathological (see the
+# comment above) -- 5e-2 (tried first) still did not return the tau_ref=60 pilot within a
+# practical time even running alone on an otherwise idle GPU. 1e-1 is a further exploration-
+# grade trade, in the same spirit as S1-2Dscan_betaJ.py's 5e-2, needed because this plane's
+# worst corner (K_ref=50 at S1's weaker drive) is a more extreme case than that one's.
+TOL = 1e-1   # age-grid accuracy; Qm is fitted to it per tile, never set by hand
 
 KEYS = ("m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot")
 
@@ -68,11 +89,29 @@ KEYS = ("m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot")
 
 CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, preset=PRESET, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
                        root=Path(__file__).parents[1] / "cache")
+PARTIAL = CACHE.with_suffix(".partial.pt")
 
 run_sim   = True
 run_plot  = True
 overwrite = False  # the hash covers every parameter, so this is only for a change to the CODE
 torch.set_default_dtype(torch.float64)
+
+
+def checkpoint(parts: list[dict]) -> None:
+    """ Save the tau_ref tiles measured so far, atomically. This script never calls
+    fp_eigenvalues (only `forward` and `entropy_trajectory`), so the MKL DGEBAL segfault
+    landmine does not apply to it -- but an ordinary crash mid-grid still should not cost a
+    multi-tile run that tiles unevenly in both count and per-tile cost. """
+    tmp = PARTIAL.with_suffix(".tmp")
+    torch.save({"parts": parts}, tmp)
+    tmp.replace(PARTIAL)
+
+
+def acf1_of(traj: torch.Tensor) -> torch.Tensor:
+    """ Lag-1 autocorrelation of m_tot over the recorded window, per batch element (B, T) ->
+    (B,). Same convention as S1-dt_conv.py / S1-cycle_point.py / S1-hopf_type.py. """
+    x = traj - traj.mean(dim=-1, keepdim=True)
+    return (x[..., :-1] * x[..., 1:]).sum(dim=-1) / x.pow(2).sum(dim=-1).clamp_min(1e-300)
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -94,9 +133,10 @@ if run_sim and (overwrite or not CACHE.exists()):
         grid because a batch sizes its age grid from its slowest member: one batch spanning
         tau_ref in [2, 60] would pay the tau_ref = 60 grid for every cell in it. """
         tr = PARAMS["tau_ref"][PARAMS["tau_ref"] <= tr_max]
+        print(f"  fitting age grid for tau_ref <= {tr_max:g} ({len(tr)} values) ...", flush=True)
         return hlp.fit_age_grid(
             lambda qm: RDMIsingModelBatch(**dict(PARAMS, tau_ref=tr), Qm=qm, device=device),
-            tol=TOL, equi=EQUI + STEPS, verbose=False)[0]
+            tol=TOL, equi=EQUI + STEPS, verbose=True, max_doublings=4)[0]
 
 
     # A tiling is acceptable when every tile fits whole: epr_plan on a tile returns a batch
@@ -130,9 +170,25 @@ if run_sim and (overwrite or not CACHE.exists()):
           f"= {EQUI + STEPS} steps at dt={PARAMS['dt']:g}")
     print(f"Running on: {device}")
 
+    # Resume: a .partial.pt from an earlier, interrupted run of this exact grid (same n_tiles
+    # and tau_ref boundaries, since both follow deterministically from PARAMS) means its tiles
+    # need not be redone.
+    parts: list[dict] = []
+    if PARTIAL.exists():
+        try:
+            saved = torch.load(PARTIAL, weights_only=False)["parts"]
+        except Exception:
+            saved = []                      # a torn read from an earlier crash: start over
+        if len(saved) <= n_tiles:
+            parts = saved
+    if parts:
+        print(f"Resuming from {PARTIAL.name}: {len(parts)}/{n_tiles} tiles already measured.")
+
     t0 = time.time()
-    parts = []
     for k, tr_t in enumerate(tr_tiles):
+        if k < len(parts):
+            print(f"[tile {k+1}/{n_tiles}]  cached from {PARTIAL.name}")
+            continue
         # Qm passed explicitly: without it the model sizes its own age grid from q_from_tau
         # and the rate-aware figure above would only ever have bounded the memory estimate.
         tile: dict = dict(PARAMS, tau_ref=tr_t, Qm=[q_of(float(tr_t.max()))])
@@ -152,8 +208,13 @@ if run_sim and (overwrite or not CACHE.exists()):
             f"tile {k+1}: truncation_error = {trunc:.2e} (Q={mf.Qm[0]}, "
             f"U_max={mf.Qm[0]*PARAMS['dt']:.0f} ms): the attractor holds more "
             f"old-age mass than the pilot did. Raise the equi passed to fit_age_grid.")
-        parts.append({f"{key}_{stat}": getattr(traj[key], stat)(dim=-1)
-                      for key in KEYS for stat in ("mean", "std")})
+        part = {f"{key}_{stat}": getattr(traj[key], stat)(dim=-1)
+               for key in KEYS for stat in ("mean", "std")}
+        part["m_tot_acf1"] = acf1_of(traj["m_tot"])
+        parts.append(part)
+        checkpoint(parts)
+        print(f"    acf1 in [{float(part['m_tot_acf1'].min()):+.3f}, "
+              f"{float(part['m_tot_acf1'].max()):+.3f}]")
         del mf, traj
         if device == 'cuda': torch.cuda.empty_cache()
     print(f"Done in {time.time() - t0:.2f}s")
@@ -164,6 +225,7 @@ if run_sim and (overwrite or not CACHE.exists()):
 
     CACHE.parent.mkdir(exist_ok=True)
     torch.save(out, CACHE)
+    PARTIAL.unlink(missing_ok=True)     # superseded by the finished cache
     print(f"Saved to {CACHE} ({CACHE.stat().st_size/2**20:.1f} MiB).")
 
 
@@ -188,14 +250,23 @@ if run_plot:
     # std map is a map of the mean. The oscillatory region is where CV is O(1) or larger.
     cv = d["m_tot_std"] / d["m_tot_mean"].clamp_min(1e-300)
 
+    # The acf1 screen: flagged, not silently plotted. See S1-2Dscan_betaJ.py's twin.
+    acf1 = d["m_tot_acf1"]
+    n_flag = int((acf1 < 0.97).sum())
+    print(f"acf1 over the grid: min {float(acf1.min()):+.4f}, "
+          f"{n_flag}/{acf1.numel()} cells below 0.97"
+          + ("  -- see the acf1 map; do not read sigma off a flagged cell" if n_flag else ""))
+
     if True:  # where the oscillation lives, and what it costs
         rp.maps({'Activity CV':      cv,
                  'Mean Activity':    d["m_tot_mean"],
                  'Mean Sigma':       d["sigma_tot_mean"],
-                 'Std of Sigma':     d["sigma_tot_std"]},
+                 'Std of Sigma':     d["sigma_tot_std"],
+                 'Lag-1 acf (m_tot)': acf1},
                 extent=extent, xlabel='K_ref (refractory amplitude)',
                 ylabel='τ_ref (refractory timescale, ms)',
-                suptitle=f'Oscillation and its cost over the (K_ref, tau_ref) plane\n{banner}')
+                suptitle=f'Oscillation and its cost over the (K_ref, tau_ref) plane\n{banner}',
+                ncols=3)
 
     if True:  # the K_ref = 0 null arm against a few nonzero ones
         idxs = hlp.grab_closest_idxs(K_ref, [0.0, 6.0, 12.0, 25.0])

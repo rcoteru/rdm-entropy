@@ -124,9 +124,12 @@ PRESETS: dict[str, dict] = {
 # rather than a family. `params("S1/fp")` resolves them, and they read as presets everywhere
 # else, so a script and a dump can name the point instead of quoting the number.
 #
-# The cycle point is deliberately absent: under the Poisson kernel the Hopf sits near
-# J = 14.4-14.6 rather than at the 12.06 measured with the legacy sigmoid kernel, and the
-# cycle point has to be re-chosen from a converged scan. J = 17 is the candidate.
+# The cycle point is deliberately absent, pending a vault decision. The Hopf is MEASURED at
+# J_c = 11.534 +- 0.012 under `poisson_exact` as a dt -> 0 limit (11.4646 under `poisson`,
+# 12.3525 under `bernoulli`; S1-cycle_point.py, S1-hopf_dt.py). J = 17 is the working cycle
+# point -- 5.47 past onset, confirmed workable -- and the scripts carry it as a literal until
+# this dict does. The J = 14.4-14.6 that stood here was route-A `poisson`, never a route-B
+# prediction; 12.06 was the legacy sigmoid kernel.
 POINTS: dict[str, dict] = {
     "S1/fp": {"J": 10.0},                   # the fixed point below the Hopf
 }

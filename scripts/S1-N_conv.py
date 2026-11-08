@@ -59,11 +59,13 @@ HAZARD = "poisson_exact"   # stated per script: the hazard is its own axis, not 
 # both constructors take, and REGIMES supplies the J.
 PARAMS: dict = pre.params(PRESET, hazard=HAZARD, dt=0.25)
 
-# The cycle regime is still at the route-A J = 15. Under route B the Hopf moved to an expected
-# J ~ 14.4-14.6 (S1-cycle_point.py measures it), so J = 15 may sit barely past onset where the
-# amplitude goes like sqrt(J - Jc) and the linewidth result this script turns on is read in the
-# worst possible place. Re-point it at POINTS["S1/cycle"] once that is set.
-REGIMES: dict[str, float] = {"fixed point": 10.0, "limit cycle": 15.0}
+# The cycle regime is at J = 17, the working cycle point (2026-11-08). It was at the route-A
+# J = 15, which under route B sits only 3.47 past the measured Hopf at J_c = 11.534 -- close
+# enough to onset that the amplitude is still growing like sqrt(J - Jc) and the linewidth this
+# script turns on would be read in the worst available place. J = 17 is 5.47 past onset, with
+# ptp 13x the mean rate and no saturation (S1-cycle_point.py). It is a WORKING value, not a
+# decision: POINTS["S1/cycle"] is still unset, and when it is set this should follow it.
+REGIMES: dict[str, float] = {"fixed point": 10.0, "limit cycle": 17.0}
 
 # Four decades. The spin step is O(N) but launch-latency bound well past 1e5 -- 1e6 neurons cost
 # 1.5x the time of 1e5 and 0.09 GiB -- so the top of this range is nearly free and is what pins

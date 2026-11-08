@@ -406,8 +406,8 @@ if run_plot:
     else:
         print(f"    Richardson from ({dt1:g}, {dt2:g}), order {p:.2f}:  J_c -> {jc_lim:.4f}")
         print(f"    error bar: |J_c(dt/2) - limit| = {abs(float(jc[-1]) - jc_lim):.4f}")
-    print(f"    against the 14.4-14.6 expected under the exact solver, and 12.0588 "
-          f"with the legacy sigmoid kernel.")
+    print(f"    against 12.0588 with the legacy sigmoid kernel. (The 14.4-14.6 this line "
+          f"once quoted was route-A poisson, not an exact-solver prediction.)")
 
     # 2. the scan, Richardson'd per J at first order (a bare pair has no order to read)
     lim = {}

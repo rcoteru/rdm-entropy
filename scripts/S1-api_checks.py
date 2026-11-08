@@ -324,3 +324,59 @@ print("    poisson has a different limit, but because it is not yet in its asymp
 print("    at any step a scan can afford. Note too that poisson is 87% high at dt = 0.5 for a")
 print("    neuron firing at 0.05 /ms: its error tracks c = nu0*dt, not lam*dt, so a slow")
 print("    population buys it nothing.")
+
+
+# ── 5. The §11 re-run: bernoulli at its OWN bin, no extrapolation ─────────────
+#
+# Check 2 compared bernoulli extrapolated to dt -> 0 against an explicit t_abs imposed on top
+# of that limit -- which is a different model, as vault note P1_unchecked-derivations §11 says
+# itself: bernoulli's bin IS the dead time (geometric ISIs, no separate absorbing window), so
+# extrapolating dt away and then bolting t_abs back on asks a question route A's own
+# construction does not pose. Check 1 of this script already IS the identity, at dt -> 0 under
+# poisson_exact, and passes to 1e-5; this is the other half, bernoulli held at the single dt
+# that makes it that model at all: dt = 1 ms = t_abs = 1/nu0, nothing extrapolated.
+
+print("\n" + "=" * 78)
+print("[5] Section 11 re-run: bernoulli at its own bin (dt = t_abs = 1, no extrapolation)")
+print("    against the route-B kernels as a dt -> 0 limit, both at t_abs = 1/nu0.")
+print("=" * 78)
+
+E_S11 = torch.linspace(0.0, 2.0, 9)
+print(f"    {'E':>6}{'beta*h':>9}{'bernoulli @ dt=1':>18}"
+      + "".join(f"{k + ' limit':>18}" for k in ("poisson", "poisson_exact"))
+      + f"{'|A-B|/B':>11}")
+rows5 = []
+for E in E_S11:
+    x = BETA * (float(E) - THETA)
+    r_A = settled_rate(stripped(float(E), "bernoulli", t_abs=1.0, dt=1.0))
+    r_poisson = rate_limit(float(E), "poisson", t_abs=T_ABS)[2]
+    r_exact   = rate_limit(float(E), "poisson_exact", t_abs=T_ABS)[2]
+    gap = abs(r_A - r_exact) / max(r_exact, 1e-300)
+    rows5.append((float(E), r_A, r_exact, gap))
+    print(f"    {float(E):6.2f}{x:9.2f}{r_A:18.10f}{r_poisson:18.10f}{r_exact:18.10f}"
+          f"{gap:11.2e}")
+
+worst = max(rows5, key=lambda t: t[3])
+print(f"\n    worst |A - B|/B over the sweep: {worst[3]:.3e} at E = {worst[0]:g}")
+print(f"    This is NOT expected to be small in the way check 1's identity is: the two rate")
+print(f"    functions differ pointwise (check 2), so even at matched t_abs the stationary")
+print(f"    rates need not agree -- the gap column is reported for completeness, not as a")
+print(f"    pass/fail. What check 2 already established stands: the two models share a")
+print(f"    CEILING at nu0*t_abs = 1, not a stationary rate. bernoulli @ dt = 1 is itself only")
+print(f"    first-order accurate in dt (it has no dt -> 0 limit to compare TO -- dt = 1 = t_abs")
+print(f"    is the model, not an approximation of a finer one), so its own solver error at")
+print(f"    this single dt is the honest floor for this row; it is not Richardson-refinable")
+print(f"    without leaving the model being re-run.")
+
+print(f"\n    Ceilings, general t_abs (check 2's other half, restated to close the brief's item):")
+for t_abs in (0.5, 1.0, 2.0, 5.0):
+    ceil_B = 1.0 / t_abs
+    ceil_A = min(NU0, 1.0 / t_abs)
+    print(f"      t_abs = {t_abs:4.1f} ms:  route A min(nu0, 1/t_abs) = {ceil_A:6.3f} /ms   "
+          f"route B 1/t_abs = {ceil_B:6.3f} /ms   "
+          f"{'EQUAL' if abs(ceil_A - ceil_B) < 1e-12 else 'different'}"
+          f"{'  (nu0*t_abs >= 1)' if NU0 * t_abs >= 1.0 - 1e-12 else ''}")
+print(f"    They agree for every t_abs >= 1/nu0 = {1.0 / NU0:g} ms, not only at equality: once")
+print(f"    the dead time alone already exceeds what the kernel's own ceiling nu0 would allow,")
+print(f"    route A's min(.) saturates on t_abs exactly where route B's 1/t_abs lives, and the")
+print(f"    two stay equal for every t_abs beyond that point, not just at nu0*t_abs = 1.")
