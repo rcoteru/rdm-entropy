@@ -27,6 +27,15 @@ Code for P1, *Irreversibility in Integrate-and-Fire Neural Populations*: refract
 | `agents/briefs/` | Briefs dropped in from the vault: decisions the vault made that this repo can't see (prior/parameter/convention choices). Read the newest one before starting if present, and write a dump when you are done with it, measurement or not (see Result dumps) |
 | `tests/` | Tests. Split fast/slow: `pytest` runs the fast suite (~40 s), `pytest -m slow` the convergence studies and large-N spin runs (~50 s). No test reads a cache; every oracle is a closed form, a second representation, or a literal in the test file |
 
+## Executing a multi-step brief
+
+A brief with several independent runs or checks is executed by delegation, not inline: dispatch one subagent per step, sequentially (never in parallel — one machine, and numerical runs contend for the same cores/GPU). Keep delegating until the brief's checklist is done.
+
+- Each subagent gets one step: the relevant brief section, the preset/hazard/overrides it needs, and what "done" means for that step. It runs the script, debugs itself if it fails, and writes its own result dump (or, for a non-measurement step, says so) before reporting back.
+- It returns a short status to you, not its working — pass/fail, headline numbers, the dump filename, anything that needs a decision. You never see its internal debugging; that is the point, since it is what would otherwise fill your context with logs and stack traces across every step.
+- You hold the brief and the running state across steps (what's done, what each step left behind, what the next one needs); a subagent does not. Pass forward whatever the next step depends on explicitly — a subagent starts with nothing but what you give it.
+- You write the closing report once every step is dispatched, pointing at the dumps rather than restating their contents.
+
 ## Model conventions (non-negotiable)
 
 - **`nu0`, `t_abs`, `dt`.** There is no time quantum and no `dt0` (route B, 2026-11-07). `nu0` is the **rate unit** of the Poisson reference measure, fixed at 1 ms⁻¹: it is not identifiable on its own, since (ν₀, θ) → (ν₀e^{βδ}, θ+δ) leaves Φ unchanged, so only ν₀e^{−βθ} is a parameter. `t_abs` is the **physical dead time** in ms, default 1 ms, and under an exponential hazard it is the *only* thing that caps the realised rate (at 1/`t_abs`); `t_abs = 0` has to be asked for explicitly and means no ceiling. `dt` is the **solver step** and nothing else — it is **required**, with no default, and is keyword-only along with the rest.
