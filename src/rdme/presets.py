@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 
 import rdme.hazards as hzd
@@ -263,3 +264,62 @@ def banner(name: str, p: Mapping, *, keys: tuple[str, ...] | None = None) -> str
     pretty = {"beta": "β", "theta": "θ", "tau_int": "τ_int", "tau_ref": "τ_ref"}
     body = ',  '.join(f'{pretty.get(k, k)}={v:g}' for k, v in shown.items())
     return f'{head}  —  {body}' if body else head
+
+
+# The gauge-invariant combinations
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# (nu0, theta) -> (nu0 e^{beta delta}, theta + delta) leaves the hazard nu0 e^{beta(S+R-theta)}
+# unchanged, so nu0 and theta are not separately identifiable and a number quoted for either
+# alone says nothing. These five combinations are: they are what two parameter sets have to
+# agree on to be the same system, and what they differ in when one is a re-anchoring rather
+# than a relabel. REPORTING ONLY -- nothing here changes a preset.
+
+INVARIANT_KEYS = ("beta_theta", "nu0_exp", "Kref_theta", "nu0_tabs", "lam_op_nu0")
+
+
+def invariants(p: Mapping | str, *, lam_op: float | None = None) -> dict:
+    """ The gauge-invariant combinations of a preset name or a parameter dict.
+
+        beta*theta       threshold in units of the gain
+        nu0 e^{-beta*theta}   the escape rate at zero field, 1/ms -- the shift-invariant pair
+        K_ref/theta      the refractory kernel in units of the threshold
+        nu0*t_abs        the dead time in units of the rate unit (cortically ~0.04)
+        lam_op/nu0       the operating hazard in units of the rate unit, = e^{beta*h_op}
+
+    The last one is an output of a run, not of a parameter set, so it is None unless the
+    caller passes the operating hazard `lam_op` (1/ms) it read off an attractor. """
+    p = resolve(p) if isinstance(p, str) else p
+    beta, theta = p["beta"], p["theta"]
+    nu0, t_abs, K_ref = p["nu0"], p["t_abs"], p["K_ref"]
+    return {
+        "beta_theta": beta * theta,
+        "nu0_exp":    nu0 * math.exp(-beta * theta),
+        "Kref_theta": K_ref / theta,
+        "nu0_tabs":   nu0 * t_abs,
+        "lam_op_nu0": None if lam_op is None else lam_op / nu0,
+    }
+
+
+def invariants_line(p: Mapping | str, *, lam_op: float | None = None) -> str:
+    """ `invariants` as one line, for a figure caption, a dump or the summary below. """
+    inv = invariants(p, lam_op=lam_op)
+    lam = inv["lam_op_nu0"]
+    return (f'β·θ={inv["beta_theta"]:g}  ·  ν₀e^(−βθ)={inv["nu0_exp"]:.4g}/ms  ·  '
+            f'K_ref/θ={inv["Kref_theta"]:g}  ·  ν₀·t_abs={inv["nu0_tabs"]:g}  ·  '
+            f'λ_op/ν₀=' + ("n/a (needs a run)" if lam is None else f"{lam:.4g}"))
+
+
+def summary() -> str:
+    """ Every preset with its parameters and its gauge invariants: `python -m rdme.presets`. """
+    out = []
+    for name in list(PRESETS) + list(POINTS):
+        p = resolve(name)
+        body = ',  '.join(f'{k}={v:g}' for k, v in p.items())
+        out += [f'{name}', f'    {body}', f'    {invariants_line(p)}', '']
+    out += ['λ_op/ν₀ = e^(β·h_op) is read off an attractor, not off a preset; pass lam_op=.', '']
+    return '\n'.join(out)
+
+
+if __name__ == "__main__":
+    print(summary())
