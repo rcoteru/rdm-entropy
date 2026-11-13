@@ -114,7 +114,7 @@ One file in `agents/dumps/P1_<YYYY-MM-DD>_<script>_<slug>.md`. The `P1_` prefix 
 1. **Every measurement run**, after it finishes.
 2. **Every session that worked from a brief**, when that work is done -- *including a session that ran no measurement at all*. An API port, a test audit, a round of fixes, a commit: if a brief sent you here, the dump is how the result travels back, and it is written **before** your closing report, not instead of it. The report is a pointer to the dump plus whatever needs a decision; it is not a substitute, and the dump is not something to produce afterwards when asked. If the brief's checklist is only partly done, the dump is still written now, with the rest under Follow-ups -- one dump per brief-session, not one per finished brief.
 
-A non-measurement dump uses the same frontmatter and body, with the run-shaped fields filled honestly rather than dropped: `script:` is the command that stands in for the run (`pytest tests`, or the commit alone), `preset: n/a`, `overrides: {}`, `sweep: {}`, `figures: []`, and `status:` judged by the same rule (a dirty tree is at best `partial`). Results is what changed and what now holds; Checks is how you know it (the suite, a regression check, a hand check). `P1_2026-11-07_api-B_commit-blockers-landed.md` is the worked example.
+A non-measurement dump uses the same frontmatter and body, with the run-shaped fields filled honestly rather than dropped: `script:` is the command that stands in for the run (`pytest tests`, or the commit alone), `preset: n/a`, `overrides: {}`, `sweep: {}`, `figures: []`, and `status:` judged by the same rule (on whether the result can be regenerated from the repo, not on whether the tree was clean). Results is what changed and what now holds; Checks is how you know it (the suite, a regression check, a hand check). `P1_2026-11-07_api-B_commit-blockers-landed.md` is the worked example.
 
 Dumps are **not committed** -- they are local run records, like the figures they embed, and travel to the vault by hand (`agents/` -- dumps and briefs -- is gitignored, and so is `scripts/figures/`). What the `commit:` field in the frontmatter pins down is the code the run used, which is what makes the dump reproducible without the dump itself being in the history.
 
@@ -125,7 +125,7 @@ Dumps are **not committed** -- they are local run records, like the figures they
 ```yaml
 ---
 script: scripts/S1-dt_conv.py   # or the stand-in command, for a dump that ran no measurement
-commit: 0ab4453          # append "-dirty" if the working tree had uncommitted changes
+commit: 0ab4453          # append "-dirty" if the tree was dirty; correct it to the commit that lands the code
 date: 2026-11-05
 brief: agents/briefs/P1 2026-11-05 route-B API and re-runs.md   # omit if not run from a brief
 preset: S1               # "n/a" when no model was run
@@ -153,6 +153,8 @@ superseded_by: []        # set on the OLD dump when a re-run replaces it, never 
 5. **Caveats**: what is not converged, what is near a floor, what differs from earlier runs (link the old dump by filename).
 6. **Follow-ups**: checkboxes, each with exactly one tag: `- [ ] #run ...` (numerical work) or `- [ ] #code ...` (code chores).
 
-**Status values** (same legend as the vault): `measured` = converged, reproducible from a clean commit under current conventions. `partial` = not converged, not systematic, or from a dirty tree. `stale` = conventions or code changed since. `bug` = known wrong. A dirty-tree run is at best `partial`.
+**Status values** (same legend as the vault): `measured` = converged, reproducible from the repo under current conventions. `partial` = not converged, not systematic, or exploration-grade (a single `dt`, a loosened tolerance, a screen nothing passed). `stale` = conventions or code changed since. `bug` = known wrong.
+
+**A dirty tree is not a ground for `partial`** (vault decision, 2026-11-07, retiring the earlier rule here). The test is whether the run can be *regenerated* from the repo, not whether it had an audit trail at the moment it ran. Record `-dirty` on the `commit:` field as the honest statement of what was in the tree, and **correct that field to the commit that lands the code once it is committed** -- an uncorrected `-dirty` commit, or one the scripts have moved past, is what the vault reads as `stale`. Genuine grounds for `partial` still apply and are stated on their own terms.
 
 No interpretation, no literature, no "this shows that the paper…". State what was computed and how well it is converged.
