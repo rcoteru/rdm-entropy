@@ -1,7 +1,7 @@
 import torch
 import tqdm
 
-import rdme.kernels as krn
+import rdme.equations as eq
 from rdme.hazards import HAZARDS, resolve_timesteps
 
 # Auxiliary functions
@@ -94,9 +94,9 @@ class SpinModel:
         self.theta, self.beta = theta, beta
         self.Nm = Nm
         
-        a_int = krn.tau2alpha(tau_int, dt)
+        a_int = eq.tau2alpha(tau_int, dt)
         self.tau_int, self.a_int = tau_int, a_int
-        a_ref = krn.tau2alpha(tau_ref, dt)
+        a_ref = eq.tau2alpha(tau_ref, dt)
         self.K_ref, self.tau_ref, self.a_ref = K_ref, tau_ref, a_ref
         
         self.device = w.device
@@ -127,9 +127,9 @@ class SpinModel:
         # Absolute refractory window. The mean field carries this inside its R(u) kernel; here
         # R is a per-NEURON state with no age axis, so the window has to be applied through the
         # age n instead. The two must agree, which is what the spin-vs-mean-field tests pin.
-        # t_abs is a physical dead time; see kernels.refractory_kernel.
-        self.n_abs = krn.n_abs_bins(self.t_abs, self.dt)
-        R_abs = (krn.abs_refractory_floor(self.w, self.E, self.theta, self.beta,
+        # t_abs is a physical dead time; see equations.refractory_kernel.
+        self.n_abs = eq.n_abs_bins(self.t_abs, self.dt)
+        R_abs = (eq.abs_refractory_floor(self.w, self.E, self.theta, self.beta,
                                           r_max=1.0 / self.t_abs)
                  if self.t_abs > 0 else torch.zeros_like(self.theta))
         self.R_abs_net = self.pop_expand.t().float() @ R_abs.float()   # (N,)
@@ -680,7 +680,7 @@ def SpinIsingModel(N: int, J: float, E: float, beta: float, theta: float,
                device: str = "cpu", ic: str = "random") -> SpinModel:
     
     """ Construct an Ising SpinModel. J is in physical units: pass J, never J/dt -- the
-    same convention as the mean field, stated in rdm.compute_total_input. """
+    same convention as the mean field, stated in equations.compute_total_input. """
 
     M = 1
     Nm = torch.tensor([N], device=device)
@@ -729,7 +729,7 @@ def SpinWilsonCowan(
         ) -> SpinModel:
     
     """ Construct a Wilson-Cowan SpinModel. Weights are in physical units: pass w_EE, never
-    w_EE/dt -- the same convention as the mean field, in rdm.compute_total_input. """
+    w_EE/dt -- the same convention as the mean field, in equations.compute_total_input. """
 
     M = 2
     # split on E_ratio directly, as RDMWilsonCowan does: going through (1 - E_ratio)

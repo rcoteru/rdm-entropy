@@ -23,7 +23,7 @@ import time
 import matplotlib.pyplot as plt
 import torch
 
-import rdme.helpers as hlp
+import rdme.plots as rp
 from rdme.rdm_batch import RDMIsingModelBatch
 
 
@@ -69,7 +69,7 @@ if run_sim and (overwrite or not STATS_FILE.exists()):
     # NOTE (superseded): this used to run at a step of 1.0 with J carrying a 1/dt, because
     # dt was not passed and defaulted to 1.0. PARAMS now sets dt and dt0 explicitly, dt0 is
     # a required argument, and the input is built from the rate -- so J is passed through
-    # unscaled, used unscaled, and plotted unscaled (see rdm.compute_total_input).
+    # unscaled, used unscaled, and plotted unscaled (see equations.compute_total_input).
     #
     # The numbers therefore already differ from the pre-port ones. What is NOT settled here
     # is whether the J range below is quoted in physical units or still carries the old
@@ -112,7 +112,7 @@ if run_plot:
     if not STATS_FILE.exists():
         raise FileNotFoundError(f"{STATS_FILE} not found. Run with run_sim = True first.")
 
-    hlp.pub_style()
+    rp.pub_style()
 
     stats = torch.load(STATS_FILE, weights_only=False)
     J, E  = stats["J"], stats["E"]
@@ -137,7 +137,7 @@ if run_plot:
     # Drawn at the SciPost text width so \includegraphics takes it at scale 1 and the
     # font sizes set above are the ones that reach the page.
     fig, axes = plt.subplots(2, 2, sharex=True, sharey=True, constrained_layout=True,
-                             figsize=(hlp.SCIPOST_TEXTWIDTH, 0.72*hlp.SCIPOST_TEXTWIDTH))
+                             figsize=(rp.SCIPOST_TEXTWIDTH, 0.72*rp.SCIPOST_TEXTWIDTH))
 
     for ax, (field, cbar_label, title, clim) in zip(axes.flat, panels):
         vmin, vmax = clim if clim is not None else (None, None)

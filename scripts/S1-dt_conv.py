@@ -45,7 +45,7 @@ pair as the control, which is the other half of the same rule.
 
 Two things are held fixed so that only the step varies, and both bite if they are not:
 
-  the age window.  U_max = Qm*dt is fitted once per (hazard, regime) at DT_FIT and then held in
+  the age window.  U_max = Q*dt is fitted once per (hazard, regime) at DT_FIT and then held in
       ms. Refitting per dt lays up to `tol` of grid error -- 1.4e-4 on the rate at the usual
       setting -- on top of dt differences that run from 1.8e-4 down to 1.4e-5. It is fitted two
       decades tighter than it is asserted; see TOL_FIT, which records what happened when it
@@ -55,7 +55,7 @@ Two things are held fixed so that only the step varies, and both bite if they ar
       a phase error that moved the mean in the third digit; this one is flat in the
       equilibration to eight.
 
-Steps. dt must divide t_abs = 1 ms (kernels.n_abs_bins refuses otherwise), so the admissible
+Steps. dt must divide t_abs = 1 ms (equations.n_abs_bins refuses otherwise), so the admissible
 sweep is 1, 1/2, 1/4, ... -- which is what the halvings below walk down. `poisson` additionally
 needs c = nu0*dt < 1 STRICTLY, so at nu0 = 1 it has no dt = 1 entry and its column starts one
 halving in; `bernoulli` allows the equality; `poisson_exact` has no arithmetic cap and its step
@@ -72,10 +72,11 @@ import torch
 import rdme.epr as epr
 import rdme.hazards as hzd
 import rdme.helpers as hlp
+import rdme.convergence as cvg
 import rdme.plots as rp
 import rdme.presets as pre
-from rdme.helpers import converged_at, orders, richardson
-from rdme.network import RDMIsingModel
+from rdme.convergence import converged_at, orders, richardson
+from rdme.mean_field import RDMIsingModel
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -217,46 +218,18 @@ overwrite = False  # the hash covers every parameter, so this is only for a chan
 torch.set_default_dtype(torch.float64)
 
 
-def checkpoint(res: dict) -> None:
-    """ Write the cache after every (hazard, regime) block rather than once at the end.
-
-    A single save at the end means an interrupted run leaves nothing on disk and a run in
-    progress is invisible to anyone else -- who then starts a second copy of it. Through a
-    temporary and a rename, so a reader sees either the old version or the new one and never
-    the half-written middle. The finished blocks are skipped on the next run. """
-    CACHE_DIR.mkdir(exist_ok=True)
-    # Fold in whatever is on disk before writing. Two runs of this script -- mine and yours --
-    # each hold their own `res` in memory, so a plain save makes the last writer win and
-    # silently discard every unit the other measured. setdefault keeps what THIS process just
-    # computed and adopts any unit it does not have, which makes concurrent runs additive
-    # instead of destructive: they divide the work by racing for it rather than redoing it.
-    if CACHE.exists():
-        try:
-            disk = torch.load(CACHE, weights_only=False)
-        except Exception:
-            disk = {}                      # a torn read from another writer: ours still stands
-        adopted = [k for k in disk if k not in res]
-        for k in adopted:
-            res[k] = disk[k]
-        if adopted:
-            print(f"  (+{len(adopted)} units from another run of this script)")
-    tmp = CACHE.with_suffix(".tmp")
-    torch.save(res, tmp)
-    tmp.replace(CACHE)
-
-
 # ── Measurement ───────────────────────────────────────────────────────────────
 
-def build(J: float, hazard: str, dt: float, Qm: list[int] | None = None) -> RDMIsingModel:
-    return RDMIsingModel(J, **MODEL, dt=dt, hazard=hazard, Qm=Qm, device=DEVICE)
+def build(J: float, hazard: str, dt: float, Q: int | None = None) -> RDMIsingModel:
+    return RDMIsingModel(J, **MODEL, dt=dt, hazard=hazard, Q=Q, device=DEVICE)
 
 
-def measure(J: float, hazard: str, dt: float, Qm: list[int], rec_ms: float,
+def measure(J: float, hazard: str, dt: float, Q: int, rec_ms: float,
             equi_ms: float = None) -> list[float]:
     """ One (hazard, regime, dt) point: equilibrate, record, average over whole cycles. """
     t0  = time.time()
     equi_ms = EQUI_MS if equi_ms is None else equi_ms
-    net = build(J, hazard, dt, Qm)
+    net = build(J, hazard, dt, Q)
     net.forward(int(equi_ms / dt))
     traj = net.entropy_trajectory(int(rec_ms / dt), pb=False)
 
@@ -302,7 +275,7 @@ def measure(J: float, hazard: str, dt: float, Qm: list[int], rec_ms: float,
             period,
             float(r[a:b].max() - r[a:b].min()),
             acf1,
-            float(Qm[0]), float(phi_max), float(rate_max), float(trunc), time.time() - t0]
+            float(Q), float(phi_max), float(rate_max), float(trunc), time.time() - t0]
 
 
 def _stepping(net: RDMIsingModel, n: int):
@@ -337,16 +310,16 @@ if run_sim:
             # One fit per (hazard, regime), in ms. Sized on the attractor at EQUI+REC, as
             # fit_age_grid requires: the boundary mass keeps settling after equilibration ends.
             print(f"\n[{hazard}, {name}, J = {J:g}] fitting the age window at dt = {DT_FIT} ...")
-            Qm_fit = hlp.fit_age_grid(lambda q: build(J, hazard, DT_FIT, q), tol=TOL_FIT,
+            Q_fit = cvg.fit_age_grid(lambda q: build(J, hazard, DT_FIT, q), tol=TOL_FIT,
                                       equi=int((equi_ms + rec_ms) / DT_FIT))
-            u_max = Qm_fit[0] * DT_FIT
+            u_max = Q_fit * DT_FIT
             res["u_max"][(hazard, name)] = u_max
-            print(f"  U_max = {u_max:.1f} ms; Qm = U_max/dt from here on")
+            print(f"  U_max = {u_max:.1f} ms; Q = U_max/dt from here on")
 
             rows = []
             for dt in DTS:
-                Qm = [max(1, round(u_max / dt))]
-                row = measure(J, hazard, dt, Qm, rec_ms, equi_ms)
+                Q = max(1, round(u_max / dt))
+                row = measure(J, hazard, dt, Q, rec_ms, equi_ms)
                 rows.append(row)
                 d = dict(zip(COLS, row))
                 print(f"  dt = {dt:6.4f}  Q = {int(d['Q']):5d}  r = {d['r']:.8f}  "
@@ -357,9 +330,9 @@ if run_sim:
                     f"age window fitted at dt = {DT_FIT} does not hold at this step.")
 
             res[(hazard, name)] = torch.tensor(rows)
-            checkpoint(res)
+            hlp.save_atomic(res, CACHE)
 
-    checkpoint(res)
+    hlp.save_atomic(res, CACHE)
     print(f"\nDone in {time.time() - t_all:.0f}s. {CACHE}.")
 
 
@@ -471,7 +444,7 @@ if run_plot:
     print(f"    worst absolute disagreement over every (hazard, regime, dt): {worst:.3e}")
 
     # The age window each (hazard, regime) was fitted to, held in ms across the sweep.
-    print(f"\n[age window] U_max = Qm*dt, fitted once at dt = {DT_FIT} to "
+    print(f"\n[age window] U_max = Q*dt, fitted once at dt = {DT_FIT} to "
           f"truncation_error < {TOL_FIT:.0e}:")
     for h in HAZARDS:
         for name in REGIMES:

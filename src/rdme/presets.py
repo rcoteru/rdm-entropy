@@ -24,9 +24,9 @@ hold:
   hazards.DEFAULT_HAZARD ("poisson_exact"); scripts state it anyway, and it ends up in the
   dump's frontmatter because the script had to write it down.
 
-  the solver step `dt`, the age grid `Qm` and the tolerance, which are numerics rather than
+  the solver step `dt` and the age-grid tolerance `tol`, which are numerics rather than
   model. `dt` is REQUIRED per run -- under route B there is no time quantum to default to --
-  and `Qm` is fitted to a tolerance by helpers.fit_age_grid rather than declared.
+  and the age grid follows from `tol` by equations.age_window rather than being declared.
 
   N, for the spin runs. The same preset drives the mean field and the microscopic model, and
   N is a property of the simulation, not of the system being simulated.
@@ -141,8 +141,8 @@ POPS: dict[str, int] = {"S1": 1, "S1-sat": 1, "D1": 1, "D2": 1, "S1/fp": 1}
 
 # Every model parameter a preset of M populations may carry, which is what an override is
 # checked against: a preset leaves J out when J is its swept axis, and that absence should not
-# make `J=...` an error. Mirrors the signature of RDMIsingModel; tests/test_presets.py checks
-# the two against each other so a parameter added to the model cannot be forgotten here.
+# make `J=...` an error. Mirrors the signature of RDMIsingModel, so a parameter added to the
+# model must be added here too.
 MODEL_KEYS: dict[int, frozenset[str]] = {
     1: frozenset({"J", "E", "beta", "theta", "tau_int", "tau_ref", "K_ref", "nu0", "t_abs"}),
 }
@@ -167,7 +167,7 @@ DEFAULT_HAZARD: str | None = hzd.DEFAULT_HAZARD
 # Keys a run may pass that are not model parameters: the solver, the grid, the hardware and,
 # for the spin runs, the population size. Separated from the model keys so that `params()` can
 # reject a typo in a model parameter without also rejecting these.
-SOLVER_KEYS = frozenset({"dt", "Qm", "eps", "device", "N", "ic"})
+SOLVER_KEYS = frozenset({"dt", "Q", "tol", "device", "N", "ic"})
 
 
 # Resolving a run
@@ -193,7 +193,7 @@ def params(name: str, *, hazard: str | None = None, **overrides) -> dict:
     makes to build its parameter dict.
 
         PARAMS = presets.params("S1", hazard="poisson", J=torch.linspace(0, 20, 300), dt=0.2)
-        mf = RDMIsingModelBatch(**PARAMS, Qm=Qm, device=device)
+        mf = RDMIsingModelBatch(**PARAMS, tol=1e-2, device=device)
 
     `hazard` falls back to hazards.DEFAULT_HAZARD ("poisson_exact"). A script states it
     anyway: it is a modelling choice of the same weight as the couplings, `bernoulli` is a

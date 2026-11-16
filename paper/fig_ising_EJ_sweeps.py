@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import numpy
 import torch
 
-import rdme.helpers as hlp
+import rdme.plots as rp
 from rdme.rdm_batch import RDMIsingModelBatch
 
 
@@ -92,7 +92,7 @@ def run_sweep(key: str) -> dict:
 
     mf = RDMIsingModelBatch(J=spec["J"], E=spec["E"], device=device, **BASE)
     x  = mf.grid_axes[spec["axis"]]
-    print(f"[{key}] {mf.B} mean-fields, {EQUI+STEPS} steps on {device} (Q={mf.Qm[0]})...")
+    print(f"[{key}] {mf.B} mean-fields, {EQUI+STEPS} steps on {device} (Q={mf.Q})...")
 
     t0 = time.time()
     mf.forward(EQUI, pb=True)
@@ -128,7 +128,7 @@ def run_sweep(key: str) -> dict:
     # Fixed points on CPU: the pass itself is tiny, and the dense eigendecomposition of the
     # (2Q, 2Q) one-step Jacobian is the cost here, so it runs on a strided subset. The model
     # is rebuilt rather than moved -- the fixed points are a property of the parameters, not
-    # of the state the trajectory above left behind, and Qm is derived identically.
+    # of the state the trajectory above left behind, and Q is derived identically.
     mf_cpu = RDMIsingModelBatch(J=spec["J"], E=spec["E"], device="cpu", **BASE)
     idx    = torch.arange(0, mf.B, max(1, mf.B // N_FP))
     print(f"[{key}] fixed points at {len(idx)} of {mf.B} values...")
@@ -171,7 +171,7 @@ if run_plot:
     if missing:
         raise FileNotFoundError(f"{', '.join(missing)} not found. Run with run_sim = True.")
 
-    hlp.pub_style()
+    rp.pub_style()
     data = {k: torch.load(cache_file(k), weights_only=True, map_location="cpu") for k in SWEEPS}
 
     C_AVG, C_STABLE, C_UNSTABLE = "k", "C0", "C3"
@@ -201,8 +201,8 @@ if run_plot:
     def grid(height: float = 0.62):
         """ 2x2, one column per sweep, columns sharing their parameter axis. """
         fig, axes = plt.subplots(2, 2, constrained_layout=True, sharex="col", sharey="row",
-                                 figsize=(hlp.SCIPOST_TEXTWIDTH,
-                                          height * hlp.SCIPOST_TEXTWIDTH))
+                                 figsize=(rp.SCIPOST_TEXTWIDTH,
+                                          height * rp.SCIPOST_TEXTWIDTH))
         for ax in axes.flat:
             ax.tick_params(direction="out", top=False, right=False)
         return fig, axes
@@ -288,7 +288,7 @@ if run_plot:
     # which have nothing to do with it. The sliver is left empty on the top row, so both
     # rows still give up the same width and the columns stay in register.
     fig2 = plt.figure(constrained_layout=True,
-                      figsize=(hlp.SCIPOST_TEXTWIDTH, 0.66 * hlp.SCIPOST_TEXTWIDTH))
+                      figsize=(rp.SCIPOST_TEXTWIDTH, 0.66 * rp.SCIPOST_TEXTWIDTH))
     gs   = fig2.add_gridspec(2, 3, width_ratios=[1, 1, 0.04])
     ax2  = numpy.empty((2, 2), dtype=object)
     for r in range(2):
@@ -372,7 +372,7 @@ if run_plot:
     # the colour scale, and each marker also carries a dark halo so it stays visible where
     # it crosses a bright ridge.
     fig3 = plt.figure(constrained_layout=True,
-                      figsize=(hlp.SCIPOST_TEXTWIDTH, 0.38 * hlp.SCIPOST_TEXTWIDTH))
+                      figsize=(rp.SCIPOST_TEXTWIDTH, 0.38 * rp.SCIPOST_TEXTWIDTH))
     gs3  = fig3.add_gridspec(1, 3, width_ratios=[1, 1, 0.04])
     ax3  = numpy.empty(2, dtype=object)
     for c in range(2):

@@ -16,7 +16,7 @@ Two operating points of S1:
 
 MONOTONICITY IS A PRECONDITION, not a result. A tolerance read off a Richardson limit means
 nothing if the sequence is not approaching one from a single side, so this refuses to print a
-table for any quantity whose sequence helpers.richardson rejects (`nan` + NO LIMIT on a sign
+table for any quantity whose sequence convergence.richardson rejects (`nan` + NO LIMIT on a sign
 change or an observed order outside [0, 3]). The guard is not relaxed, and a REFUSED row is
 the honest answer: there is no pair that buys that tolerance on this sweep.
 
@@ -41,7 +41,7 @@ and its step is set by accuracy alone (hazards.step_error: the local relative er
 lam*dt/2 at the PEAK HAZARD rate, which on this cycle is far above the population rate).
 `poisson` additionally needs c = nu0*dt < 1 strictly, so at nu0 = 1 /ms no pair in this table
 may have dt >= 1 for it; `bernoulli` admits the equality. Every dt here divides t_abs = 1 ms,
-which kernels.n_abs_bins requires of all three.
+which equations.n_abs_bins requires of all three.
 """
 
 import resource
@@ -52,9 +52,10 @@ import torch
 
 import rdme.hazards as hzd
 import rdme.helpers as hlp
+import rdme.convergence as cvg
 import rdme.presets as pre
-from rdme.helpers import converged_at, orders, richardson
-from rdme.network import RDMIsingModel
+from rdme.convergence import converged_at, orders, richardson
+from rdme.mean_field import RDMIsingModel
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -116,8 +117,8 @@ for _dt in DTS + [DT_FIT]:
     hzd.check_step(HAZARD, PARAMS["nu0"], _dt)
 
 
-def build(J: float, dt: float, Qm: list[int] | None = None) -> RDMIsingModel:
-    return RDMIsingModel(J, **MODEL, dt=dt, hazard=HAZARD, Qm=Qm, device=DEVICE)
+def build(J: float, dt: float, Q: int | None = None) -> RDMIsingModel:
+    return RDMIsingModel(J, **MODEL, dt=dt, hazard=HAZARD, Q=Q, device=DEVICE)
 
 
 def measure(J: float, dt: float, Q: int, equi_ms: float, rec_ms: float) -> list[float]:
@@ -143,10 +144,10 @@ def measure(J: float, dt: float, Q: int, equi_ms: float, rec_ms: float) -> list[
     # not the population rate, which the dead time caps at 1/t_abs.
     n_probe = max(1, int(period / dt) if n_cyc else len(r) // 10)
     phi_max, lam_max = 0.0, 0.0
-    n_abs = net.n_abs
+    n_abs = net.n_abs.tolist()                  # per population
     for _ in range(n_probe):
         phi_max = max(phi_max, net.max_step_prob())
-        lam_max = max(lam_max, max(float(l[n_abs:].max()) for l in net.hazard_rate()))
+        lam_max = max(lam_max, max(float(l[n:].max()) for l, n in zip(net.hazard_rate(), n_abs)))
         net.update()
 
     x = r[a:z] - r[a:z].mean()
@@ -180,11 +181,11 @@ if run_sim:
         J, equi_ms, rec_ms = reg["J"], reg["equi_ms"], reg["rec_ms"]
 
         print(f"\n[{name}, J = {J:g}] fitting the age window at dt = {DT_FIT} ...")
-        Qm_fit = hlp.fit_age_grid(lambda q: build(J, DT_FIT, q), tol=TOL_FIT,
+        Q_fit = cvg.fit_age_grid(lambda q: build(J, DT_FIT, q), tol=TOL_FIT,
                                   equi=hlp.n_steps(equi_ms + rec_ms, DT_FIT))
-        u_max = Qm_fit[0] * DT_FIT
+        u_max = Q_fit * DT_FIT
         res["u_max"][name] = u_max
-        print(f"  U_max = {u_max:.1f} ms; Qm = U_max/dt from here on")
+        print(f"  U_max = {u_max:.1f} ms; Q = U_max/dt from here on")
 
         rows = []
         for dt in DTS:
@@ -220,7 +221,7 @@ if run_table:
 
     # 0. the precondition
     print("\n[0] MONOTONICITY -- the precondition. A tolerance read off a limit that does not")
-    print("    exist is not a tolerance. helpers.richardson refuses on a sign change in the")
+    print("    exist is not a tolerance. convergence.richardson refuses on a sign change in the")
     print("    successive differences or an observed order outside [0, 3]; not relaxed.")
     limits: dict = {}
     for name, reg in REGIMES.items():
@@ -264,7 +265,7 @@ if run_table:
     print("\n[2] THE TABLE. For each quantity and tolerance: the COARSEST pair whose finer")
     print("    member is inside the tolerance of the extrapolated limit AND stays inside it")
     print("    all the way down -- a curve that crosses a threshold once on its way past is")
-    print("    not converged there (helpers.converged_at).")
+    print("    not converged there (convergence.converged_at).")
     for name, reg in REGIMES.items():
         t = res[name]
         print(f"\n    [{name}]")

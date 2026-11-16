@@ -27,8 +27,9 @@ import time
 import torch
 
 import rdme.helpers as hlp
+import rdme.convergence as cvg
 import rdme.presets as pre
-from rdme.network import RDMIsingModel
+from rdme.mean_field import RDMIsingModel
 
 
 PRESET = "S1-sat"
@@ -49,10 +50,10 @@ torch.set_default_dtype(torch.float64)
 def run(t_abs: float) -> dict:
     base = {k: v for k, v in pre.params(PRESET, hazard=HAZARD, dt=DT).items()
            if k not in ("dt", "t_abs")}
-    Qm = hlp.fit_age_grid(
-        lambda qm: RDMIsingModel(**base, dt=DT, t_abs=t_abs, Qm=qm, device=DEVICE),
+    Q = cvg.fit_age_grid(
+        lambda q: RDMIsingModel(**base, dt=DT, t_abs=t_abs, Q=q, device=DEVICE),
         tol=TOL, equi=hlp.n_steps(T_EQUI_MS + T_MEAS_MS, DT), verbose=False)
-    net = RDMIsingModel(**base, dt=DT, t_abs=t_abs, Qm=Qm, device=DEVICE)
+    net = RDMIsingModel(**base, dt=DT, t_abs=t_abs, Q=Q, device=DEVICE)
     net.forward(hlp.n_steps(T_EQUI_MS, DT))
     traj = net.entropy_trajectory(hlp.n_steps(T_MEAS_MS, DT), pb=False)
     r_tot = traj["r_tot"]
@@ -61,7 +62,7 @@ def run(t_abs: float) -> dict:
     x = window - window.mean()
     acf1 = float((x[:-1] * x[1:]).sum() / x.pow(2).sum().clamp_min(1e-300))
     return {
-        "Q": Qm[0], "r": float(window.mean()), "r_max": float(r_tot.max()),
+        "Q": Q, "r": float(window.mean()), "r_max": float(r_tot.max()),
         "sigma": float(traj["sigma_tot"][a:z if n_cyc else slice(None)].mean()) / DT,
         "n_cyc": n_cyc, "acf1": acf1, "trunc": float(net.truncation_error()),
     }

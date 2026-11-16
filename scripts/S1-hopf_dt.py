@@ -52,8 +52,8 @@ import torch
 import rdme.hazards as hzd
 import rdme.helpers as hlp
 import rdme.presets as pre
-from rdme.helpers import orders, richardson
-from rdme.network import RDMIsingModel
+from rdme.convergence import orders, richardson
+from rdme.mean_field import RDMIsingModel
 
 
 PRESET  = "S1"
@@ -74,7 +74,7 @@ PROBE_J = (13.0, 14.0, 14.5, 15.0, 16.0)
 
 # bernoulli needs nu0*dt <= 1 and poisson needs nu0*dt < 1 strictly (hazards.check_step), so
 # with nu0 = 1 the sweep starts at dt = 1 for bernoulli and at the first halving for poisson.
-# poisson_exact has no arithmetic cap. dt must also divide t_abs = 1 ms (kernels.n_abs_bins).
+# poisson_exact has no arithmetic cap. dt must also divide t_abs = 1 ms (equations.n_abs_bins).
 DTS     = (1.0, 0.5, 0.25, 0.125)
 
 # Cached per (hazard, dt) cell, not per run. The cost of a cell is one dense eigendecomposition
@@ -96,7 +96,7 @@ def spectral_radius(J: float, hazard: str, dt: float) -> float:
     assumption -- a second branch appearing would show up as a discontinuity in rho instead of
     being silently picked up or dropped. """
     net = RDMIsingModel(J, **MODEL, dt=dt, hazard=hazard,
-                        Qm=[max(1, round(U_MAX / dt))], device=DEVICE)
+                        Q=max(1, round(U_MAX / dt)), device=DEVICE)
     roots = net.fixed_points(n_grid=401)
     if roots.numel() == 0:
         raise RuntimeError(f"no fixed point at J={J}, hazard={hazard}, dt={dt}")
@@ -124,15 +124,6 @@ CACHE = hlp.cache_path(Path(__file__).stem,
                        root=CACHE_DIR)
 
 
-def checkpoint(res: dict) -> None:
-    """ Save after every cell, through a temporary and a rename, so an interrupted run keeps
-    what it measured and a reader never sees a half-written file. """
-    CACHE_DIR.mkdir(exist_ok=True)
-    tmp = CACHE.with_suffix(".tmp")
-    torch.save(res, tmp)
-    tmp.replace(CACHE)
-
-
 if __name__ == '__main__':
     res: dict = torch.load(CACHE, weights_only=False) if CACHE.exists() else {}
 
@@ -156,7 +147,7 @@ if __name__ == '__main__':
                 continue
             t0 = time.time()
             res[("Jc", hazard, dt)] = hopf(hazard, dt)
-            checkpoint(res)
+            hlp.save_atomic(res, CACHE)
             print(f"dt = {dt:6.4f}  {hazard:14s}  Hopf at J = {res[('Jc', hazard, dt)]:9.6f}"
                   f"   ({time.time() - t0:.0f}s)", flush=True)
         # the shape of rho(J) around it: a bisected root says nothing about how steep the
@@ -164,7 +155,7 @@ if __name__ == '__main__':
         for hazard in live:
             if ("rho", hazard, dt) not in res:
                 res[("rho", hazard, dt)] = [spectral_radius(J, hazard, dt) for J in PROBE_J]
-                checkpoint(res)
+                hlp.save_atomic(res, CACHE)
             vals = " ".join(f"{v:.5f}" for v in res[("rho", hazard, dt)])
             print(f"    rho at J = {'/'.join('%g' % J for J in PROBE_J)}, "
                   f"{hazard:14s}: {vals}", flush=True)

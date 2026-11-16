@@ -53,9 +53,10 @@ import torch
 
 import rdme.hazards as hzd
 import rdme.helpers as hlp
+import rdme.convergence as cvg
 import rdme.plots as rp
 import rdme.presets as pre
-from rdme.network import RDMIsingModel
+from rdme.mean_field import RDMIsingModel
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -137,11 +138,11 @@ torch.set_default_dtype(torch.float64)
 
 # ── Measurement ───────────────────────────────────────────────────────────────
 
-def build(J: float, Qm: list[int] | None = None):
-    return RDMIsingModel(float(J), **MODEL, dt=DT, hazard=HAZARD, Qm=Qm, device=DEVICE)
+def build(J: float, Q: int | None = None):
+    return RDMIsingModel(float(J), **MODEL, dt=DT, hazard=HAZARD, Q=Q, device=DEVICE)
 
 
-def measure(J: float, Qm: list[int], state, settle_ms: float) -> tuple[list[float], tuple]:
+def measure(J: float, Q: int, state, settle_ms: float) -> tuple[list[float], tuple]:
     """ Settle at J from `state`, record, and return the row plus the final state.
 
     `state` is (p, S, m) from the previous J, or None to start from the model's own initial
@@ -149,7 +150,7 @@ def measure(J: float, Qm: list[int], state, settle_ms: float) -> tuple[list[floa
     R_abs is computed from w at construction, so assigning J in place would leave the floor at
     the old coupling -- a silent inconsistency that would look like a branch. The grid is the
     same at every J, which is what makes copying the state across well defined. """
-    net = build(J, Qm)
+    net = build(J, Q)
     if state is not None:
         p, S, m = state
         net.p = [t.clone() for t in p]
@@ -184,7 +185,7 @@ def measure(J: float, Qm: list[int], state, settle_ms: float) -> tuple[list[floa
     return row, final
 
 
-def sweep(Js: torch.Tensor, Qm: list[int], settle_ms: float, label: str) -> torch.Tensor:
+def sweep(Js: torch.Tensor, Q: int, settle_ms: float, label: str) -> torch.Tensor:
     """ One pass of the continuation: each J started from the previous J's final state.
 
     The FIRST J of a pass is started from the model's own initial condition, which is the only
@@ -195,7 +196,7 @@ def sweep(Js: torch.Tensor, Qm: list[int], settle_ms: float, label: str) -> torc
     rows, state = [], None
     t0 = time.time()
     for k, J in enumerate(Js):
-        row, state = measure(float(J), Qm, state, settle_ms)
+        row, state = measure(float(J), Q, state, settle_ms)
         rows.append(row)
         d = dict(zip(COLS, row))
         print(f"  [{label}] J = {float(J):6.3f}  r = {d['r']:.6f}  ptp = {d['ptp']:.6f}  "
@@ -218,15 +219,15 @@ if run_sim:
                  else torch.load(CACHE, weights_only=False))
     t_all = time.time()
 
-    if "Qm" not in res:
+    if "Q" not in res:
         # Sized on the attractor at the FULL per-J budget, as fit_age_grid requires, and at
         # the low end of the ladder where the rate is smallest and the tail longest.
         print(f"Fitting the age window at J = {J_FIT}, dt = {DT} ...")
-        Qm = hlp.fit_age_grid(lambda q: build(J_FIT, q), tol=TOL / 100,
-                              equi=hlp.n_steps(SETTLE_MS + REC_MS, DT))
-        res["Qm"] = Qm
-        print(f"  Qm = {Qm}, U_max = {Qm[0] * DT:.1f} ms")
-    Qm = res["Qm"]
+        Q = cvg.fit_age_grid(lambda q: build(J_FIT, q), tol=TOL / 100,
+                             equi=hlp.n_steps(SETTLE_MS + REC_MS, DT))
+        res["Q"] = Q
+        print(f"  Q = {Q}, U_max = {Q * DT:.1f} ms")
+    Q = res["Q"]
 
     for key, Js, label in (("up", J_UP, "up  "), ("down", J_DOWN, "down")):
         if key in res:
@@ -234,7 +235,7 @@ if run_sim:
             continue
         print(f"\n[{key}] {len(Js)} points, J = {float(Js[0]):g} -> {float(Js[-1]):g}, "
               f"settle = {SETTLE_MS:g} ms each")
-        res[key] = sweep(Js, Qm, SETTLE_MS, label)
+        res[key] = sweep(Js, Q, SETTLE_MS, label)
         torch.save(res, CACHE)
 
     # The settling control, at the N_CONTROL J nearest onset on each pass. Re-run from the
@@ -254,7 +255,7 @@ if run_sim:
                         break
                     # walked at the production settling until the control window is reached
                     s = settle if k in idx.tolist() else SETTLE_MS
-                    row, state = measure(float(J), Qm, state, s)
+                    row, state = measure(float(J), Q, state, s)
                     if k in idx.tolist():
                         out[float(J)] = row
                 ctrl[(key, settle)] = out

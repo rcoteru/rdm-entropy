@@ -37,9 +37,10 @@ import matplotlib.pyplot as plt
 import torch
 
 import rdme.helpers as hlp
+import rdme.convergence as cvg
 import rdme.plots as rp
 import rdme.presets as pre
-from rdme.network import RDMIsingModel
+from rdme.mean_field import RDMIsingModel
 from rdme.spin_model import SpinIsingModel
 
 
@@ -109,40 +110,6 @@ run_sim   = True
 run_plot  = True
 overwrite = False  # the hash covers every parameter, so this is only for a change to the CODE
 torch.set_default_dtype(torch.float64)
-
-
-def checkpoint(res: dict) -> None:
-    """ Write the cache, atomically, after every unit of work.
-
-    Not at the end of the run, which is the obvious place and the wrong one. This sweep is
-    half an hour of independent units, and a single save at the end means an interrupted run
-    leaves nothing, a run in progress is invisible to anyone else, and the first thing anyone
-    does on seeing no cache is start a SECOND copy competing for the same GPU. Saving per unit
-    makes the file usable while it fills and makes the run resumable: `res` is reloaded below
-    and finished units are skipped.
-
-    Through a temporary and a rename, because the reader may be the person watching it fill:
-    `replace` is atomic within a filesystem, so a loader sees either the previous version or
-    the new one, never the half-written middle. """
-    CACHE_DIR.mkdir(exist_ok=True)
-    # Fold in whatever is on disk before writing. Two runs of this script -- mine and yours --
-    # each hold their own `res` in memory, so a plain save makes the last writer win and
-    # silently discard every unit the other measured. setdefault keeps what THIS process just
-    # computed and adopts any unit it does not have, which makes concurrent runs additive
-    # instead of destructive: they divide the work by racing for it rather than redoing it.
-    if CACHE.exists():
-        try:
-            disk = torch.load(CACHE, weights_only=False)
-        except Exception:
-            disk = {}                      # a torn read from another writer: ours still stands
-        adopted = [k for k in disk if k not in res]
-        for k in adopted:
-            res[k] = disk[k]
-        if adopted:
-            print(f"  (+{len(adopted)} units from another run of this script)")
-    tmp = CACHE.with_suffix(".tmp")
-    torch.save(res, tmp)
-    tmp.replace(CACHE)
 
 
 # ── Signal measures ───────────────────────────────────────────────────────────
@@ -279,9 +246,9 @@ if run_sim:
                   f"r = {float(res[(name, 'mf')][0]):.6f}")
         else:
             print(f"\n[{name}, J = {J:g}] mean field ...")
-            Qm = hlp.fit_age_grid(lambda q: RDMIsingModel(J, **PARAMS, Qm=q, device="cpu"),
+            Q = cvg.fit_age_grid(lambda q: RDMIsingModel(J, **PARAMS, Q=q, device="cpu"),
                                   tol=TOL, equi=int((EQUI_MS + REC_MS) / dt))
-            mf = RDMIsingModel(J, **PARAMS, Qm=Qm, device="cpu")
+            mf = RDMIsingModel(J, **PARAMS, Q=Q, device="cpu")
             mf.forward(int(EQUI_MS / dt))
             mf_r = mf.trajectory(int(REC_MS / dt), pb=False)["r"][:, 0]
 
@@ -302,8 +269,8 @@ if run_sim:
             res[(name, "mf_sigma")] = mf_sigma
             res[(name, "mf_traj")] = mf_r.float().clone()
             res[(name, "mf_psd")] = torch.stack(psd(mf_r, dt, SEG_MS))
-            checkpoint(res)
-            print(f"  Q={Qm[0]}  r={mf_row[0]:.6f}  sd={mf_row[1]**0.5:.6f}  "
+            hlp.save_atomic(res, CACHE)
+            print(f"  Q={Q}  r={mf_row[0]:.6f}  sd={mf_row[1]**0.5:.6f}  "
                   f"period={mf_row[2]:.2f} ms  sigma/dt={mf_sigma:.4e}  ({n_cyc} cycles)")
 
         # --- the samples ------------------------------------------------------
@@ -330,7 +297,7 @@ if run_sim:
                 if DEVICE == 'cuda': torch.cuda.empty_cache()
             res[(name, N)] = torch.tensor(rows)                     # (seeds, COLS)
             res[(name, N, "psd")] = torch.stack(psds).mean(dim=0)   # (2, F)
-            checkpoint(res)
+            hlp.save_atomic(res, CACHE)
             m = torch.tensor(rows).mean(dim=0)
             print(f"  N={N:8d}  r={m[0]:.6f}  sd={m[1] ** 0.5:.6f}  "
                   f"excess sd={max(m[1] - mf_row[1], 0) ** 0.5:.2e}  "
@@ -357,13 +324,13 @@ if run_sim:
             res[(name, N, "sigma")] = torch.tensor([float(sg.mean()),
                                                     float(blk.std() / nb ** 0.5)])
             res[(name, N, "H_fwd")] = float(ep["H_fwd_tot"].double().mean()) / dt
-            checkpoint(res)
+            hlp.save_atomic(res, CACHE)
             print(f"  N={N:8d}  sigma/dt={float(sg.mean()):+.4e} "
                   f"+- {float(blk.std() / nb ** 0.5):.1e}  ({time.time() - t0:.0f}s)")
             del sm, ep
             if DEVICE == 'cuda': torch.cuda.empty_cache()
 
-    checkpoint(res)
+    hlp.save_atomic(res, CACHE)
     print(f"\nDone in {time.time() - t_all:.0f}s. "
           f"{CACHE} ({CACHE.stat().st_size / 2**20:.1f} MiB).")
 

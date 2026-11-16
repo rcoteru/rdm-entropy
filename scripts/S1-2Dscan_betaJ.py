@@ -5,9 +5,10 @@ import matplotlib.pyplot as plt
 import torch
 
 import rdme.helpers as hlp
+import rdme.convergence as cvg
 import rdme.plots as rp
 import rdme.presets as pre
-from rdme.network import RDMIsingModelBatch
+from rdme.mean_field import RDMIsingModelBatch
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -36,7 +37,7 @@ PARAMS: dict = pre.params(
 
 # The age grid is FITTED per tile, not declared: the model's q_from_tau default is the
 # wrong rule whenever the firing interval is comparable to Q*dt. TOL is what goes in the
-# cache key -- Qm is a solver setting, not a model parameter.
+# cache key -- Q is a solver setting, not a model parameter.
 #
 # Loosened from the usual 1e-2 to 5e-2 for THIS grid specifically (2026-11-08 session): the
 # beta ~ 1 corner fires at a near-zero rate and needs Q in the thousands even at tol=1e-2,
@@ -46,7 +47,7 @@ PARAMS: dict = pre.params(
 # dt=0.25 hit). 5e-2 is still inside the brief's own exploration-grade allowance (sigma is
 # already quoted at 13-23% relative error on these maps; this trades a comparable amount of
 # age-grid accuracy for the run being affordable at all across the full beta range asked for).
-TOL = 5e-2   # age-grid accuracy; Qm is fitted to it
+TOL = 5e-2   # age-grid accuracy; Q is fitted to it
 
 # Equilibration and recording are set in MILLISECONDS; the step counts follow dt (see
 # helpers.n_steps). A step count says nothing about the system -- the same 20000 steps is a
@@ -78,20 +79,6 @@ overwrite = False  # the hash covers every parameter, so this is only for a chan
 torch.set_default_dtype(torch.float64)
 
 
-def checkpoint(parts: list[dict]) -> None:
-    """ Save the tiles measured so far, atomically. This grid runs to 81x81 at dt=0.25 and the
-    one stage that can take the whole process down without raising -- fp_eigenvalues' MKL
-    DGEBAL landmine, see CLAUDE.md -- does not happen to be called anywhere in this script (it
-    only runs `forward` and `entropy_trajectory`, never a stability eigendecomposition), so
-    that specific crash cannot hit this run. What CAN still kill a multi-hour batch job is the
-    ordinary kind -- OOM on a tile, a killed process, a bad node -- and saving nothing until the
-    very end turns any of those into a wasted run. This writes after every tile instead, through
-    a temporary and a rename so a reader never sees a half-written file. """
-    tmp = PARTIAL.with_suffix(".tmp")
-    torch.save({"parts": parts}, tmp)
-    tmp.replace(PARTIAL)
-
-
 def acf1_of(traj: torch.Tensor) -> torch.Tensor:
     """ Lag-1 autocorrelation of m_tot over the recorded window, per batch element (B, T) ->
     (B,). Same convention as S1-dt_conv.py / S1-cycle_point.py / S1-hopf_type.py: -1 is the
@@ -108,8 +95,8 @@ if run_sim and (overwrite or not CACHE.exists()):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     J, beta = PARAMS["J"], PARAMS["beta"]
 
-    Q = hlp.fit_age_grid(lambda qm: RDMIsingModelBatch(**PARAMS, Qm=qm, device=device),
-                         tol=TOL, equi=EQUI + STEPS)[0]
+    Q = cvg.fit_age_grid(lambda q: RDMIsingModelBatch(**PARAMS, Q=q, device=device),
+                         tol=TOL, equi=EQUI + STEPS)
     # One tile: the EPR observer is O(Q) per cell since the 2026-11-13 rebuild, so the O(B * Q^2)
     # ring epr_plan used to tile for is gone and the whole grid fits on the card. What a tile
     # still holds is its (B, T) trajectories, on the host, before the reduction below.
@@ -118,16 +105,10 @@ if run_sim and (overwrite or not CACHE.exists()):
     J_tiles = torch.tensor_split(J, n_tiles)
     assert all(len(t) >= 2 for t in J_tiles), "tiles of one J value would drop the J axis"
 
-    # Resume: a .partial.pt from an earlier, interrupted run of this exact grid (same n_tiles,
-    # since that follows deterministically from PARAMS) means its tiles need not be redone.
-    parts: list[dict] = []
-    if PARTIAL.exists():
-        try:
-            saved = torch.load(PARTIAL, weights_only=False)["parts"]
-        except Exception:
-            saved = []                      # a torn read from an earlier crash: start over
-        if len(saved) <= n_tiles:
-            parts = saved
+    # Resume: a .partial.pt from an earlier, interrupted run of this exact grid holds the
+    # tiles it finished, keyed by tile index.
+    parts: dict[int, dict] = (torch.load(PARTIAL, weights_only=False)
+                              if PARTIAL.exists() else {})
     if parts:
         print(f"Resuming from {PARTIAL.name}: {len(parts)}/{n_tiles} tiles already measured.")
 
@@ -138,10 +119,10 @@ if run_sim and (overwrite or not CACHE.exists()):
 
     t0 = time.time()
     for k, J_t in enumerate(J_tiles):
-        if k < len(parts):
+        if k in parts:
             print(f"[tile {k+1}/{n_tiles}]  cached from {PARTIAL.name}")
             continue
-        tile: dict = dict(PARAMS, Qm=[Q], J=J_t)
+        tile: dict = dict(PARAMS, Q=Q, J=J_t)
         mf = RDMIsingModelBatch(**tile, device=device)
         print(f"[tile {k+1}/{n_tiles}] {mf.B} mean-fields, "
               f"J in [{J_t.min():.3f}, {J_t.max():.3f}]")
@@ -149,14 +130,14 @@ if run_sim and (overwrite or not CACHE.exists()):
         traj = mf.entropy_trajectory(STEPS, pb=True, inplace=True)
         trunc = float(mf.truncation_error().max())
         assert trunc < TOL, (f"tile {k+1}: truncation_error = {trunc:.2e}: the age grid "
-                                   f"is too short (Qm={mf.Qm[0]}). Re-fit with fit_age_grid.")
+                                   f"is too short (Q={mf.Q}). Re-fit with fit_age_grid.")
         # reduce here, inside the loop: holding the tiles whole until the end would put the
         # full grid's trajectories in memory, which is the thing the tiling exists to avoid
         part = {f"{key}_{stat}": getattr(traj[key], stat)(dim=-1)
                for key in KEYS for stat in ("mean", "std")}
         part["m_tot_acf1"] = acf1_of(traj["m_tot"])
-        parts.append(part)
-        checkpoint(parts)
+        parts[k] = part
+        hlp.save_atomic(parts, PARTIAL)
         print(f"    acf1 in [{float(part['m_tot_acf1'].min()):+.3f}, "
               f"{float(part['m_tot_acf1'].max()):+.3f}]")
         del mf, traj
@@ -164,7 +145,8 @@ if run_sim and (overwrite or not CACHE.exists()):
     print(f"Done in {time.time() - t0:.2f}s")
 
     # tile k holds J_tiles[k] along axis 0, so the grid reassembles by concatenating there
-    out: dict = {key: torch.cat([p[key] for p in parts], dim=0).cpu() for key in parts[0]}
+    out: dict = {key: torch.cat([parts[k][key] for k in range(n_tiles)], dim=0).cpu()
+                 for key in parts[0]}
     out["params"] = PARAMS
 
     CACHE.parent.mkdir(exist_ok=True)
@@ -183,7 +165,7 @@ if run_plot:
     print(f"Plotting {CACHE.name}.")
     d = torch.load(CACHE, weights_only=False)
 
-    hlp.pub_style()
+    rp.pub_style()
     banner = pre.banner(PRESET, PARAMS)
 
     # NOTE: the J axis is plotted in the units it was passed in, i.e. physical units. The

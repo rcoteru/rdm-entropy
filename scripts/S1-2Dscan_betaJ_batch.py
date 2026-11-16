@@ -19,7 +19,7 @@ import torch
 import rdme.helpers as hlp
 import rdme.presets as pre
 try:
-    from rdme.network import RDMIsingModelBatch
+    from rdme.mean_field import RDMIsingModelBatch
     VERSION = "new"
 except ImportError:
     from rdme.rdm_batch import RDMIsingModelBatch
@@ -97,7 +97,7 @@ if not CACHE.exists():
     parts: list[dict] = []
     t0 = time.time()
     for k, J_t in enumerate(J_tiles):
-        mf = RDMIsingModelBatch(**dict(PARAMS, J=J_t, beta=beta), Qm=[QM], device=device)
+        mf = RDMIsingModelBatch(**dict(PARAMS, J=J_t, beta=beta), Q=QM, device=device)
         ta = time.time()
         mf.forward(EQUI, pb=False)
         sync(); tb = time.time()
@@ -105,7 +105,7 @@ if not CACHE.exists():
         sync(); tc = time.time()
         t_equi += tb - ta; t_epr += tc - tb
         trunc = float(mf.truncation_error().max())
-        assert trunc < TOL, f"tile {k+1}: truncation_error = {trunc:.2e} at Qm={QM}"
+        assert trunc < TOL, f"tile {k+1}: truncation_error = {trunc:.2e} at Q={QM}"
         part = {f"{key}_{stat}": getattr(traj[key], stat)(dim=-1)
                 for key in KEYS for stat in ("mean", "std")}
         part["m_tot_acf1"] = acf1_of(traj["m_tot"])

@@ -72,10 +72,10 @@ from matplotlib.colors import ListedColormap, BoundaryNorm, TwoSlopeNorm
 import torch
 import tqdm
 
-import rdme.kernels as krn
+import rdme.equations as eq
 import rdme.lyapunov as lyap
 import rdme.plots as rp
-from rdme.network import RDMWilsonCowanPoints, flatten_param_grid, unflatten_batch
+from rdme.mean_field import RDMWilsonCowanPoints, flatten_param_grid, unflatten_batch
 
 
 # ── Cache paths ───────────────────────────────────────────────────────────────
@@ -140,19 +140,18 @@ if run_sim:
         flat, grid_shape, swept = flatten_param_grid(axes_in)
         B = flat["w_EE"].numel()
 
-        Qm = [krn.q_from_tau(max(tau_int_E, tau_ref), dt, 0.01),
-              krn.q_from_tau(max(tau_int_I, tau_ref), dt, 0.01)]
-        D = 2 * sum(Qm)
+        Q = eq.q_from_tau(max(tau_int_E, tau_int_I, tau_ref), dt, 0.01)
+        D = 2 * 2 * Q
 
         # Chunk from a memory model rather than copied from stage 1, which had no tangents.
         # The tangent step allocates roughly c_tan temporaries of (B, k, Q) on top of the basis
         # itself, and the state costs c_state of (B, Q); measured peak was 0.98 GiB at B=2197,
-        # k=6, so without this a smaller dt (Qm doubles) or a larger k would silently OOM.
+        # k=6, so without this a smaller dt (Q doubles) or a larger k would silently OOM.
         c_tan, c_state, budget = 5, 5, 6 * 2**30
         chunk = min(n**3, int(budget / (8 * D * (c_tan * k + c_state))))
         n_chunks = (B + chunk - 1) // chunk
 
-        print(f"Grid: {n}**4 = {B} cells, k={k}, Qm={Qm} (D={D}).")
+        print(f"Grid: {n}**4 = {B} cells, k={k}, Q={Q} (D={D}).")
         print(f"{n_chunks} chunks of up to {chunk}. "
               f"{equi} equilibration + {warmup} warmup + {steps} accumulation steps each.")
         print(f"Running on: {device}")
@@ -171,7 +170,7 @@ if run_sim:
                 E_ratio, flat["w_EE"][sl], gc*rho, -gc/rho, flat["w_II"][sl],
                 flat["E_ext"][sl], flat["E_ext"][sl], beta, beta, theta, theta,
                 tau_int_E, tau_int_I, tau_ref, tau_ref, K_ref_E, K_ref_I,
-                dt=dt, hazard="poisson_exact", Qm=Qm, device=device)
+                dt=dt, hazard="poisson_exact", Q=Q, device=device)
 
             mf.forward(equi, pb=False)          # state only: tangents here would be wasted
             blocks = mf.init_tangent(k, generator=gen)

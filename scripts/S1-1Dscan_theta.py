@@ -7,9 +7,10 @@ import torch
 
 import rdme.fixed_points as fpts
 import rdme.helpers as hlp
+import rdme.convergence as cvg
 import rdme.plots as rp
 import rdme.presets as pre
-from rdme.network import RDMIsingModelBatch
+from rdme.mean_field import RDMIsingModelBatch
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -45,8 +46,8 @@ PARAMS: dict = pre.params(
 # The age grid is FITTED, not declared: the model's q_from_tau default sizes it from the
 # kernels alone and is the wrong rule whenever the firing interval is comparable to Q*dt,
 # where mass reaches the absorbing last bin and the run finds a different attractor. TOL
-# is what goes in the cache key -- Qm is a solver setting, not a model parameter.
-TOL = 1e-2   # age-grid accuracy; Qm is fitted to it
+# is what goes in the cache key -- Q is a solver setting, not a model parameter.
+TOL = 1e-2   # age-grid accuracy; Q is fitted to it
 
 AXIS  = "theta"                      # the swept parameter: the one PARAMS gives a vector
 LABEL = 'Threshold θ'
@@ -97,7 +98,7 @@ def age_grid() -> list[int]:
     """ The age grid both stages use, measured once and reused. Lazy so that a run with both
     caches warm never pays for it, and shared because the simulation and the fixed points are
     the same model at the same parameters -- sizing on the attractor covers both. """
-    return hlp.fit_age_grid(lambda qm: RDMIsingModelBatch(**PARAMS, Qm=qm, device="cpu"),
+    return cvg.fit_age_grid(lambda q: RDMIsingModelBatch(**PARAMS, Q=q, device="cpu"),
                             tol=TOL, equi=EQUI + STEPS)
 
 
@@ -114,42 +115,26 @@ if run_sim and (overwrite or not CACHE_SIM.exists()):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    Qm = age_grid()
+    Q = age_grid()
 
-    # One tile: the EPR observer is O(Q) per cell since the 2026-11-13 rebuild (the O(B * Q^2)
-    # ring that epr_plan used to tile for is gone), so the whole axis fits. The tile loop
-    # stays for the per-tile reduction below.
-    axis_values = PARAMS[AXIS]
-    B_tile = len(axis_values)
-    tiles = torch.tensor_split(axis_values, max(1, -(-len(axis_values) // B_tile)))
-
-    print(f"Running {len(axis_values)} mean-fields for {T_EQUI + T_MEAS:g} ms "
+    print(f"Running {len(PARAMS[AXIS])} mean-fields for {T_EQUI + T_MEAS:g} ms "
           f"({EQUI + STEPS} steps at dt={PARAMS['dt']:g}) on {device}...")
     t0 = time.time()
-    parts = []
-    for k, vals in enumerate(tiles):
-        mf = RDMIsingModelBatch(**dict(PARAMS, **{AXIS: vals}), Qm=Qm, device=device)
-        if len(tiles) > 1: print(f"[tile {k+1}/{len(tiles)}] {mf.B} mean-fields")
-        mf.forward(EQUI, pb=True)
-        traj = mf.entropy_trajectory(STEPS, pb=True, inplace=True)
+    mf = RDMIsingModelBatch(**PARAMS, Q=Q, device=device)
+    mf.forward(EQUI, pb=True)
+    traj = mf.entropy_trajectory(STEPS, pb=True, inplace=True)
 
-        trunc = float(mf.truncation_error().max())
-        assert trunc < TOL, (f"truncation_error = {trunc:.2e} at Qm={mf.Qm}: the "
-                             f"attractor holds more old-age mass than the pilot did. "
-                             f"Raise the equi passed to fit_age_grid.")
-
-        # reduced inside the loop: everything but m_tot is only ever plotted as a mean, and
-        # holding the tiles whole would defeat the tiling
-        parts.append({"m_tot": traj["m_tot"].cpu()}
-                     | {f"{key}_{s}": getattr(traj[key], s)(dim=-1).cpu()
-                        for key in MEANS for s in ("mean", "std")})
-        del mf, traj
-        if device == 'cuda': torch.cuda.empty_cache()
+    trunc = float(mf.truncation_error().max())
+    assert trunc < TOL, (f"truncation_error = {trunc:.2e} at Q={mf.Q}: the "
+                         f"attractor holds more old-age mass than the pilot did. "
+                         f"Raise the equi passed to fit_age_grid.")
     print(f"Done in {time.time() - t0:.2f}s")
 
+    # everything but m_tot is only ever plotted as a mean
     out: dict = {"params": PARAMS, "t_equi": T_EQUI, "t_meas": T_MEAS,
-             "equi": EQUI, "steps": STEPS}
-    out.update({key: torch.cat([p[key] for p in parts], dim=0) for key in parts[0]})
+             "equi": EQUI, "steps": STEPS, "m_tot": traj["m_tot"].cpu()}
+    out.update({f"{key}_{s}": getattr(traj[key], s)(dim=-1).cpu()
+                for key in MEANS for s in ("mean", "std")})
 
     CACHE_DIR.mkdir(exist_ok=True)
     torch.save(out, CACHE_SIM)
@@ -161,12 +146,12 @@ if run_sim and (overwrite or not CACHE_SIM.exists()):
 if run_fp and (overwrite or not CACHE_FP.exists()):
 
     # on CPU: the fixed-point pass is tiny and LAPACK's eig has no GPU equivalent here
-    Qm_fp  = age_grid()
-    mf_fp  = RDMIsingModelBatch(**PARAMS, Qm=Qm_fp, device="cpu")
+    Q_fp   = age_grid()
+    mf_fp  = RDMIsingModelBatch(**PARAMS, Q=Q_fp, device="cpu")
     stride = max(1, mf_fp.B // N_THETA_FP)
     idx    = torch.arange(0, mf_fp.B, stride)
 
-    print(f"Finding fixed points at {len(idx)} of {mf_fp.B} {AXIS} values (Q={mf_fp.Qm[0]})...")
+    print(f"Finding fixed points at {len(idx)} of {mf_fp.B} {AXIS} values (Q={mf_fp.Q})...")
     t0 = time.time()
     branches: dict = fpts.branch_scan(mf_fp, mf_fp.grid_axes[AXIS], idx, n_grid=N_SCAN, n_lead=N_LEAD)
     print(f"Done in {time.time() - t0:.2f}s, {len(branches['m_star'])} fixed points.")

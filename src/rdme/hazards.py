@@ -63,7 +63,7 @@ The kernels and their relationships are documented below; rdme is what applies t
 # t_abs = 0 can reach arbitrary rates. bernoulli's rate saturates at nu0 instead, one spike
 # per update interval, a property of the discrete state space it was built on.
 #
-# Every kernel takes `inplace`, with the same meaning as in rdme.rdm: the out-of-place
+# Every kernel takes `inplace`, with the same meaning as in rdme.equations: the out-of-place
 # branch is the definition and the oracle, the in-place branch is the same arithmetic in the
 # same ORDER with the temporaries folded away, so the two agree bit for bit and the tests can
 # assert torch.equal rather than allclose. inplace=True is a licence to destroy h -- the
@@ -452,8 +452,8 @@ def check_step(hazard: str, nu0: float, dt: float) -> None:
 # The (dt, t_abs, nu0) convention
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-def resolve_timesteps(dt: float, t_abs: float, nu0: float,
-                      hazard: str) -> tuple[float, float, float]:
+def resolve_timesteps(dt: float, t_abs: float | torch.Tensor, nu0: float,
+                      hazard: str) -> tuple[float, float | torch.Tensor, float]:
     """ Settle (dt, t_abs, nu0) for a model. Shared by RDMNetwork, RDMNetworkBatch and
     SpinModel so the convention is stated once rather than three times.
 
@@ -469,7 +469,7 @@ def resolve_timesteps(dt: float, t_abs: float, nu0: float,
             parameter of the model, and the only thing that bounds the realised firing rate
             under an exponential hazard (at 1/t_abs). It no longer defaults to the step; a
             model that wants no dead time passes t_abs = 0 explicitly and accepts an unbounded
-            rate. kernels.n_abs_bins requires dt to divide it.
+            rate. equations.n_abs_bins requires dt to divide it.
 
       dt    the SOLVER step, and nothing else. REQUIRED: under route B there is no discrete
             model to default to, so a model that has not named its step has not said how it is
@@ -494,8 +494,8 @@ def resolve_timesteps(dt: float, t_abs: float, nu0: float,
         raise ValueError(f"dt must be positive, got {dt}")
     if not nu0 > 0:
         raise ValueError(f"nu0 must be positive, got {nu0}")
-    if t_abs is None or t_abs < 0:
+    if t_abs is None or bool((torch.as_tensor(t_abs) < 0).any()):
         raise ValueError(f"t_abs must be a non-negative number of ms, got {t_abs}. Pass "
                          "t_abs=0.0 explicitly for no dead time (and an unbounded rate).")
     check_step(hazard, nu0, dt)
-    return float(dt), float(t_abs), float(nu0)
+    return float(dt), (t_abs if torch.is_tensor(t_abs) else float(t_abs)), float(nu0)

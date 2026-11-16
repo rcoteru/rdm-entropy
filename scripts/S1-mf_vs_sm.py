@@ -6,10 +6,11 @@ import torch
 
 import rdme.fixed_points as fpts
 import rdme.helpers as hlp
+import rdme.convergence as cvg
 import rdme.plots as rp
 import rdme.presets as pre
 
-from rdme.network import RDMIsingModel
+from rdme.mean_field import RDMIsingModel
 from rdme.spin_model import SpinIsingModel
 
 
@@ -64,7 +65,7 @@ regime = "ref_lowbeta"  # pick one of the above regimes to run
 
 PRESET = REGIMES[regime]["preset"]
 
-TOL    = 1e-2      # age-grid accuracy; Qm is fitted to it rather than set by hand
+TOL    = 1e-2      # age-grid accuracy; Q is fitted to it rather than set by hand
 N      = 40000     # spins in the network model
 DEVICE = 'cpu'     # 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -94,7 +95,7 @@ SKIP   = hlp.n_steps(SKIP_MS, PARAMS["dt"], name="SKIP_MS")
 # predates it and there is nothing to invalidate by hand. Switching regimes, or back to a
 # parameter set already run, is free. The cost is one file per set in cache/.
 #
-# TOL is in the key but the fitted Qm is not, because Qm is a solver setting rather than a
+# TOL is in the key but the fitted Q is not, because Q is a solver setting rather than a
 # model parameter: two runs at the same physics and the same accuracy are the same run,
 # whatever bin count each turned out to need. A change to the FITTING code is a code change,
 # which the cache does not track and clearing cache/ handles.
@@ -116,14 +117,14 @@ if run_sim and (overwrite or not CACHE.exists()):
 
     # The mean field's age grid is fitted, not declared: q_from_tau is the model's default and
     # is the wrong rule at these rates, and the right Q differs by 2x between the two arms.
-    Qm = hlp.fit_age_grid(lambda qm: RDMIsingModel(PARAMS["J"], **mf_args, Qm=qm, eps=0.01,
+    Q = cvg.fit_age_grid(lambda q: RDMIsingModel(PARAMS["J"], **mf_args, Q=q, eps=0.01,
                                                    device=DEVICE), tol=TOL, equi=steps1 + steps2)
 
-    # the spin network carries an age per neuron and has no age grid, so Qm is the one thing
+    # the spin network carries an age per neuron and has no age grid, so Q is the one thing
     # the two models do not share
     sm = SpinIsingModel(N, PARAMS["J"], **mf_args, device=DEVICE, ic="random")
-    mf = RDMIsingModel(PARAMS["J"], **mf_args, Qm=Qm, eps=0.01, device=DEVICE)
-    print(f"Q = {mf.Qm} age bins. Running {T_EQUI + T_MEAS:g} ms of each model "
+    mf = RDMIsingModel(PARAMS["J"], **mf_args, Q=Q, eps=0.01, device=DEVICE)
+    print(f"Q = {mf.Q} age bins. Running {T_EQUI + T_MEAS:g} ms of each model "
           f"({steps1 + steps2} steps at dt={PARAMS['dt']:g}) on {DEVICE}.")
 
     t0 = time.time()
@@ -148,7 +149,7 @@ if run_sim and (overwrite or not CACHE.exists()):
         "sm_traj1": sm_traj1, "sm_traj2": sm_traj2,
         # the two age distributions, on the mean field's grid
         "p_mf": mf.p[0].cpu(),
-        "p_sm": sm.fdist(mf.Qm[0]).cpu(),
+        "p_sm": sm.fdist(mf.Q).cpu(),
         "m_grid": m_grid.squeeze(-1).cpu(),
         "G": mf.fp_residual(m_grid).squeeze(-1).cpu(),
         "roots": roots.cpu(),

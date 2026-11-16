@@ -1,22 +1,20 @@
 from __future__ import annotations
 
-from typing import NamedTuple
-
 import math
 
 import torch
 
+import rdme.equations as eq
 from rdme.hazards import Hazard
-import rdme.rdm as rdm
 
 """ Entropy production, by the O(Q) observer.
 
 The EPR needs only four marginals of the joint distribution of forward and reverse age, and
 each slides exactly from one timestep to the next, so epr_step reaches them by recursion at
 O(Q) per step and O(Q) memory, and epr_from_parts reads the EPR off them. The explicit (Q, K)
-joint -- the definition, at O(Q^2) per step -- is not in the library: it lives in
-tests/epr_reference.py as the oracle the observer is checked against, and calls the same
-epr_from_parts, so the two can only disagree through the four marginals.
+joint -- the definition, at O(Q^2) per step -- is kept at the end of this module as the oracle
+the observer is checked against, and calls the same epr_from_parts, so the two can only
+disagree through the four marginals.
 
 The EPR is a functional of the hazard alone, so one implementation serves every kernel; that
 is why it is written as the plain Bernoulli entropy in Phi rather than in the softplus/logit
@@ -35,9 +33,9 @@ or nothing at all. """
 # every member of the family.
 
 def compute_reverse_synaptic_term(
-        I: torch.Tensor,       # (Qm[i],) buffered I[j] = input at time t+j
+        I: torch.Tensor,       # (..., Q) buffered I[j] = input at time t+j
         alpha: float | torch.Tensor,   # integration kernel scaling factor
-        ) -> torch.Tensor:             # (Qm[i],) backward field S^dagger_t(n)
+        ) -> torch.Tensor:             # (..., Q) backward field S^dagger_t(n)
     """ Age-dependent backward (time-reversed) field from a buffered trajectory of future
     population inputs, via a kernel-weighted cumulative sum:
 
@@ -88,7 +86,7 @@ def anchor_reverse_synaptic_term(
 # Entropy production
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #
-# Every function below takes the `inplace` flag of rdme.rdm and rdme.hazards, with the
+# Every function below takes the `inplace` flag of rdme.equations and rdme.hazards, with the
 # same contract: the out-of-place branch is the definition and the oracle, the in-place one is
 # the same arithmetic in the same order with the temporaries folded away, so the two agree bit
 # for bit. Nothing a caller owns is touched -- p, the observer state, the live S and R
@@ -107,7 +105,7 @@ def _log1m(phi: torch.Tensor, inplace: bool) -> torch.Tensor:
     """ log1p(-Phi) with the clamp every survival product needs, in one buffer instead of
     three. phi itself is never written to -- clamp() already copies, and the rest rides on that
     copy -- so this is safe on a hazard the caller still needs, which is every caller here. """
-    c = rdm.hazard_clamp(phi.dtype)
+    c = eq.hazard_clamp(phi.dtype)
     return phi.clamp(max=c).neg_().log1p_() if inplace else torch.log1p(-phi.clamp(max=c))
 
 
@@ -145,7 +143,7 @@ def epr_from_parts(p_fwd: torch.Tensor,    # (..., Q) row sums of the joint == p
     # each chain runs in the buffer its clamp() copies into: the same operations in the same
     # order as the out-of-place forms, on a temporary nothing else holds
     lo = lambda phi: phi.clamp(min=torch.finfo(phi.dtype).tiny,
-                               max=rdm.hazard_clamp(phi.dtype)).log_()
+                               max=eq.hazard_clamp(phi.dtype)).log_()
     l1 = _log1m
 
     sm = lambda x: x.sum(dim=-1)
@@ -191,17 +189,6 @@ def poisson_reference_entropy(m: torch.Tensor,    # (...) per-bin firing probabi
     return -(m * math.log(c) + (1.0 - m) * math.log1p(-c))
 
 
-class EPRParams(NamedTuple):
-    """ One population's parameters, as every observer step and init takes them. """
-    R:      torch.Tensor                 # (..., Q) refractory kernel
-    alpha:  float | torch.Tensor         # (..., 1) integration kernel scaling factor
-    beta:   float | torch.Tensor         # (..., 1)
-    theta:  float | torch.Tensor         # (..., 1)
-    hazard: Hazard
-    nu0:    float
-    dt:     float
-
-
 # Sliding-state EPR: the same quantity in O(Q) per step and O(Q) memory
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #
@@ -231,7 +218,7 @@ class EPRParams(NamedTuple):
 # the pre-rebuild implementation kept as a ring:
 #
 #   the row S_t, for Phi[t, .]: a copy of the model's S lagged K-1 steps, advanced by the
-#     model's own rdm.update_synaptic_term on the stored input, so it is the model's S bit for
+#     model's own eq.update_synaptic_term on the stored input, so it is the model's S bit for
 #     bit;
 #   the row S_{t+K-1}, for the window-edge hazards: the model's LIVE S, passed in by the caller
 #     at the step it is current, so the observer keeps no copy of it;
@@ -240,6 +227,18 @@ class EPRParams(NamedTuple):
 #     input window every step by synaptic_diagonal.
 #
 # State per population is therefore O(Q): three (Q,) rows, G (K,), and the input window (K-1,).
+# It is carried as a plain tuple, valid at the reported time t:
+#
+#   (p, S, I, G, logV, phi_end)
+#     p        (..., Q)    p_t, the reported marginal, lagging the model by K-1 steps
+#     S        (..., Q)    S_t, the model's S lagged K-1 steps
+#     I        (..., K-1)  I_t .. I_{t+K-2}
+#     G        (..., K)    column sums of the joint, G[k] = p_t(n_dagger = k)
+#     logV     (..., Q)    log survival over the next K-2 steps, per age
+#     phi_end  (..., Q)    Phi[t+K-2, min(n+K-2, Q-1)], the window-edge hazards
+#
+# Every init and step takes one population's parameters as the trailing positional arguments
+# R (..., Q), alpha, beta, theta (each (..., 1) or a float), hazard, nu0, dt.
 
 
 def synaptic_diagonal(I: torch.Tensor,                 # (..., n) inputs I_t .. I_{t+n-1}
@@ -281,18 +280,6 @@ def _first_passage(d: torch.Tensor, p0: torch.Tensor, inplace: bool) -> torch.Te
     return torch.cat([surv[..., :-1] * d[..., :-1], surv[..., -1:]], dim=-1)
 
 
-class EPRState(NamedTuple):
-    """ What the sliding observer carries between timesteps, valid at the reported time t.
-    Every field is (..., Q) or (..., K) with K == Q: O(Q) per population. Nothing here is the
-    model's own state: p and S lag it by K-1 steps, the rest are sums over the window. """
-    p:       torch.Tensor   # (..., Q)   p_t, the reported marginal
-    S:       torch.Tensor   # (..., Q)   S_t, the model's S lagged K-1 steps
-    I:       torch.Tensor   # (..., K-1) I_t .. I_{t+K-2}
-    G:       torch.Tensor   # (..., K)   column sums of the joint, G[k] = p_t(n_dagger = k)
-    logV:    torch.Tensor   # (..., Q)   log survival over the next K-2 steps, per age
-    phi_end: torch.Tensor   # (..., Q)   Phi[t+K-2, min(n+K-2, Q-1)], the window-edge hazards
-
-
 def _window_edge_ages(Q: int, device) -> torch.Tensor:
     return torch.clamp(torch.arange(Q, device=device) + (Q - 2), max=Q - 1)
 
@@ -300,9 +287,16 @@ def _window_edge_ages(Q: int, device) -> torch.Tensor:
 def init_epr_state(p: torch.Tensor,       # (..., Q) p_t
                    S: torch.Tensor,       # (..., Q) S_t
                    I: torch.Tensor,       # (..., K-1) inputs I_t .. I_{t+K-2}
-                   prm: EPRParams,
-                   inplace: bool = False) -> EPRState:
-    """ The sliding state at the first reported step, from S_t and the inputs that follow it.
+                   R: torch.Tensor,
+                   alpha: float | torch.Tensor,
+                   beta: float | torch.Tensor,
+                   theta: float | torch.Tensor,
+                   hazard: Hazard,
+                   nu0: float,
+                   dt: float,
+                   inplace: bool = False) -> tuple:
+    """ The sliding state (p, S, I, G, logV, phi_end) at the first reported step, from S_t and
+    the inputs that follow it.
 
     G, logV and phi_end are sums over the joint's lag axis, so they are accumulated one lag at
     a time, walking S forward along the window with the model's own update: row k of the
@@ -311,7 +305,6 @@ def init_epr_state(p: torch.Tensor,       # (..., Q) p_t
     step of a trajectory is O(Q*K) in time and O(Q) in memory. The running sum is the same
     sequence of additions as the joint path's cumsum; G and logV are reduced in a different
     order from it, so they agree with the joint to rounding, not bit for bit. """
-    R, alpha, beta, theta, hazard, nu0, dt = prm
     Q = S.shape[-1]
     K = I.shape[-1] + 1
     if K < 3:
@@ -319,7 +312,7 @@ def init_epr_state(p: torch.Tensor,       # (..., Q) p_t
     if K != Q:
         # the reverse field's h(k) is evaluated against R(k), so the lag axis and the age axis
         # share a length -- a constraint the joint path carries too, and entropy_trajectory
-        # always satisfies it (K = Qm[i] = Q)
+        # always satisfies it (K = Q)
         raise ValueError(f"sliding EPR needs K == Q, got K={K}, Q={Q}")
     n_idx = torch.arange(Q, device=S.device)
     G = p.new_empty(p.shape[:-1] + (K,))
@@ -327,7 +320,7 @@ def init_epr_state(p: torch.Tensor,       # (..., Q) p_t
     for k in range(K - 1):
         if k > 0:
             # in place only on a row this function owns, never on the caller's S
-            S_k = rdm.update_synaptic_term(S_k, alpha, I[..., k - 1:k], inplace=inplace and k > 1)
+            S_k = eq.update_synaptic_term(S_k, alpha, I[..., k - 1:k], inplace=inplace and k > 1)
         # the field on the whole row, then gathered: the same elementwise sums as gathering S
         # and R first, with one (..., Q) temporary instead of three
         a = torch.clamp(n_idx + k, max=Q - 1)
@@ -350,7 +343,7 @@ def init_epr_state(p: torch.Tensor,       # (..., Q) p_t
     # the last lag is censoring, the bare survival through K-1 rows: it needs no hazard of its
     # own, so the window's last row S_{t+K-1} is never formed here -- the live S carries it
     G[..., K - 1] = (torch.exp(acc).mul_(p) if inplace else torch.exp(acc) * p).sum(dim=-1)
-    return EPRState(p, S, I, G, logV, phi_end)
+    return p, S, I, G, logV, phi_end
 
 
 def _edge_field(S: torch.Tensor, R: torch.Tensor, theta, inplace: bool) -> torch.Tensor:
@@ -363,17 +356,91 @@ def _edge_field(S: torch.Tensor, R: torch.Tensor, theta, inplace: bool) -> torch
     return hazard_field(S[..., Q - 2:], R[..., Q - 2:], theta, inplace)[..., a]
 
 
-def epr_step(state: EPRState,
+def _epr_now(p, G, I, I_new, phi_t, R, alpha, theta, phi, inplace: bool) -> torch.Tensor:
+    """ (..., 3) [sigma, H_fwd, H_rev] at the reported t, from the four marginals of J_t: the
+    row sums p and column sums G the state carries, column 0 off the hazard row phi_t, and
+    row 0 off the age-0 cohort's diagonal. phi is the hazard as a function of the field. """
+    col0 = p * phi_t                                                 # (Q,)  J_t[:, 0]
+
+    # row 0: the age-0 cohort's first-passage law, off the diagonal Phi[t+j, j] (K == Q, so
+    # the diagonal's ages are R's own and need no gather)
+    d = phi(hazard_field(synaptic_diagonal(I, alpha), R, theta, inplace))   # (..., K)
+    row0 = _first_passage(d, p[..., :1], inplace)                    # (..., K), last col bare
+    del d
+
+    I_full = torch.cat([I, I_new.unsqueeze(-1)], dim=-1)             # I_t .. I_{t+K-1}
+    phi_r = phi(hazard_field(anchor_reverse_synaptic_term(I_full, alpha), R, theta, inplace))
+    del I_full
+    return epr_from_parts(p, G, col0, row0, phi_t, phi_r)
+
+
+def _newborn_cohort(I, p0_next, R, alpha, theta, phi, inplace: bool):
+    """ The cohort born at t+1, at ages 0..K-3, whose one diagonal of hazards gives both its
+    own survival window logV_{t+1}(0) and the next step's row 0 up to lag K-3. Returns
+    (logV0 (...), row0_next (..., K-2)). """
+    K = I.shape[-1] + 1
+    d2 = phi(hazard_field(synaptic_diagonal(I[..., 1:K - 2], alpha), R[..., :K - 2], theta,
+                          inplace))
+    log_surv2 = _cumlog1m(d2, inplace)
+    logV0 = log_surv2[..., -1]
+    surv2 = torch.cat([torch.ones_like(d2[..., :1]), torch.exp(log_surv2[..., :-1])], dim=-1)
+    del log_surv2
+    row0_next = surv2.mul_(p0_next).mul_(d2) if inplace else p0_next * surv2 * d2
+    return logV0, row0_next
+
+
+def _slide_logV(logV, phi_t, phi_end, logV0, inplace: bool) -> torch.Tensor:
+    """ logV_{t+1}: drop time t off the front of the window, add t+K-2 at the back, and shift
+    one age up, with the newborn's logV0 at age 0. Index Q-1 takes the lumped-bin value rather
+    than the shifted one; the two agree analytically (both merged cohorts see the same clamped
+    future) and this stays exact if the shift falls off. """
+    L_t = _log1m(phi_t, inplace)
+    L_e = _log1m(phi_end, inplace)
+    W = L_t.neg_().add_(logV).add_(L_e) if inplace else logV - L_t + L_e
+    del L_t, L_e
+    logV_next = torch.empty_like(W)
+    logV_next[..., 1:] = W[..., :-1]
+    logV_next[..., -1] = W[..., -1]
+    logV_next[..., 0] = logV0
+    return logV_next
+
+
+def _slide_G(G, row0_next, logV_next, p_next, phi_end_next, inplace: bool) -> torch.Tensor:
+    """ G_{t+1}: shift-and-add on the interior lags, V-weighted sums on the two boundary ones
+    (the first passage at K-2 and the censoring bin at K-1). """
+    K = G.shape[-1]
+    G_next = torch.empty_like(G)
+    G_next[..., :K - 2] = row0_next.add_(G[..., 1:K - 1]) if inplace else \
+                          G[..., 1:K - 1] + row0_next
+    if inplace:
+        pV = torch.exp(logV_next).mul_(p_next)
+        w = torch.mul(pV, phi_end_next)
+        G_next[..., K - 2] = w.sum(dim=-1)
+        G_next[..., K - 1] = w.copy_(phi_end_next).neg_().add_(1).mul_(pV).sum(dim=-1)
+    else:
+        pV = p_next * torch.exp(logV_next)
+        G_next[..., K - 2] = (pV * phi_end_next).sum(dim=-1)
+        G_next[..., K - 1] = (pV * (1 - phi_end_next)).sum(dim=-1)
+    return G_next
+
+
+def epr_step(state: tuple,                # (p, S, I, G, logV, phi_end) at the reported t
              S_live: torch.Tensor,        # (..., Q) the model's S at t+K-1, the window's edge
              I_new: torch.Tensor,         # (...) the model's input at t+K-1
-             prm: EPRParams,
+             R: torch.Tensor,
+             alpha: float | torch.Tensor,
+             beta: float | torch.Tensor,
+             theta: float | torch.Tensor,
+             hazard: Hazard,
+             nu0: float,
+             dt: float,
              inplace: bool = False):
     """ One timestep of the observer: (state_{t+1}, sigma, H_fwd, H_rev) at the reported t.
 
     The observer lags the model by K-1 steps -- the reverse field needs the input that far into
     the future -- and is fed the model's live S and live input, both read at time t+K-1 BEFORE
     the model advances. It never sees the model otherwise: S_t is advanced here, by
-    rdm.update_synaptic_term on the stored inputs, and p_t by rdm.update_age_distribution on
+    eq.update_synaptic_term on the stored inputs, and p_t by eq.update_age_distribution on
     the Phi[t, .] row this step already needs. Three (Q,) hazard evaluations and two diagonal
     rebuilds replace the (Q, K) joint.
 
@@ -382,73 +449,142 @@ def epr_step(state: EPRState,
     peak is the new state plus a couple of (..., Q) buffers; inplace reuses the buffers this
     function allocates itself, in the same arithmetic order, and lowers it further. """
     p, S, I, G, logV, phi_end = state
-    R, alpha, beta, theta, hazard, nu0, dt = prm
-    K = I.shape[-1] + 1
     phi = lambda h: hazard.phi(h, beta, nu0, dt, inplace=inplace)
-    fld = lambda S, Rv: hazard_field(S, Rv, theta, inplace)
 
-    # -- present: the hazard row at time t, shared by H_fwd, column 0 and the logV slide
-    phi_t = phi(fld(S, R))                                           # (Q,)
-    col0 = p * phi_t                                                 # (Q,)  J_t[:, 0]
+    # the hazard row at time t, shared by H_fwd, column 0, the p update and the logV slide
+    phi_t = phi(hazard_field(S, R, theta, inplace))                  # (Q,)
+    epr = _epr_now(p, G, I, I_new, phi_t, R, alpha, theta, phi, inplace)
+    p_next = eq.update_age_distribution(p, phi_t)
 
-    # -- row 0: the age-0 cohort's first-passage law, off the diagonal Phi[t+j, j] (K == Q, so
-    # the diagonal's ages are R's own and need no gather)
-    d = phi(fld(synaptic_diagonal(I, alpha), R))                     # (..., K)
-    row0 = _first_passage(d, p[..., :1], inplace)                    # (..., K), last col bare
-    del d
-
-    I_full = torch.cat([I, I_new.unsqueeze(-1)], dim=-1)             # I_t .. I_{t+K-1}
-    phi_r = phi(fld(anchor_reverse_synaptic_term(I_full, alpha), R))
-    del I_full              # rebuilt as the next window at the end, rather than held through
-    epr = epr_from_parts(p, G, col0, row0, phi_t, phi_r)
-    del col0, row0, phi_r
-
-    p_next = rdm.update_age_distribution(p, phi_t)
-
-    # -- slide logV: drop time t off the front of the window, add t+K-2 at the back. Index Q-1
-    # takes the lumped-bin value rather than the shifted one; the two agree analytically (both
-    # merged cohorts see the same clamped future) and this stays exact if the shift falls off.
-    L_t = _log1m(phi_t, inplace)
-    del phi_t
-    L_e = _log1m(phi_end, inplace)
-    W = L_t.neg_().add_(logV).add_(L_e) if inplace else logV - L_t + L_e
-    del L_t, L_e
-    logV_next = torch.empty_like(W)
-    logV_next[..., 1:] = W[..., :-1]
-    logV_next[..., -1] = W[..., -1]
-    del W
-
-    # -- the newborn cohort's own window, and the next step's row 0, share one diagonal: the
-    # cohort born at t+1, at ages 0..K-3
-    d2 = phi(fld(synaptic_diagonal(I[..., 1:K - 2], alpha), R[..., :K - 2]))
-    log_surv2 = _cumlog1m(d2, inplace)
-    logV_next[..., 0] = log_surv2[..., -1]
-    surv2 = torch.cat([torch.ones_like(d2[..., :1]), torch.exp(log_surv2[..., :-1])], dim=-1)
-    del log_surv2
-    row0_next = surv2.mul_(p_next[..., :1]).mul_(d2) if inplace else \
-                p_next[..., :1] * surv2 * d2                         # (..., K-2)
-    del d2, surv2
-
-    # -- slide G: shift-and-add on the interior, V-weighted sums on the two boundary lags
-    G_next = torch.empty_like(G)
-    G_next[..., :K - 2] = row0_next.add_(G[..., 1:K - 1]) if inplace else \
-                          G[..., 1:K - 1] + row0_next
-    del row0_next
+    logV0, row0_next = _newborn_cohort(I, p_next[..., :1], R, alpha, theta, phi, inplace)
+    logV_next = _slide_logV(logV, phi_t, phi_end, logV0, inplace)
+    del phi_t, logV0
     phi_end_next = phi(_edge_field(S_live, R, theta, inplace))       # Phi[t+K-1, .]
-    if inplace:
-        pV = torch.exp(logV_next).mul_(p_next)
-        w = torch.mul(pV, phi_end_next)
-        G_next[..., K - 2] = w.sum(dim=-1)
-        G_next[..., K - 1] = w.copy_(phi_end_next).neg_().add_(1).mul_(pV).sum(dim=-1)
-        del pV, w
-    else:
-        pV = p_next * torch.exp(logV_next)
-        G_next[..., K - 2] = (pV * phi_end_next).sum(dim=-1)
-        G_next[..., K - 1] = (pV * (1 - phi_end_next)).sum(dim=-1)
-        del pV
+    G_next = _slide_G(G, row0_next, logV_next, p_next, phi_end_next, inplace)
+    del row0_next
 
-    S_next = rdm.update_synaptic_term(S.clone(), alpha, I[..., :1], inplace=True) if inplace \
-        else rdm.update_synaptic_term(S, alpha, I[..., :1])
+    S_next = eq.update_synaptic_term(S.clone(), alpha, I[..., :1], inplace=True) if inplace \
+        else eq.update_synaptic_term(S, alpha, I[..., :1])
     I_next = torch.cat([I[..., 1:], I_new.unsqueeze(-1)], dim=-1)   # I_{t+1} .. I_{t+K-1}
-    nxt = EPRState(p_next, S_next, I_next, G_next, logV_next, phi_end_next)
+    nxt = (p_next, S_next, I_next, G_next, logV_next, phi_end_next)
     return nxt, epr[..., 0], epr[..., 1], epr[..., 2]
+
+
+# The joint-distribution reference
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# The EPR read off the explicit (Q, K) joint of forward and reverse age: the definition, at
+# O(Q^2) per step. It is the oracle the sliding observer above is checked against, selected
+# with RDMNetwork.entropy_trajectory(method="joint"). It shares epr_from_parts with the
+# observer, so the two can only disagree through the four marginals they hand it.
+
+def joint_distribution(p: torch.Tensor,        # (Q,)   p_t(n)
+                       buff_S: torch.Tensor,   # (K, Q) buff_S[j, n] = S_{t+j}(n), j=0 is t
+                       R: torch.Tensor,        # (Q,)
+                       beta: float | torch.Tensor,
+                       theta: float | torch.Tensor,
+                       hazard: Hazard,
+                       nu0: float,
+                       dt: float,
+                       inplace: bool = False,
+                       ) -> torch.Tensor:      # (Q, K) p_t(n, n_dagger=k)
+    """ Joint distribution of forward and reverse age, built from hazards.
+
+    The hazard-parametrised port of mean_field.compute_joint_distribution; the structure is
+    unchanged. A cohort's survival prod_{j<k} (1 - Phi_{t+j}(n+j)) is built by multiplying
+    hazards rather than reading density ratios, which is what lets it track a cohort through
+    the lumped final bin and means only the marginal p_t is ever needed. Rows sum to 1 by
+    telescoping, so no normalization.
+
+    inplace folds the chain of (Q, K) temporaries into three live buffers, in the same order so
+    the two branches agree bit for bit; buff_S, R and p are read-only either way, only the
+    intermediates this function allocates itself are reused. It is the expensive flag in the
+    package: this is the one (B, Q, K) object in an EPR trajectory, so each temporary dropped
+    is the whole joint again. """
+    Q, K = buff_S.shape[-1], buff_S.shape[-2]
+    # buff_S carries an extra lag axis that R, beta and theta do not: they are (..., Q) and
+    # (..., 1) as everywhere else in the package, so each is lifted one axis here rather than
+    # making every caller remember a different convention for these two functions. A 0-dim
+    # scalar becomes (1,), which broadcasts just as well.
+    lift = lambda x: x.unsqueeze(-1) if torch.is_tensor(x) else x
+    R, beta, theta = R.unsqueeze(-2), lift(beta), lift(theta)
+    n_idx = torch.arange(Q, device=buff_S.device)
+    j_idx = torch.arange(K, device=buff_S.device)
+    future_age  = torch.clamp(n_idx.unsqueeze(1) + j_idx.unsqueeze(0), max=Q - 1)   # (Q, K)
+    future_time = j_idx.unsqueeze(0)                                                # (1, K)
+
+    phi_all = hazard.phi(hazard_field(buff_S, R, theta, inplace), beta, nu0, dt, inplace=inplace)
+    # the two index tensors consume the last two axes, so the ellipsis carries any batch
+    phi = phi_all[..., future_time, future_age]                     # (..., Q, K)
+    del phi_all             # the gather already copied; holding the source doubles the peak
+
+    if inplace:
+        log_surv = _cumlog1m(phi, True)
+        surv = torch.empty_like(phi)
+        surv[..., 0] = 1.0
+        torch.exp(log_surv[..., :-1], out=surv[..., 1:])
+        del log_surv
+        surv[..., :-1].mul_(phi[..., :-1])   # first passage; last column keeps bare S
+        return surv.mul_(p.unsqueeze(-1))
+
+    log_surv = _cumlog1m(phi, False)
+    surv = torch.ones_like(phi)
+    surv[..., 1:] = torch.exp(log_surv[..., :-1])
+    surv[..., :-1] = surv[..., :-1] * phi[..., :-1]  # first passage; last column keeps bare S
+    return surv * p.unsqueeze(-1)
+
+
+
+def epr_from_joint(p_joint: torch.Tensor,   # (Q, K)
+                   phi_fwd: torch.Tensor,   # (Q,)
+                   phi_rev: torch.Tensor,   # (K,)
+                   ) -> torch.Tensor:       # (3,) [sigma, H_fwd, H_rev]
+    """ The EPR read off the explicit joint: the reference path, and the oracle the sliding
+    recursions are checked against. """
+    return epr_from_parts(p_joint.sum(dim=-1), p_joint.sum(dim=-2),
+                          p_joint[..., :, 0], p_joint[..., 0, :], phi_fwd, phi_rev)
+
+
+
+def synaptic_window(S: torch.Tensor,      # (..., Q) S_t
+                    I: torch.Tensor,      # (..., K-1) inputs I_t .. I_{t+K-2}
+                    alpha: float | torch.Tensor,
+                    ) -> torch.Tensor:    # (..., K, Q) row j = S_{t+j}
+    """ The look-ahead block the joint path reads, replayed from S_t and the input window by
+    eq.update_synaptic_term -- the model's own update on the model's own inputs, so every row
+    is bit for bit the S the model held at that time. O(K*Q): the oracle's cost, not the
+    observer's. """
+    out = S.new_empty(S.shape[:-1] + (I.shape[-1] + 1, S.shape[-1]))
+    out[..., 0, :] = S
+    for j in range(I.shape[-1]):
+        out[..., j + 1, :] = eq.update_synaptic_term(out[..., j, :], alpha, I[..., j:j + 1])
+    return out
+
+
+def epr_step_joint(state: tuple,       # (p, S, I) at the reported t
+                   S_live, I_new, R, alpha, beta, theta, hazard: Hazard, nu0: float,
+                   dt: float, inplace: bool = False):
+    """ The reference path as an observer: same feed and same return as epr_step, but the EPR
+    is read off the explicit (Q, K) joint, rebuilt every step from the lagged S and the input
+    window. O(Q^2) per step; it is the oracle the sliding observer is checked against. Its
+    state is only (p_t, S_t, I_t .. I_{t+K-2}); it replays the window's last row itself, so
+    S_live is taken for the shared interface only. """
+    p, S, I = state
+    I_full = torch.cat([I, I_new.unsqueeze(-1)], dim=-1)                # I_t .. I_{t+K-1}
+    phi = lambda h: hazard.phi(h, beta, nu0, dt, inplace=inplace)
+    J = joint_distribution(p, synaptic_window(S, I, alpha), R, beta, theta,
+                           hazard, nu0, dt, inplace=inplace)
+    phi_f = phi(hazard_field(S, R, theta, inplace))
+    phi_r = phi(hazard_field(anchor_reverse_synaptic_term(I_full, alpha), R, theta, inplace))
+    e = epr_from_joint(J, phi_f, phi_r)
+    nxt = (eq.update_age_distribution(p, phi_f),
+           eq.update_synaptic_term(S, alpha, I[..., :1]),
+           I_full[..., 1:])
+    return nxt, e[..., 0], e[..., 1], e[..., 2]
+
+
+def init_joint_state(p, S, I, R, alpha, beta, theta, hazard: Hazard, nu0: float, dt: float,
+                     inplace: bool = False) -> tuple:
+    """ The joint path's state (p, S, I) at the first reported step: it carries the inputs and
+    rebuilds everything else every step. Same signature as init_epr_state. """
+    return p, S, I

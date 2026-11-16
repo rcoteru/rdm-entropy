@@ -57,10 +57,10 @@ import torch
 import time
 
 import rdme.fixed_points as fpts
-import rdme.kernels as krn
+import rdme.equations as eq
 import rdme.lyapunov as lyap
 import rdme.plots as rp
-from rdme.network import RDMWilsonCowan
+from rdme.mean_field import RDMWilsonCowan
 from rdme.spin_model import SpinWilsonCowan
 
 
@@ -110,8 +110,8 @@ hazard = "poisson_exact"
 # it the exponential kernel is overwhelmed at this coupling and the population runs at >1 kHz.
 T_ABS, M_SUPPRESS = 1.0, 40.0
 
-U_MAX  = 100.0                   # ms; age grid held fixed in TIME, so Qm tracks dt
-Qm     = [math.ceil(U_MAX / dt)] * 2
+U_MAX  = 100.0                   # ms; age grid held fixed in TIME, so Q tracks dt
+Q      = math.ceil(U_MAX / dt)
 
 steps1 = int(3000 / dt)          # equilibration
 steps2 = int(3000 / dt)          # recorded
@@ -128,10 +128,10 @@ steps2 = int(3000 / dt)          # recorded
 #   kernels.refractory_kernel_abs blocked round(t_abs/dt) bins, which is one too many: a
 #   neuron entering bin 0 fires at the NEXT step, so blocking n bins buys a dead time of
 #   (n+1)*dt. The realised dead time here was 1.1 ms, not the 1.0 ms T_ABS asks for, and it
-#   moved with dt. kernels.n_abs_bins now gets this right, so these runs differ from the
+#   moved with dt. equations.n_abs_bins now gets this right, so these runs differ from the
 #   cached ones by that one bin.
 #
-# R_abs is sized by kernels.abs_refractory_floor, which reproduces the hand-rolled
+# R_abs is sized by equations.abs_refractory_floor, which reproduces the hand-rolled
 # `max(inc - theta + M_SUPPRESS/beta, M_SUPPRESS/beta)` this script used, to the last bit.
 
 
@@ -150,9 +150,9 @@ sm = SpinWilsonCowan(N, E_ratio, w_EE, w_EI, w_IE, w_II,
 mf = RDMWilsonCowan(E_ratio, w_EE, w_EI, w_IE, w_II, 
                     E_exc, E_inh, beta_E, beta_I, theta_E, theta_I, 
                     tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I,
-                    dt=dt, nu0=nu0, hazard=hazard, t_abs=T_ABS, Qm=Qm, device=device)
+                    dt=dt, nu0=nu0, hazard=hazard, t_abs=T_ABS, Q=Q, device=device)
 
-print(mf.Qm)
+print(mf.Q)
 
 # mf.P = sm.fdist(Q) # initialize mean-field distribution to match spin model
 
@@ -183,7 +183,7 @@ if True: # visualize final p(n) distribution
     plt.title("Firing age distribution (mean-field vs spin model)")
 
 
-    fdists = sm.fdists(max(mf.Qm)).cpu().numpy()
+    fdists = sm.fdists(mf.Q).cpu().numpy()
     plt.plot(fdists[0], label='Spin Model [E]', linewidth=2)
     plt.plot(fdists[1], label='Spin Model [I]', linewidth=2)
 
@@ -416,7 +416,7 @@ if True: # Lyapunov spectrum of the mean field
     lmf = RDMWilsonCowan(E_ratio, w_EE, w_EI, w_IE, w_II,
                          E_exc, E_inh, beta_E, beta_I, theta_E, theta_I,
                          tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I,
-                         dt=dt, nu0=nu0, hazard=hazard, t_abs=T_ABS, Qm=Qm, device=device)
+                         dt=dt, nu0=nu0, hazard=hazard, t_abs=T_ABS, Q=Q, device=device)
 
     print(f"\nLyapunov: equilibrating {eq_lyap} steps, then {wu_lyap} warmup + {T_lyap} "
           f"accumulation, k={k_lyap} ...")

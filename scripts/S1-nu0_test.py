@@ -29,7 +29,7 @@ moving nu0 alone, which is what stage 2 does.
 E IS NOT THE SAME MOVE, and this script asserted that it was until the control measured it.
 The argument for degeneracy -- E enters only through I = sum w r + E, so raising E by -delta
 should shift h exactly as lowering theta by delta does -- fails on the age resolution of the
-synaptic term: rdm.update_synaptic_term carries S per AGE with S(0) = 0, so a constant E
+synaptic term: equations.update_synaptic_term carries S per AGE with S(0) = 0, so a constant E
 reaches the field as E*(1 - (1-alpha)^n), zero for a neuron that has just fired and E only
 asymptotically, while theta shifts every age by the same amount. The two twins are therefore
 NOT the same system, and the control's E arm measures the difference: ~1% in r, period,
@@ -55,7 +55,7 @@ and never with theta.
                   S1 at the SAME dt, same structure both sides; and the observed orders on
                   every quantity, reported as S1-dt_conv.py reports them.
 
-  stage `cost`    the dt and the memory that buy 1% sigma, through helpers.converged_at, so
+  stage `cost`    the dt and the memory that buy 1% sigma, through convergence.converged_at, so
                   the table reads as S1-dt_cost.py's does, against S1's own column.
 
 E IS TUNED ONCE AT dt = 0.25 AND HELD DOWN THE LADDER (decision carried into this script, not
@@ -76,10 +76,11 @@ import torch
 import rdme.epr as epr
 import rdme.hazards as hzd
 import rdme.helpers as hlp
+import rdme.convergence as cvg
 import rdme.plots as rp
 import rdme.presets as pre
-from rdme.helpers import converged_at, orders, richardson
-from rdme.network import RDMIsingModel
+from rdme.convergence import converged_at, orders, richardson
+from rdme.mean_field import RDMIsingModel
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -217,18 +218,18 @@ def model(P: dict) -> dict:
 
 def build(P: dict, J: float, dt: float, Q: int | None = None) -> RDMIsingModel:
     return RDMIsingModel(J, **model(P), dt=dt, hazard=HAZARD,
-                         Qm=None if Q is None else [Q], device=DEVICE)
+                         Q=Q, device=DEVICE)
 
 
 def age_window(P: dict, J: float, dt: float) -> float:
-    """ U_max = Qm*dt in MILLISECONDS, fitted at `dt` and then held in ms.
+    """ U_max = Q*dt in MILLISECONDS, fitted at `dt` and then held in ms.
 
     A physical length rather than a bin count, so the same window is used on both sides of a
     comparison and at every step: refitting per run lays up to `tol` of grid error on top of
     the difference being measured. """
-    Qm = hlp.fit_age_grid(lambda q: build(P, J, dt, None if q is None else q[0]),
+    Q = cvg.fit_age_grid(lambda q: build(P, J, dt, q),
                           tol=TOL_FIT, equi=hlp.n_steps(T_EQUI + T_MEAS, dt))
-    return Qm[0] * dt
+    return Q * dt
 
 
 def measure(P: dict, J: float, dt: float, Q: int, *, ic_m: float | None = None) -> list[float]:
@@ -252,10 +253,10 @@ def measure(P: dict, J: float, dt: float, Q: int, *, ic_m: float | None = None) 
     # peak HAZARD rate is tracked beside it -- that is what hazards.step_error wants, and it
     # is not the population rate, which the dead time caps at 1/t_abs.
     n_probe = max(1, hlp.n_steps(period, dt) if n_cyc else len(r) // 10)
-    phi_max, lam_max, n_abs = 0.0, 0.0, net.n_abs
+    phi_max, lam_max, n_abs = 0.0, 0.0, net.n_abs.tolist()       # per population
     for _ in range(n_probe):
         phi_max = max(phi_max, net.max_step_prob())
-        lam_max = max(lam_max, max(float(l[n_abs:].max()) for l in net.hazard_rate()))
+        lam_max = max(lam_max, max(float(l[n:].max()) for l, n in zip(net.hazard_rate(), n_abs)))
         net.update()
 
     x = r[a:z] - r[a:z].mean()
@@ -573,10 +574,10 @@ def measure_full(P: dict, J: float, dt: float, Q: int) -> list[float]:
     href = epr.poisson_reference_entropy(traj["m_tot"][a:z], P["nu0"], dt)
 
     n_probe = max(1, hlp.n_steps(period, dt) if n_cyc else len(r) // 10)
-    phi_max, lam_max, n_abs = 0.0, 0.0, net.n_abs
+    phi_max, lam_max, n_abs = 0.0, 0.0, net.n_abs.tolist()       # per population
     for _ in range(n_probe):
         phi_max = max(phi_max, net.max_step_prob())
-        lam_max = max(lam_max, max(float(l[n_abs:].max()) for l in net.hazard_rate()))
+        lam_max = max(lam_max, max(float(l[n:].max()) for l, n in zip(net.hazard_rate(), n_abs)))
         net.update()
 
     x = r[a:z] - r[a:z].mean()
@@ -639,7 +640,7 @@ if run_ladder and (overwrite or not CACHE_LADDER.exists()):
 
 # ── 5. The cost: the dt and the memory that buy 1% sigma ──────────────────────
 #
-# Derived from the ladder, through the same helpers.converged_at machinery S1-dt_cost.py uses
+# Derived from the ladder, through the same convergence.converged_at machinery S1-dt_cost.py uses
 # so the two tables read the same way: the COARSEST dt whose relative error against the
 # Richardson limit stays inside the tolerance ALL THE WAY DOWN. Where the ladder does not
 # reach the tolerance, the step is EXTRAPOLATED by a log-log fit of the relative error against
@@ -1004,7 +1005,7 @@ if run_report:
 
     # 8. the orders on ptp -- the question of item 3
     print(f"\n[8] DOES THE AMPLITUDE ACQUIRE A dt -> 0 LIMIT? Observed orders on each")
-    print(f"    quantity (helpers.orders) and whether helpers.richardson accepts the")
+    print(f"    quantity (convergence.orders) and whether convergence.richardson accepts the")
     print(f"    sequence. ptp is the one the brief asks about; `REFUSED` is a legitimate")
     print(f"    answer and is not worked around.")
     for name in REGIMES:
@@ -1057,7 +1058,7 @@ if run_report:
     # 10. the cost comparison -- the brief's deliverable
     print(f"\n[10] THE COST. Read exactly as S1-dt_cost.py's table: for each quantity and")
     print(f"     tolerance, the COARSEST dt whose relative error against the Richardson limit")
-    print(f"     stays inside the tolerance all the way down (helpers.converged_at).")
+    print(f"     stays inside the tolerance all the way down (convergence.converged_at).")
     for name in REGIMES:
         for side in SIDES:
             print(f"\n     [{name}, {side}]  U_max = {L['u_max'][(side, name)]:.1f} ms")
@@ -1114,7 +1115,7 @@ if run_report:
 # ── Plots ─────────────────────────────────────────────────────────────────────
 
 if run_report:
-    hlp.pub_style()
+    rp.pub_style()
     banner = pre.banner(PRESET, dict(PARAMS_NU0, dt=DT_REF))
 
     fig, (ax_b, ax_r) = plt.subplots(1, 2, figsize=(11, 4.6))

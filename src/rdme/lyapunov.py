@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Callable, NamedTuple
+from collections.abc import Callable
+from typing import NamedTuple
 
 import torch
 
@@ -12,10 +13,10 @@ headers: the tangent map below evaluates a hazard, while the driver above it kno
 about populations or age distributions -- it takes an `advance` callable that steps a state
 together with a basis, and is tested against maps whose spectra are known in closed form.
 
-Basis convention: a list of blocks, each (B, k, Q_b). B indexes independent systems, k indexes
-tangent directions, Q_b is the b-th block of a ragged state vector. Inner products reduce over
-the block axis and the last axis, so a state split across several differently-sized blocks
-never has to be concatenated into one contiguous vector.
+Basis convention: one tensor (..., k, D). The leading axes index independent systems, k indexes
+tangent directions, D is the flat state vector. For the RDM, D = M*2*Q laid out as
+RDMNetwork.flatten_state lays out the state, [dp_0, dS_0, dp_1, dS_1, ...], so a view
+(..., k, M, 2, Q) splits it back into populations at no cost.
 
 Whether this is a map or a flow is the caller's to say, and it changes the CLASSIFICATION but
 not the measurement. The Benettin driver is agnostic: QR on a time-dt sampling of a flow returns
@@ -42,14 +43,14 @@ the legacy discrete one ("bernoulli" at nu0*dt = 1). """
 #
 # The model-specific half: the derivative of one step of the dynamics, and the basis it acts on.
 
-def update_tangent(blocks: list[torch.Tensor],   # 2M blocks [dp_0, dS_0, ...], each (k, Q_i)
-                   p: list[torch.Tensor],        # M age masses, each (Q_i,)
-                   fprobs: list[torch.Tensor],   # M hazards at the CURRENT state
-                   dphi: list[torch.Tensor],     # M hazard DERIVATIVES dPhi/dh, same shapes
-                   w: torch.Tensor,              # (M, M), unscaled
-                   alpha: list[torch.Tensor],
+def update_tangent(V: torch.Tensor,        # (..., k, M, 2, Q) [dp, dS] per population
+                   p: torch.Tensor,        # (..., M, Q) age masses
+                   fprobs: torch.Tensor,   # (..., M, Q) hazards at the CURRENT state
+                   dphi: torch.Tensor,     # (..., M, Q) hazard DERIVATIVES dPhi/dh
+                   w: torch.Tensor,        # (..., M, M), unscaled
+                   alpha: torch.Tensor,    # (..., M)
                    dt: float,
-                   ) -> list[torch.Tensor]:
+                   ) -> torch.Tensor:      # (..., k, M, 2, Q)
     """ One step of the linearized dynamics.
 
     Same algebra as mean_field.update_tangent with two changes. The hazard derivative is passed
@@ -60,62 +61,66 @@ def update_tangent(blocks: list[torch.Tensor],   # 2M blocks [dp_0, dS_0, ...], 
     Kept separate from mean_field's rather than generalising that one, so the reference
     implementation stays untouched. Its correctness is checked against
     jacfwd(RDMNetwork.state_map) in the tests, independently of mean_field. """
-    M = len(p)
-    dm = torch.stack([blocks[2 * i][..., 0] for i in range(M)], dim=-1)   # (k, M)
-    dI = (w.unsqueeze(-3) @ (dm / dt).unsqueeze(-1)).squeeze(-1)          # (k, M)
+    dp, dS = V[..., 0, :], V[..., 1, :]                                    # (..., k, M, Q)
+    p, fp = p.unsqueeze(-3), fprobs.unsqueeze(-3)                          # broadcast over k
+    dI = (w.unsqueeze(-3) @ (dp[..., 0] / dt).unsqueeze(-1)).squeeze(-1)   # (..., k, M)
+    dfp = dphi.unsqueeze(-3) * dS
 
-    out: list[torch.Tensor] = []
-    for i in range(M):
-        p_i, fp_i = p[i].unsqueeze(-2), fprobs[i].unsqueeze(-2)   # (1, Q), broadcast over k
-        dp, dS = blocks[2 * i], blocks[2 * i + 1]
-        dfp = dphi[i].unsqueeze(-2) * dS
+    out = torch.zeros_like(V)
+    dp_new, dS_new = out[..., 0, :], out[..., 1, :]
+    dp_new[..., 0]    = (dp * fp + p * dfp).sum(dim=-1)
+    dp_new[..., 1:-1] = dp[..., :-2] * (1 - fp[..., :-2]) - p[..., :-2] * dfp[..., :-2]
+    dp_new[..., -1]   = -dp_new[..., :-1].sum(dim=-1)
 
-        dp_new = torch.zeros_like(dp)
-        dp_new[..., 0]    = (dp * fp_i + p_i * dfp).sum(dim=-1)
-        dp_new[..., 1:-1] = dp[..., :-2] * (1 - fp_i[..., :-2]) - p_i[..., :-2] * dfp[..., :-2]
-        dp_new[..., -1]   = -dp_new[..., :-1].sum(dim=-1)
-
-        dS_new = torch.zeros_like(dS)
-        dS_new[..., 1:] = alpha[i] * dI[..., i].unsqueeze(-1) + (1 - alpha[i]) * dS[..., :-1]
-
-        out.append(dp_new)
-        out.append(dS_new)
+    a = alpha.unsqueeze(-2).unsqueeze(-1)                                  # (..., 1, M, 1)
+    dS_new[..., 1:] = a * dI.unsqueeze(-1) + (1 - a) * dS[..., :-1]
     return out
 
 
-def init_tangent_blocks(Qm: list[int],
-                        k: int,
-                        prefix: tuple[int, ...] = (),   # leading axes, e.g. (B,) for a batch
-                        device: str | torch.device = 'cpu',
-                        generator: torch.Generator | None = None,
-                        ) -> list[torch.Tensor]:        # 2M blocks, each (*prefix, k, Q_i)
-    """ A random orthonormal tangent basis, laid out as the state is: per population a block
-    for delta-p and one for delta-S, interleaved [dp_0, dS_0, dp_1, dS_1, ...] to match
-    RDMNetwork.flatten_state.
+def tangent_step(V: torch.Tensor, p: torch.Tensor, fprobs: torch.Tensor, dphi: torch.Tensor,
+                 w: torch.Tensor, alpha: torch.Tensor, dt: float) -> torch.Tensor:
+    """ The linearized step on a flat tangent basis (..., k, M*2*Q), about the state whose
+    hazards are fprobs/dphi; update_tangent on its (..., k, M, 2, Q) view. """
+    M, Q = p.shape[-2:]
+    return update_tangent(V.unflatten(-1, (M, 2, Q)), p, fprobs, dphi, w, alpha,
+                          dt).flatten(-3)
 
-    The dp blocks are centred so sum(dp_i) = 0. Perturbations that change an age distribution's
+
+def init_tangent(M: int,
+                 Q: int,
+                 k: int,
+                 prefix: tuple[int, ...] = (),   # leading axes, e.g. (B,) for a batch
+                 device: str | torch.device = 'cpu',
+                 generator: torch.Generator | None = None,
+                 ) -> torch.Tensor:              # (*prefix, k, M*2*Q)
+    """ A random orthonormal tangent basis, laid out as the state is: per population a delta-p
+    and a delta-S, [dp_0, dS_0, dp_1, dS_1, ...] to match RDMNetwork.flatten_state.
+
+    The dp parts are centred so sum(dp_i) = 0. Perturbations that change an age distribution's
     total mass leave the physical manifold; update_tangent annihilates them in one step whatever
     comes in, but starting inside the subspace means the first accumulation block does not log
-    that annihilation as if it were contraction. """
+    that annihilation as if it were contraction.
+
+    Drawn one (k, Q) piece at a time in layout order, so a seeded generator gives the same
+    basis the former per-population block list did. """
     if k < 1:
         raise ValueError(f"k must be at least 1, got {k}")
     dtype = torch.get_default_dtype()
-    blocks = []
-    for Q in Qm:
-        dp = torch.randn(*prefix, k, Q, device=device, dtype=dtype, generator=generator)
-        blocks.append(dp - dp.mean(dim=-1, keepdim=True))            # onto sum(dp) = 0
-        blocks.append(torch.randn(*prefix, k, Q, device=device, dtype=dtype, generator=generator))
-    orthonormalize(blocks)
-    return blocks
+    draw = lambda: torch.randn(*prefix, k, Q, device=device, dtype=dtype, generator=generator)
+    V = torch.stack([torch.stack([draw(), draw()], dim=-2) for _ in range(M)], dim=-3)
+    V[..., 0, :] -= V[..., 0, :].mean(dim=-1, keepdim=True)          # onto sum(dp) = 0
+    V = V.flatten(-3)
+    orthonormalize(V)
+    return V
 
 
 # Orthonormalization
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-def orthonormalize(blocks: list[torch.Tensor],   # each (..., k, Q_b), modified IN PLACE
+def orthonormalize(V: torch.Tensor,     # (..., k, D), modified IN PLACE
                    eps: float = 1e-300,
-                   ) -> torch.Tensor:            # (..., k) log of each column's norm
-    """ Modified Gram-Schmidt over a ragged block list, in place, returning log|R_ii|.
+                   ) -> torch.Tensor:  # (..., k) log of each column's norm
+    """ Modified Gram-Schmidt over the k directions, in place, returning log|R_ii|.
 
     Modified rather than classical: classical GS loses orthogonality catastrophically once the
     columns have been squeezed toward the dominant direction between renormalizations, which is
@@ -123,28 +128,24 @@ def orthonormalize(blocks: list[torch.Tensor],   # each (..., k, Q_b), modified 
     so later columns are orthogonalized against the already-corrected earlier ones.
 
     Hand-written rather than torch.linalg.qr or a Cholesky-QR on the Gram matrix, which is the
-    obvious review comment and is slower here for two reasons. Both alternatives want one
-    contiguous (B, k, sum(Q_b)) matrix, so every call pays a cat of the blocks; and both are
-    matmul-bound, while consumer Ada runs float64 matmul at about 1/64 of its float32 rate.
-    Measured at B=2197, k=6, sum(Q_b)=2306: MGS 12.0 ms, Cholesky-QR 31.1 ms. MGS also gives
-    log|R_ii| for free as the normalization it performs anyway.
+    obvious review comment: both are matmul-bound, while consumer Ada runs float64 matmul at
+    about 1/64 of its float32 rate. Measured at B=2197, k=6, D=2306 (with the basis then still
+    a ragged block list, which also charged the alternatives a cat): MGS 12.0 ms, Cholesky-QR
+    31.1 ms. MGS also gives log|R_ii| for free as the normalization it performs anyway.
 
     Returns the logs rather than the norms because that is what the accumulator needs and
     because the product over many intervals would otherwise underflow. """
-    lead, k = blocks[0].shape[:-2], blocks[0].shape[-2]
-    logs = torch.empty(*lead, k, device=blocks[0].device, dtype=blocks[0].dtype)
+    lead, k = V.shape[:-2], V.shape[-2]
+    logs = torch.empty(*lead, k, device=V.device, dtype=V.dtype)
 
     for j in range(k):
+        v = V[..., j, :]
         for i in range(j):                    # subtract projections onto the corrected columns < j
-            # <v_j, v_i> reduced over every block and its age axis -> (..., 1)
-            dot = sum((b[..., j, :] * b[..., i, :]).sum(dim=-1) for b in blocks).unsqueeze(-1)
-            for b in blocks:
-                b[..., j, :] -= dot * b[..., i, :]
-        nrm = torch.sqrt(sum((b[..., j, :] ** 2).sum(dim=-1) for b in blocks))      # (...,)
+            u = V[..., i, :]
+            v -= (v * u).sum(dim=-1, keepdim=True) * u
+        nrm = torch.sqrt((v ** 2).sum(dim=-1))                                      # (...,)
         logs[..., j] = torch.log(nrm.clamp_min(eps))
-        inv = 1.0 / nrm.clamp_min(eps)
-        for b in blocks:
-            b[..., j, :] *= inv.unsqueeze(-1)
+        v *= (1.0 / nrm.clamp_min(eps)).unsqueeze(-1)
 
     return logs
 
@@ -178,8 +179,8 @@ class Spectrum(NamedTuple):
     # only by halving dt and re-measuring.
 
 
-def benettin(advance: Callable[[list[torch.Tensor]], None],
-             blocks: list[torch.Tensor],   # (..., k, Q_b) orthonormal basis, modified IN PLACE
+def benettin(advance: Callable[[torch.Tensor], None],
+             basis: torch.Tensor,          # (..., k, D) orthonormal basis, modified IN PLACE
              n_steps: int,
              dt: float = 1.0,
              cadence: int = 100,
@@ -189,7 +190,7 @@ def benettin(advance: Callable[[list[torch.Tensor]], None],
              ) -> Spectrum:
     """ Benettin/QR Lyapunov spectrum of a map, for a whole batch at once.
 
-    `advance(blocks)` steps the state and the tangent basis together by one step, in place. It
+    `advance(basis)` steps the state and the tangent basis together by one step, in place. It
     is one callable rather than a (step, tangent_step) pair on purpose: the tangent is the
     linearization *at the current state*, so the two must share one evaluation of the model's
     nonlinearity. Two separate callables would let them desync, and the resulting exponents
@@ -224,8 +225,8 @@ def benettin(advance: Callable[[list[torch.Tensor]], None],
     if cadence < 1:
         raise ValueError(f"cadence must be >= 1, got {cadence}")
 
-    lead, k = blocks[0].shape[:-2], blocks[0].shape[-2]
-    dev, dtype = blocks[0].device, blocks[0].dtype
+    lead, k = basis.shape[:-2], basis.shape[-2]
+    dev, dtype = basis.device, basis.dtype
     per_block = torch.zeros(n_blocks, *lead, k, device=dev, dtype=dtype)
     counts    = torch.zeros(n_blocks, device=dev, dtype=dtype)
 
@@ -235,23 +236,23 @@ def benettin(advance: Callable[[list[torch.Tensor]], None],
 
     since = 0
     for t in range(warmup):
-        advance(blocks)
+        advance(basis)
         since += 1
         if since == cadence:
-            orthonormalize(blocks)          # discarded: this is the alignment transient
+            orthonormalize(basis)           # discarded: this is the alignment transient
             since = 0
     if warmup:
-        orthonormalize(blocks)              # start the first block from an orthonormal basis
+        orthonormalize(basis)               # start the first block from an orthonormal basis
 
     acc = torch.zeros(*lead, k, device=dev, dtype=dtype)
     since, blk = 0, 0
     for t in range(n_steps):
-        advance(blocks)
+        advance(basis)
         since += 1
         # Renormalize on cadence, and always at a block edge: a block's logs must cover exactly
         # the steps attributed to it, so an interval may not straddle the boundary.
         if since == cadence or t + 1 == edges[blk + 1]:
-            acc += orthonormalize(blocks)
+            acc += orthonormalize(basis)
             since = 0
         if t + 1 == edges[blk + 1]:
             per_block[blk] = acc

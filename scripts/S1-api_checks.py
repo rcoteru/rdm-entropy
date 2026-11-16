@@ -42,7 +42,7 @@ first. Nothing here is a claim about the paper's results.
   4. DO poisson AND poisson_exact AGREE IN THE dt -> 0 LIMIT? They share a rate function as
      the same object, so they are one continuous-time model under two discretization maps and
      their limits are REQUIRED to coincide. tests/test_hazards.py asserts that pointwise on
-     Phi -- the per-bin gap halves when dt halves -- but nothing asserted it on a SOLVED
+     Phi -- each Phi/dt reaches the shared rate at first order -- but nothing asserted it on a SOLVED
      observable until this check. The stripped neuron is the right place for it: its
      stationary rate has the closed form r = lam/(1 + lam t_abs) with the lam BOTH kernels
      share, so the two limits can be compared against a third thing rather than only against
@@ -63,8 +63,8 @@ import torch
 
 import rdme.helpers as hlp
 import rdme.presets as pre
-from rdme.helpers import orders, richardson
-from rdme.network import RDMIsingModel
+from rdme.convergence import orders, richardson
+from rdme.mean_field import RDMIsingModel
 
 
 PRESET = "S1"
@@ -103,10 +103,10 @@ def stripped(E: float, hazard: str, *, t_abs: float, dt: float = DT, nu0: float 
     tau_int is set so that alpha = 1 - exp(-dt/tau_int) is 1 to machine precision, which is the
     "tau_int -> 0" the checks ask for: the synaptic term then tracks the input with no lag and
     the field is exactly E - theta. Passed as an explicit tiny number rather than 0, which
-    would divide by zero in kernels.tau2alpha. """
+    would divide by zero in equations.tau2alpha. """
     return RDMIsingModel(0.0, E=E, beta=BETA, theta=THETA, tau_int=dt / 64, tau_ref=1.0,
                          K_ref=0.0, dt=dt, hazard=hazard, nu0=nu0, t_abs=t_abs,
-                         Qm=[max(1, round(U_MAX / dt))], device=DEVICE)
+                         Q=max(1, round(U_MAX / dt)), device=DEVICE)
 
 
 def rate_limit(E: float, hazard: str, *, t_abs: float, nu0: float = NU0) -> tuple:
@@ -244,7 +244,7 @@ for name, J in POINTS.items():
     for t_abs in (0.0, T_ABS):
         t0 = time.time()
         net = RDMIsingModel(J, **MODEL, dt=DT, hazard=HAZARD, t_abs=t_abs,
-                            Qm=[max(1, round(U_MAX / DT))], device=DEVICE)
+                            Q=max(1, round(U_MAX / DT)), device=DEVICE)
         net.forward(hlp.n_steps(T_EQUI, DT))
         traj = net.entropy_trajectory(hlp.n_steps(T_MEAS, DT), pb=False)
         r = traj["r_tot"]

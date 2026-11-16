@@ -63,7 +63,7 @@ groups carry over exactly, one does not, and one has no counterpart at all:
   effect is not subtle -- at the nominal translation, U_max = 12 ms (the kernel rule at
   eps = 0.01) gives a FIXED POINT at r = 1.8e-2/ms, and U_max = 24 ms gives a limit cycle at
   r = 6.1e-2/ms with CV 1.65, converged to five digits against 48, 96 and 192 ms. So U_max is
-  sized per cell by kernels.q_from_tau_and_rate, from a rate measured in a short pilot pass.
+  sized per cell by equations.q_from_tau_and_rate, from a rate measured in a short pilot pass.
   Validated against a flat grid on the whole dt = 0.5 sweep: 99.4% of cells get the same label
   and the median rate agrees to 1e-5, on a mean Qm of 92 bins against 200, i.e. less than half
   the age grid. The disagreements are almost entirely in the step-artifact class, where the
@@ -187,10 +187,10 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 import torch
 import tqdm
 
-import rdme.kernels as krn
+import rdme.equations as eq
 import rdme.lyapunov as lyap
 import rdme.plots as rp
-from rdme.network import RDMWilsonCowanPoints, flatten_param_grid
+from rdme.mean_field import RDMWilsonCowanPoints, flatten_param_grid
 
 
 # ── Cache paths ───────────────────────────────────────────────────────────────
@@ -294,7 +294,7 @@ def translate_columns(kappa: torch.Tensor, K_ref: torch.Tensor,
 #   The spin model has no R(u) to patch, so it had to be done a second way there, and its EPR
 #   rebuilds the field without going through field(). One parameter, one implementation.
 #
-# R_abs is sized per element by kernels.abs_refractory_floor, which is the same bound the
+# R_abs is sized per element by equations.abs_refractory_floor, which is the same bound the
 # `abs_floor` helper here computed: with the window in place no population exceeds r = 1/T_ABS,
 # so the drive is bounded by (incoming weights)/T_ABS + |Q| and the floor clears it by
 # M_SUPPRESS/beta.
@@ -324,7 +324,7 @@ TAU_INT = 1.0
 K_REF_I_ON = True   # both populations refractory; theirs are, and the asymmetry is in tau
 
 # Absolute refractory period, in ms, imposed as a hard floor on the first round(T_ABS/dt) age
-# bins via the t_abs argument of kernels.refractory_kernel. Set to 0 to recover the plain
+# bins via the t_abs argument of equations.refractory_kernel. Set to 0 to recover the plain
 # exponential kernel.
 #
 # Without it the exponential kernel is a purely RELATIVE mechanism and a strong enough drive
@@ -340,14 +340,14 @@ K_REF_I_ON = True   # both populations refractory; theirs are, and the asymmetry
 T_ABS = 1.0
 # How far below threshold the field is held inside the window, in units of 1/beta. 40 puts the
 # hazard at sigma(-40) ~ 4e-18, i.e. zero for every purpose here and still finite -- see
-# kernels.abs_refractory_floor on why -inf is not an option.
+# equations.abs_refractory_floor on why -inf is not an option.
 M_SUPPRESS = 40.0
 
 CACHE_STAT_FILE = CACHE_DIR / f"{_tag()}_stats.pt"
 CACHE_LYAP_FILE = CACHE_DIR / f"{_tag()}_lyap.pt"
 
 # Age grid. The kernel rule q_from_tau is the wrong rule here -- see the module docstring --
-# so the grid is sized per cell from the MEASURED firing rate, via kernels.q_from_tau_and_rate.
+# so the grid is sized per cell from the MEASURED firing rate, via equations.q_from_tau_and_rate.
 # That needs a rate, which is an output, so a short pilot pass supplies one.
 EPS_Q       = 1e-4     # tolerance on (mass beyond U_max) x (field error there)
 U_MAX_PILOT = 100.0    # ms; the pilot's own grid, generous because its only job is a rate
@@ -358,7 +358,7 @@ PILOT_WIN   = 1000.0   # averaging window for it
 # boundary, so the absorbing bin resums its tail exactly and the lumping commits no error.
 U_MAX_CAP   = 200.0
 # Peak device memory the production chunks may use for (p, S), in bytes. The chunk size is set
-# from this and the chunk's own Qm rather than being a constant, since Qm now varies by an
+# from this and the chunk's own Q rather than being a constant, since Q now varies by an
 # order of magnitude across the grid and a fixed cell count would OOM on the slow cells and
 # waste the device on the fast ones.
 STATE_BUDGET = 2 * 2**30
@@ -518,7 +518,7 @@ def streaming_peaks(mf, steps: int, thr: torch.Tensor) -> dict[str, torch.Tensor
 # ── Stage 0: the translated populations on their own ──────────────────────────
 
 if run_probe:
-    from rdme.network import RDMNetwork
+    from rdme.mean_field import RDMNetwork
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print("── Stage 0: each translated population alone ──────────────────────────")
@@ -552,14 +552,14 @@ if run_probe:
         tr = td / torch.log(KK * bg)
         # stage 0 keeps a fixed generous grid: it is 63 cells, the saving is not worth the
         # pilot, and U_MAX_PILOT is already past where these cells converge
-        Qm = [max(krn.q_from_tau(max(tr.max().item(), TAU_INT), dt, 0.01),
-                  math.ceil(U_MAX_PILOT / dt))]
+        Q = max(eq.q_from_tau(max(tr.max().item(), TAU_INT), dt, 0.01),
+                math.ceil(U_MAX_PILOT / dt))
         col = lambda t: torch.as_tensor(t).reshape(-1, 1).expand(kk.numel(), 1).clone()
         mf = RDMNetwork(
             M=1, w=(kk * w0).reshape(-1, 1, 1), N=[1000], E=col(0.0), beta=col(bg),
             theta=col(th), tau_int=col(TAU_INT), tau_ref=tr.reshape(-1, 1),
             K_ref=KK.reshape(-1, 1), dt=dt, nu0=NU0, hazard=HAZARD, t_abs=T_ABS,
-            Qm=Qm, device=device)
+            Q=Q, device=device)
         mf.forward(int(4000 / dt), pb=False)
         st = streaming_stats(mf, int(1500 / dt))
         st = {k: v.cpu() for k, v in st.items()}
@@ -567,7 +567,7 @@ if run_probe:
         art = ((st["acf1"] < ALT_TOL) | (st["hi"] / dt > SAT_FRAC * LAM0)).reshape(nk, nK)
         live = (cv > CV_TOL) & ~art
         print(f"\n  population {j+1}: w_self(kappa=1) = {w0:.2f}, dead time {td:.2f} ms, "
-              f"Qm = {Qm[0]}")
+              f"Q = {Q}")
         print("    CV of r_1, '*' = step artifact;  rows kappa, cols K_ref")
         print("            " + " ".join(f"{k:7.1f}" for k in Kr))
         for i in range(nk):
@@ -612,7 +612,7 @@ if run_sim:
         Kr, bgain = flat["K_ref"], [1.0 / s for s in P_S]
         T_u = P_ALPHA[0] * DT0_ANCHOR
 
-        def build(idx, Qm):
+        def build(idx, Q):
             """ The batch for an arbitrary set of flat indices, on the given age grid.
 
             Indices rather than a slice: the production pass reorders the grid by how much age
@@ -623,7 +623,7 @@ if run_sim:
                 P_Q[0], P_Q[1], bgain[0], bgain[1], P_THETA[0], P_THETA[1],
                 TAU_INT, TAU_INT, g("tau_ref_E"), g("tau_ref_I"),
                 Kr[idx], Kr[idx] if K_REF_I_ON else 0.0 * Kr[idx],
-                dt=dt, nu0=NU0, hazard=HAZARD, t_abs=T_ABS, Qm=Qm, device=device)
+                dt=dt, nu0=NU0, hazard=HAZARD, t_abs=T_ABS, Q=Q, device=device)
             return mf
 
         # ── Pass 0: pilot rates ───────────────────────────────────────────────
@@ -636,11 +636,11 @@ if run_sim:
         Qp = math.ceil(U_MAX_PILOT / dt)
         pilot_chunk = max(1, min(n ** 3, int(STATE_BUDGET / (8 * 4 * Qp))))
         rates = torch.empty(B, 2)
-        print(f"Pilot: {B} cells at Qm = {Qp} (U_max = {U_MAX_PILOT:g} ms), "
+        print(f"Pilot: {B} cells at Q = {Qp} (U_max = {U_MAX_PILOT:g} ms), "
               f"{PILOT_MS:g} + {PILOT_WIN:g} ms each.")
         for lo in tqdm.tqdm(range(0, B, pilot_chunk), desc="pilot"):
             idx = torch.arange(lo, min(lo + pilot_chunk, B))
-            mf = build(idx, [Qp, Qp])
+            mf = build(idx, Qp)
             mf.forward(int(PILOT_MS / dt), pb=False)
             acc, T = torch.zeros(len(idx), 2, device=device), int(PILOT_WIN / dt)
             for _ in range(T):
@@ -664,21 +664,21 @@ if run_sim:
             for i in range(B):
                 r = max(rates[i, j].item(), 0.0)
                 q = max(
-                    krn.q_from_tau_and_rate(taur[j][i].item(), r, dt, eps=EPS_Q,
+                    eq.q_from_tau_and_rate(taur[j][i].item(), r, dt, eps=EPS_Q,
                                             gain=bgain[j], amplitude=max(Kr[i].item(), 1e-12)),
-                    krn.q_from_tau_and_rate(TAU_INT, r, dt, eps=EPS_Q, gain=bgain[j],
+                    eq.q_from_tau_and_rate(TAU_INT, r, dt, eps=EPS_Q, gain=bgain[j],
                                             amplitude=max(inp[j][i].item(), 1e-12)))
                 Qreq[i] = max(int(Qreq[i]), q)
         n_capped = int((Qreq > Qcap).sum())
         Qreq.clamp_(max=Qcap)
 
         # ── Production, in grid-homogeneous chunks ────────────────────────────
-        # Sorted by requirement, because Qm is shared across a batch: left in grid order, one
+        # Sorted by requirement, because Q is shared across a batch: left in grid order, one
         # slow cell would drag its whole chunk up to the cap, which is the "a batch is only as
         # cheap as its slowest member" caveat in RDMNetwork. Sorting makes each chunk
         # nearly uniform, so the cheap cells actually get the small grid they asked for.
         order = torch.argsort(Qreq)
-        print(f"Age grid from the measured rate (eps = {EPS_Q:g}): Qm per cell "
+        print(f"Age grid from the measured rate (eps = {EPS_Q:g}): Q per cell "
               f"min {int(Qreq.min())}, median {int(Qreq.median())}, max {int(Qreq.max())} "
               f"(U_max {Qreq.min()*dt:g}-{Qreq.max()*dt:g} ms); {n_capped} capped at {Qcap}. "
               f"A flat grid at the cap costs {Qcap * B / Qreq.sum().item():.1f}x more age grid.")
@@ -690,7 +690,7 @@ if run_sim:
         out = {}
         pos, pbar = 0, tqdm.tqdm(total=B, desc="cells")
         while pos < B:
-            # grow the chunk while the budget allows, charging every cell the Qm of the
+            # grow the chunk while the budget allows, charging every cell the Q of the
             # largest in it -- which, sorted, is the last one taken
             lo, hi = pos, pos
             while hi < B and hi - lo < n ** 3:
@@ -700,7 +700,7 @@ if run_sim:
             idx = order[lo:hi]
             Q = int(Qreq[idx].max())
 
-            mf = build(idx, [Q, Q])
+            mf = build(idx, Q)
             mf.forward(equi, pb=False)
             st = streaming_stats(mf, steps)
             # Pass 2 continues from where pass 1 stopped rather than re-equilibrating: the state
@@ -830,7 +830,7 @@ if run_lyap:
             cols = translate_columns(cand["kappa"], cand["K_ref"],
                                      cand["tau_scale"], cand["cross"])
             # U_max held fixed in MILLISECONDS, so the age grid is refined with dt rather than
-            # being silently shortened by it -- refining dt at fixed Qm changes the truncation
+            # being silently shortened by it -- refining dt at fixed Q changes the truncation
             # age, which is a different model, not a finer solution of this one.
             Q = math.ceil(U_MAX_PILOT / dt_r)
             mf = RDMWilsonCowanPoints(
@@ -838,7 +838,7 @@ if run_lyap:
                 P_Q[0], P_Q[1], 1/P_S[0], 1/P_S[1], P_THETA[0], P_THETA[1],
                 TAU_INT, TAU_INT, cols["tau_ref_E"], cols["tau_ref_I"],
                 cand["K_ref"], cand["K_ref"] if K_REF_I_ON else 0.0 * cand["K_ref"],
-                dt=dt_r, nu0=NU0, hazard=HAZARD, t_abs=T_ABS, Qm=[Q, Q], device=device)
+                dt=dt_r, nu0=NU0, hazard=HAZARD, t_abs=T_ABS, Q=Q, device=device)
 
             mf.forward(int(EQUI_MS / dt_r), pb=False)  # state only; tangents here are waste
             gen = torch.Generator(device=device).manual_seed(0)
@@ -852,7 +852,7 @@ if run_lyap:
             del mf, blocks
             if device == 'cuda': torch.cuda.empty_cache()
 
-            print(f"\n  dt = {dt_r} (lam0*dt = {dt_r/DT0_ANCHOR:.3g}), Qm = {Q}")
+            print(f"\n  dt = {dt_r} (lam0*dt = {dt_r/DT0_ANCHOR:.3g}), Q = {Q}")
             for j in range(len(sel)):
                 l1, l2 = res[dt_r]["lam"][j, 0].item(), res[dt_r]["lam"][j, 1].item()
                 e1 = res[dt_r]["se"][j, 0].item()

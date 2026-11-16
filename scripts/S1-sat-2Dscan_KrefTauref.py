@@ -6,9 +6,10 @@ import matplotlib.pyplot as plt
 import torch
 
 import rdme.helpers as hlp
+import rdme.convergence as cvg
 import rdme.plots as rp
 import rdme.presets as pre
-from rdme.network import RDMIsingModelBatch
+from rdme.mean_field import RDMIsingModelBatch
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -80,7 +81,7 @@ STEPS = hlp.n_steps(T_MEAS, PARAMS["dt"], name="T_MEAS")
 # practical time even running alone on an otherwise idle GPU. 1e-1 is a further exploration-
 # grade trade, in the same spirit as S1-2Dscan_betaJ.py's 5e-2, needed because this plane's
 # worst corner (K_ref=50 at S1's weaker drive) is a more extreme case than that one's.
-TOL = 1e-1   # age-grid accuracy; Qm is fitted to it per tile, never set by hand
+TOL = 1e-1   # age-grid accuracy; Q is fitted to it per tile, never set by hand
 
 KEYS = ("m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot")
 
@@ -95,16 +96,6 @@ run_sim   = True
 run_plot  = True
 overwrite = False  # the hash covers every parameter, so this is only for a change to the CODE
 torch.set_default_dtype(torch.float64)
-
-
-def checkpoint(parts: list[dict]) -> None:
-    """ Save the tau_ref tiles measured so far, atomically. This script never calls
-    fp_eigenvalues (only `forward` and `entropy_trajectory`), so the MKL DGEBAL segfault
-    landmine does not apply to it -- but an ordinary crash mid-grid still should not cost a
-    multi-tile run that tiles unevenly in both count and per-tile cost. """
-    tmp = PARTIAL.with_suffix(".tmp")
-    torch.save({"parts": parts}, tmp)
-    tmp.replace(PARTIAL)
 
 
 def acf1_of(traj: torch.Tensor) -> torch.Tensor:
@@ -134,9 +125,9 @@ if run_sim and (overwrite or not CACHE.exists()):
         tau_ref in [2, 60] would pay the tau_ref = 60 grid for every cell in it. """
         tr = PARAMS["tau_ref"][PARAMS["tau_ref"] <= tr_max]
         print(f"  fitting age grid for tau_ref <= {tr_max:g} ({len(tr)} values) ...", flush=True)
-        return hlp.fit_age_grid(
-            lambda qm: RDMIsingModelBatch(**dict(PARAMS, tau_ref=tr), Qm=qm, device=device),
-            tol=TOL, equi=EQUI + STEPS, verbose=True, max_doublings=4)[0]
+        return cvg.fit_age_grid(
+            lambda q: RDMIsingModelBatch(**dict(PARAMS, tau_ref=tr), Q=q, device=device),
+            tol=TOL, equi=EQUI + STEPS, verbose=True, max_doublings=4)
 
 
     # One tile. The tiling search that stood here sized tiles with epr_plan against the
@@ -153,30 +144,23 @@ if run_sim and (overwrite or not CACHE.exists()):
           f"= {EQUI + STEPS} steps at dt={PARAMS['dt']:g}")
     print(f"Running on: {device}")
 
-    # Resume: a .partial.pt from an earlier, interrupted run of this exact grid (same n_tiles
-    # and tau_ref boundaries, since both follow deterministically from PARAMS) means its tiles
-    # need not be redone.
-    parts: list[dict] = []
-    if PARTIAL.exists():
-        try:
-            saved = torch.load(PARTIAL, weights_only=False)["parts"]
-        except Exception:
-            saved = []                      # a torn read from an earlier crash: start over
-        if len(saved) <= n_tiles:
-            parts = saved
+    # Resume: a .partial.pt from an earlier, interrupted run of this exact grid holds the
+    # tiles it finished, keyed by tile index.
+    parts: dict[int, dict] = (torch.load(PARTIAL, weights_only=False)
+                              if PARTIAL.exists() else {})
     if parts:
         print(f"Resuming from {PARTIAL.name}: {len(parts)}/{n_tiles} tiles already measured.")
 
     t0 = time.time()
     for k, tr_t in enumerate(tr_tiles):
-        if k < len(parts):
+        if k in parts:
             print(f"[tile {k+1}/{n_tiles}]  cached from {PARTIAL.name}")
             continue
-        # Qm passed explicitly: without it the model sizes its own age grid from q_from_tau
+        # Q passed explicitly: without it the model sizes its own age grid from q_from_tau
         # and the rate-aware figure above would only ever have bounded the memory estimate.
-        tile: dict = dict(PARAMS, tau_ref=tr_t, Qm=[q_of(float(tr_t.max()))])
+        tile: dict = dict(PARAMS, tau_ref=tr_t, Q=q_of(float(tr_t.max())))
         mf = RDMIsingModelBatch(**tile, device=device)
-        print(f"[tile {k+1}/{n_tiles}] {mf.B} mean-fields, Q={mf.Qm[0]}, "
+        print(f"[tile {k+1}/{n_tiles}] {mf.B} mean-fields, Q={mf.Q}, "
               f"tau_ref in [{tr_t.min():.2f}, {tr_t.max():.2f}]")
         mf.forward(EQUI, pb=True)
         traj = mf.entropy_trajectory(STEPS, pb=True, inplace=True)
@@ -185,14 +169,14 @@ if run_sim and (overwrite or not CACHE.exists()):
         # on every grid wide enough to contain a silent cell -- which is all of them here.
         trunc = float(mf.truncation_error().max())
         assert trunc < TOL, (
-            f"tile {k+1}: truncation_error = {trunc:.2e} (Q={mf.Qm[0]}, "
-            f"U_max={mf.Qm[0]*PARAMS['dt']:.0f} ms): the attractor holds more "
+            f"tile {k+1}: truncation_error = {trunc:.2e} (Q={mf.Q}, "
+            f"U_max={mf.Q*PARAMS['dt']:.0f} ms): the attractor holds more "
             f"old-age mass than the pilot did. Raise the equi passed to fit_age_grid.")
         part = {f"{key}_{stat}": getattr(traj[key], stat)(dim=-1)
                for key in KEYS for stat in ("mean", "std")}
         part["m_tot_acf1"] = acf1_of(traj["m_tot"])
-        parts.append(part)
-        checkpoint(parts)
+        parts[k] = part
+        hlp.save_atomic(parts, PARTIAL)
         print(f"    acf1 in [{float(part['m_tot_acf1'].min()):+.3f}, "
               f"{float(part['m_tot_acf1'].max()):+.3f}]")
         del mf, traj
@@ -200,7 +184,8 @@ if run_sim and (overwrite or not CACHE.exists()):
     print(f"Done in {time.time() - t0:.2f}s")
 
     # tile k holds tr_tiles[k] along axis 0, so the grid reassembles by concatenating there
-    out: dict = {key: torch.cat([p[key] for p in parts], dim=0).cpu() for key in parts[0]}
+    out: dict = {key: torch.cat([parts[k][key] for k in range(n_tiles)], dim=0).cpu()
+                 for key in parts[0]}
     out["params"] = PARAMS
 
     CACHE.parent.mkdir(exist_ok=True)
@@ -219,7 +204,7 @@ if run_plot:
     print(f"Plotting {CACHE.name}.")
     d = torch.load(CACHE, weights_only=False)
 
-    hlp.pub_style()
+    rp.pub_style()
     banner = pre.banner(PRESET, PARAMS)
 
     tau_ref, K_ref = PARAMS["tau_ref"], PARAMS["K_ref"]

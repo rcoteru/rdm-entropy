@@ -25,7 +25,7 @@ import torch
 
 import rdme.helpers as hlp
 import rdme.plots as rp
-from rdme.network import RDMNetwork, RDMWilsonCowanBatch
+from rdme.mean_field import RDMWilsonCowanBatch
 
 
 # ── Cache paths ───────────────────────────────────────────────────────────────
@@ -33,7 +33,6 @@ from rdme.network import RDMNetwork, RDMWilsonCowanBatch
 bname = Path(__file__).stem
 CACHE_DIR       = Path(__file__).parents[1] / "cache"
 CACHE_TRAJ_FILE = CACHE_DIR / f"{bname}_traj.pt"
-CACHE_SIM_FILE  = CACHE_DIR / f"{bname}_sim.pt"
 
 run_sim   = True
 run_plot  = True
@@ -91,28 +90,25 @@ if run_sim:
         print(f"Done in {time.time() - t0:.2f}s")
 
         traj["dt"] = torch.tensor(dt)
+        traj["axes"] = mf.grid_axes
 
         CACHE_DIR.mkdir(exist_ok=True)
         torch.save(traj, CACHE_TRAJ_FILE)
         print(f"Trajectory saved to {CACHE_TRAJ_FILE}.")
-        mf.save(CACHE_SIM_FILE)
-        print(f"Simulation state saved to {CACHE_SIM_FILE}.")
 
 
 # ── Analysis & Plot ───────────────────────────────────────────────────────────
 
 if run_plot:
 
-    for f in (CACHE_TRAJ_FILE, CACHE_SIM_FILE):
-        if not f.exists():
-            raise FileNotFoundError(f"{f} not found. Run simulation first.")
+    if not CACHE_TRAJ_FILE.exists():
+        raise FileNotFoundError(f"{CACHE_TRAJ_FILE} not found. Run simulation first.")
 
     traj = torch.load(CACHE_TRAJ_FILE, weights_only=True)
-    mf   = RDMNetwork.load(CACHE_SIM_FILE, device="cpu")
 
-    # grid_axes holds the vectors as they were passed in, now in physical units
+    # axes holds the vectors as they were passed in, now in physical units
     dt = traj["dt"].item()
-    w_EE, w_II = mf.grid_axes["w_EE"], mf.grid_axes["w_II"]
+    w_EE, w_II = traj["axes"]["w_EE"], traj["axes"]["w_II"]
     extent = (w_II.min().item(), w_II.max().item(), w_EE.min().item(), w_EE.max().item())
 
     # trajectories already come back grid-shaped: (n_EE, n_II, T)

@@ -52,14 +52,14 @@ def run(dt: float, mode: str) -> dict:
     import rdme.helpers as hlp
     import rdme.presets as pre
     try:
-        from rdme.network import RDMIsingModel          # since Step 3 of the rebuild
+        from rdme.mean_field import RDMIsingModel          # since Step 3 of the rebuild
     except ImportError:
         from rdme.rdm_single import RDMIsingModel       # 8e8a724 and the Step-1/2 trees
 
     Q = round(U_MAX / dt)
     out = {"dt": dt, "mode": mode, "Q": Q, "threads": torch.get_num_threads(),
            "rdme": str(Path(epr.__file__).parent)}
-    net = RDMIsingModel(**pre.params(PRESET, hazard=HAZARD, J=J, dt=dt), Qm=[Q])
+    net = RDMIsingModel(**pre.params(PRESET, hazard=HAZARD, J=J, dt=dt), Q=Q)
 
     t0 = time.perf_counter()
     net.forward(hlp.n_steps(T_EQUI, dt))

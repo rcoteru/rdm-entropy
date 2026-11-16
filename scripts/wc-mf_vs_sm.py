@@ -24,7 +24,7 @@ import time
 import rdme.fixed_points as fpts
 import rdme.lyapunov as lyap
 import rdme.plots as rp
-from rdme.network import RDMWilsonCowan
+from rdme.mean_field import RDMWilsonCowan
 from rdme.spin_model import SpinWilsonCowan
 
 
@@ -123,7 +123,7 @@ mf = RDMWilsonCowan(E_ratio, w_EE, w_EI, w_IE, w_II,
                     tau_int_E, tau_int_I, tau_ref_E, tau_ref_I, K_ref_E, K_ref_I,
                     dt=dt, hazard=hazard, eps=0.01, device=device)
 
-print(mf.Qm)
+print(mf.Q)
 
 # mf.P = sm.fdist(Q) # initialize mean-field distribution to match spin model
 
@@ -154,7 +154,7 @@ if True: # visualize final p(n) distribution
     plt.title("Firing age distribution (mean-field vs spin model)")
 
 
-    fdists = sm.fdists(max(mf.Qm)).cpu().numpy()
+    fdists = sm.fdists(mf.Q).cpu().numpy()
     plt.plot(fdists[0], label='Spin Model [E]', linewidth=2)
     plt.plot(fdists[1], label='Spin Model [I]', linewidth=2)
 

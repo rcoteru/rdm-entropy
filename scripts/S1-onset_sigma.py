@@ -36,8 +36,9 @@ import time
 import torch
 
 import rdme.helpers as hlp
+import rdme.convergence as cvg
 import rdme.presets as pre
-from rdme.network import RDMIsingModel
+from rdme.mean_field import RDMIsingModel
 
 
 PRESET = "S1"
@@ -68,15 +69,15 @@ DEVICE = 'cpu'
 torch.set_default_dtype(torch.float64)
 
 
-def build(J: float, dt: float, Qm):
+def build(J: float, dt: float, Q):
     params = {k: v for k, v in pre.params(PRESET, hazard=HAZARD, dt=dt).items() if k != "dt"}
     return RDMIsingModel(J, **{k: v for k, v in params.items() if k != "J"},
-                         dt=dt, Qm=Qm, device=DEVICE)
+                         dt=dt, Q=Q, device=DEVICE)
 
 
-def measure(J: float, dt: float, equi_ms: float, Qm) -> dict:
+def measure(J: float, dt: float, equi_ms: float, Q) -> dict:
     """ One reading: equilibrate equi_ms, then record MEAS_MS and reduce to scalars. """
-    net = build(J, dt, Qm)
+    net = build(J, dt, Q)
     net.forward(hlp.n_steps(equi_ms, dt))
     traj = net.entropy_trajectory(hlp.n_steps(MEAS_MS, dt), pb=False)
     r = traj["r_tot"]
@@ -91,12 +92,12 @@ def measure(J: float, dt: float, equi_ms: float, Qm) -> dict:
            "n_cyc": n_cyc, "occ_max": occ_max, "acf1": acf1}
 
 
-def two_reading(J: float, dt: float, equi_ms: float, Qm) -> tuple[dict, bool, float]:
+def two_reading(J: float, dt: float, equi_ms: float, Q) -> tuple[dict, bool, float]:
     """ Measure, then continue the SAME trajectory for another equi_ms and measure again
     (not a fresh run from the initial condition -- the question is whether the state has
     stopped drifting, which a restart cannot answer). Accepted iff the two sigma readings
     agree to better than SETTLE_TOL relative. """
-    net = build(J, dt, Qm)
+    net = build(J, dt, Q)
     net.forward(hlp.n_steps(equi_ms, dt))
     traj1 = net.entropy_trajectory(hlp.n_steps(MEAS_MS, dt), pb=False)
     a1, z1, n1 = hlp.cycle_window(traj1["r_tot"])
@@ -135,17 +136,17 @@ for Delta in DELTAS:
     # the two-reading settling test, at the FINER dt (dt2): if sigma has not stopped moving
     # there, the dt1 reading -- the one the Richardson pair below needs -- cannot be trusted
     # either, since both start from the same equilibration schedule.
-    Qm2 = hlp.fit_age_grid(lambda qm: build(J, DT_PAIR[1], qm), tol=TOL_AGE,
+    Q2 = cvg.fit_age_grid(lambda q: build(J, DT_PAIR[1], q), tol=TOL_AGE,
                            equi=hlp.n_steps(equi_ms + MEAS_MS, DT_PAIR[1]), verbose=False)
-    settle_out, ok, rel = two_reading(J, DT_PAIR[1], equi_ms, Qm2)
+    settle_out, ok, rel = two_reading(J, DT_PAIR[1], equi_ms, Q2)
 
     # The Richardson pair proper, at the SAME (doubled) equilibration the settling test just
     # certified -- not the original equi_ms, so the point entering the dt->0 limit below is
     # the settled one, not the first, possibly-still-drifting, reading.
     equi_settled = 2 * equi_ms
-    Qm1 = hlp.fit_age_grid(lambda qm: build(J, DT_PAIR[0], qm), tol=TOL_AGE,
+    Q1 = cvg.fit_age_grid(lambda q: build(J, DT_PAIR[0], q), tol=TOL_AGE,
                            equi=hlp.n_steps(equi_settled + MEAS_MS, DT_PAIR[0]), verbose=False)
-    m1 = measure(J, DT_PAIR[0], equi_settled, Qm1)
+    m1 = measure(J, DT_PAIR[0], equi_settled, Q1)
     sigma1, sigma2 = m1["sigma"], settle_out["sigma"]
     order = math.log2(abs(sigma1 - sigma2) / max(1e-300, abs(sigma2 - settle_out["sigma_first_reading"]))) \
         if ok else float('nan')

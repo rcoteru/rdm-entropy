@@ -87,9 +87,9 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 import torch
 import tqdm
 
-import rdme.kernels as krn
+import rdme.equations as eq
 import rdme.plots as rp
-from rdme.network import RDMWilsonCowanPoints, flatten_param_grid, unflatten_batch
+from rdme.mean_field import RDMWilsonCowanPoints, flatten_param_grid, unflatten_batch
 
 
 # ── Cache paths ───────────────────────────────────────────────────────────────
@@ -241,16 +241,15 @@ if run_sim:
         flat, grid_shape, swept = flatten_param_grid(axes_in)
         B = flat["w_EE"].numel()
 
-        # One age grid for every chunk, sized from the slowest kernel per population.
-        Qm = [krn.q_from_tau(max(tau_int_E, tau_ref), dt, 0.01),
-              krn.q_from_tau(max(tau_int_I, tau_ref), dt, 0.01)]
+        # One age grid for every chunk and population, sized from the slowest kernel.
+        Q = eq.q_from_tau(max(tau_int_E, tau_int_I, tau_ref), dt, 0.01)
 
         # Chunked by flat index: the full 4D batch would need several GiB of (p, S)
         # state before any intermediates, and chunking keeps the grid resolution a
         # free parameter rather than something bounded by VRAM.
         chunk = n ** 3
         print(f"Grid: {n}**4 = {B} cells, in {(B + chunk - 1)//chunk} chunks of {chunk}. "
-              f"Qm = {Qm}. {equi+steps} steps each "
+              f"Q = {Q}. {equi+steps} steps each "
               f"({equi} equilibration + {steps} recording).")
         print(f"Running on: {device}")
 
@@ -269,7 +268,7 @@ if run_sim:
                 E_ratio, flat["w_EE"][sl], gc*rho, -gc/rho, flat["w_II"][sl],
                 flat["E_ext"][sl], flat["E_ext"][sl], beta, beta, theta, theta,
                 tau_int_E, tau_int_I, tau_ref, tau_ref, K_ref_E, K_ref_I,
-                dt=dt, hazard="poisson_exact", Qm=Qm, device=device)
+                dt=dt, hazard="poisson_exact", Q=Q, device=device)
             mf.forward(equi, pb=False)
             parts.append({k: v.cpu() for k, v in streaming_stats(mf, steps).items()})
             del mf

@@ -40,12 +40,13 @@ import torch
 import rdme.epr as epr
 import rdme.hazards as hzd
 import rdme.helpers as hlp
-import rdme.kernels as krn
+import rdme.convergence as cvg
+import rdme.equations as eq
 import rdme.plots as rp
 import rdme.presets as pre
-from rdme.helpers import orders, richardson
-from rdme.network import RDMIsingModelBatch
-from rdme.network import RDMIsingModel
+from rdme.convergence import orders, richardson
+from rdme.mean_field import RDMIsingModelBatch
+from rdme.mean_field import RDMIsingModel
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -143,19 +144,19 @@ for _dt in set(DTS) | set(DT_MONO) | {DT_FIT}:
 
 
 def age_window() -> float:
-    """ U_max = Qm*dt in MILLISECONDS, fitted once at DT_FIT and held across the sweep.
+    """ U_max = Q*dt in MILLISECONDS, fitted once at DT_FIT and held across the sweep.
 
     Refitting per dt lays up to `tol` of grid error on top of the dt differences the whole
-    exercise is about, so the window is a physical length and Qm = U_max/dt follows it.
+    exercise is about, so the window is a physical length and Q = U_max/dt follows it.
 
     Fitted at the BOTTOM of the scan, J = 12, which is the binding case: that is where the
     rate is lowest, the firing interval longest and the mass reaching furthest back in age. A
     window that holds there holds everywhere above it. """
     J0 = float(J_SCAN[0])
-    Qm = hlp.fit_age_grid(
-        lambda q: RDMIsingModel(J0, **MODEL, dt=DT_FIT, hazard=HAZARD, Qm=q, device="cpu"),
+    Q = cvg.fit_age_grid(
+        lambda q: RDMIsingModel(J0, **MODEL, dt=DT_FIT, hazard=HAZARD, Q=q, device="cpu"),
         tol=TOL_FIT, equi=hlp.n_steps(T_EQUI + T_MEAS, DT_FIT))
-    return Qm[0] * DT_FIT
+    return Q * DT_FIT
 
 
 # ── 1. The Hopf, by bisection on rho(J) ───────────────────────────────────────
@@ -166,7 +167,7 @@ def spectral_radius(J: float, dt: float, Q: int) -> float:
     Over every root rather than a chosen one: taking the max makes the single-branch structure
     an observation instead of an assumption -- a second branch appearing shows up as a
     discontinuity in rho rather than being silently picked up or dropped. """
-    net = RDMIsingModel(J, **MODEL, dt=dt, hazard=HAZARD, Qm=[Q], device="cpu")
+    net = RDMIsingModel(J, **MODEL, dt=dt, hazard=HAZARD, Q=Q, device="cpu")
     roots = net.fixed_points(n_grid=401)
     if roots.numel() == 0:
         raise RuntimeError(f"no fixed point at J={J}, dt={dt}")
@@ -230,14 +231,15 @@ def occupancy(mf, n_probe: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tenso
     rmax = torch.zeros(mf.B, device=mf.device)
     lmax = torch.zeros(mf.B, device=mf.device)
     phi  = 0.0
+    blocked = torch.arange(mf.Q, device=mf.device) < mf.n_abs[:, 0, None]   # (B, Q), per cell
     for _ in range(n_probe):
-        if mf.n_abs:
-            occ = torch.maximum(occ, mf.p[0][:, :mf.n_abs].sum(dim=-1))
+        occ = torch.maximum(occ, (mf.p[:, 0] * blocked).sum(dim=-1))
         rmax = torch.maximum(rmax, mf.rates()[:, 0])
         # the hazard rate over the ELIGIBLE bins: inside the blocked window R_abs drives the
         # field to a large negative number by construction, so including those bins would
         # report the floor rather than the burst.
-        lmax = torch.maximum(lmax, mf.hazard_rate()[0][:, mf.n_abs:].max(dim=-1).values)
+        lmax = torch.maximum(lmax, mf.hazard_rate()[:, 0].masked_fill(blocked, -torch.inf)
+                                     .max(dim=-1).values)
         phi = max(phi, float(mf.max_step_prob().max()))
         mf.update()
     return occ.cpu(), rmax.cpu(), lmax.cpu(), phi
@@ -257,78 +259,72 @@ def scan(dt: float, u_max: float, J_SCAN: torch.Tensor,
     Q     = max(1, round(u_max / dt))
     equi  = hlp.n_steps(t_equi, dt, name="T_EQUI")
     steps = hlp.n_steps(T_MEAS, dt, name="T_MEAS")
-    B_tile = len(J_SCAN)          # one tile: the EPR observer is O(Q) per cell (2026-11-13)
-    tiles = torch.tensor_split(J_SCAN, max(1, -(-len(J_SCAN) // B_tile)))
 
-    print(f"  dt = {dt:6.4f}  Q = {Q:5d}  {equi} + {steps} steps  "
-          f"{len(tiles)} tile(s)", flush=True)
-    rows = []
-    for k, Js in enumerate(tiles):
-        mf = RDMIsingModelBatch(**MODEL, J=Js, dt=dt, hazard=HAZARD, Qm=[Q], device=DEVICE)
+    print(f"  dt = {dt:6.4f}  Q = {Q:5d}  {equi} + {steps} steps", flush=True)
+    mf = RDMIsingModelBatch(**MODEL, J=J_SCAN, dt=dt, hazard=HAZARD, Q=Q, device=DEVICE)
+    mf.forward(equi, pb=False)
+    traj = mf.entropy_trajectory(steps, pb=True, inplace=True)
+
+    trunc = float(mf.truncation_error().max())
+    assert trunc < TOL, (f"truncation_error = {trunc:.2e} at dt = {dt}, Q = {Q}: the "
+                         f"window fitted at dt = {DT_FIT} does not hold at this step.")
+
+    r = traj["r_tot"]                                   # (B, T), 1/ms
+    blk = []
+    for b in range(len(J_SCAN)):
+        a, z, n_cyc = hlp.cycle_window(r[b])
+        per = (z - a) * dt / n_cyc if n_cyc else float('nan')
+        # lag-1 autocorrelation of the rate over the averaged window: -1 is the whole
+        # population firing in alternate bins, which is a step artifact and not a cycle.
+        x = r[b, a:z] - r[b, a:z].mean()
+        acf1 = float((x[:-1] * x[1:]).sum() / x.pow(2).sum().clamp_min(1e-300))
+        m = traj["m_tot"][b, a:z]
+        # H relative to the Poisson reference: the finite half of the pair. sigma is
+        # untouched by the subtraction, both terms losing the same H_ref.
+        href = epr.poisson_reference_entropy(m, PARAMS["nu0"], dt)
+        blk.append([float(r[b, a:z].mean()),
+                    float(r[b, a:z].max() - r[b, a:z].min()),
+                    per,
+                    float(traj["sigma_tot"][b, a:z].mean()) / dt,
+                    float(traj["H_fwd_tot"][b, a:z].mean()) / dt,
+                    float(traj["H_rev_tot"][b, a:z].mean()) / dt,
+                    float((traj["H_fwd_tot"][b, a:z] - href).mean()) / dt,
+                    float((traj["H_rev_tot"][b, a:z] - href).mean()) / dt,
+                    0.0, 0.0, 0.0, acf1, 0.0, 1.0])
+
+    # The ceiling probe, over one period of the SLOWEST cell in the scan, so every cell in
+    # it is covered: a peak is one instant, and the mean of a relaxation oscillator is
+    # nowhere near it. 200 ms where no cell in the scan has a period (all settled).
+    periods = [b[SCAN_COLS.index("period")] for b in blk]
+    slowest = max((p for p in periods if p == p), default=200.0)
+    occ, rmax, lmax, phi = occupancy(mf, max(1, hlp.n_steps(slowest, dt)))
+    for b in range(len(J_SCAN)):
+        blk[b][SCAN_COLS.index("occ")] = float(occ[b])
+        blk[b][SCAN_COLS.index("rate_max")] = float(rmax[b])
+        blk[b][SCAN_COLS.index("lam_max")] = float(lmax[b])
+        blk[b][SCAN_COLS.index("phi_max")] = phi
+
+    # The equilibration test: run the SAME model another t_equi and re-measure the
+    # amplitude. `settle` is the ratio. On a settled orbit it is 1; while the orbit is
+    # still growing into (or decaying onto) the attractor it is not, and the lever arm is
+    # the whole equilibration rather than half a record. Only done when asked for -- the
+    # far-field scan is far from onset and does not need to pay for it.
+    if repeat:
         mf.forward(equi, pb=False)
-        traj = mf.entropy_trajectory(steps, pb=True, inplace=True)
-
-        trunc = float(mf.truncation_error().max())
-        assert trunc < TOL, (f"truncation_error = {trunc:.2e} at dt = {dt}, Q = {Q}: the "
-                             f"window fitted at dt = {DT_FIT} does not hold at this step.")
-
-        r = traj["r_tot"]                                   # (B, T), 1/ms
-        blk = []
-        for b in range(len(Js)):
-            a, z, n_cyc = hlp.cycle_window(r[b])
-            per = (z - a) * dt / n_cyc if n_cyc else float('nan')
-            # lag-1 autocorrelation of the rate over the averaged window: -1 is the whole
-            # population firing in alternate bins, which is a step artifact and not a cycle.
-            x = r[b, a:z] - r[b, a:z].mean()
-            acf1 = float((x[:-1] * x[1:]).sum() / x.pow(2).sum().clamp_min(1e-300))
-            m = traj["m_tot"][b, a:z]
-            # H relative to the Poisson reference: the finite half of the pair. sigma is
-            # untouched by the subtraction, both terms losing the same H_ref.
-            href = epr.poisson_reference_entropy(m, PARAMS["nu0"], dt)
-            blk.append([float(r[b, a:z].mean()),
-                        float(r[b, a:z].max() - r[b, a:z].min()),
-                        per,
-                        float(traj["sigma_tot"][b, a:z].mean()) / dt,
-                        float(traj["H_fwd_tot"][b, a:z].mean()) / dt,
-                        float(traj["H_rev_tot"][b, a:z].mean()) / dt,
-                        float((traj["H_fwd_tot"][b, a:z] - href).mean()) / dt,
-                        float((traj["H_rev_tot"][b, a:z] - href).mean()) / dt,
-                        0.0, 0.0, 0.0, acf1, 0.0, 1.0])
-
-        # The ceiling probe, over one period of the SLOWEST cell in the tile, so every cell in
-        # it is covered: a peak is one instant, and the mean of a relaxation oscillator is
-        # nowhere near it. 200 ms where no cell in the tile has a period (all settled).
-        periods = [b[SCAN_COLS.index("period")] for b in blk]
-        slowest = max((p for p in periods if p == p), default=200.0)
-        occ, rmax, lmax, phi = occupancy(mf, max(1, hlp.n_steps(slowest, dt)))
-        for b in range(len(Js)):
-            blk[b][SCAN_COLS.index("occ")] = float(occ[b])
-            blk[b][SCAN_COLS.index("rate_max")] = float(rmax[b])
-            blk[b][SCAN_COLS.index("lam_max")] = float(lmax[b])
-            blk[b][SCAN_COLS.index("phi_max")] = phi
-
-        # The equilibration test: run the SAME model another t_equi and re-measure the
-        # amplitude. `settle` is the ratio. On a settled orbit it is 1; while the orbit is
-        # still growing into (or decaying onto) the attractor it is not, and the lever arm is
-        # the whole equilibration rather than half a record. Only done when asked for -- the
-        # far-field scan is far from onset and does not need to pay for it.
-        if repeat:
-            mf.forward(equi, pb=False)
-            t2 = mf.entropy_trajectory(steps, pb=True, inplace=True)
-            r2 = t2["r_tot"]
-            for b in range(len(Js)):
-                # Both amplitudes over the WHOLE record, not the cycle-aligned window: an
-                # orbit that has not settled has no well-defined period to align to, so
-                # comparing an aligned window against a whole one would mix the thing being
-                # tested with the window it is tested in.
-                a1 = float(r[b].max() - r[b].min())
-                a2 = float(r2[b].max() - r2[b].min())
-                blk[b][SCAN_COLS.index("settle")] = a2 / a1 if a1 > 0 else float('nan')
-            del t2, r2
-        rows += blk
-        del mf, traj
-        if DEVICE == 'cuda': torch.cuda.empty_cache()
-    return torch.tensor(rows)
+        t2 = mf.entropy_trajectory(steps, pb=True, inplace=True)
+        r2 = t2["r_tot"]
+        for b in range(len(J_SCAN)):
+            # Both amplitudes over the WHOLE record, not the cycle-aligned window: an
+            # orbit that has not settled has no well-defined period to align to, so
+            # comparing an aligned window against a whole one would mix the thing being
+            # tested with the window it is tested in.
+            a1 = float(r[b].max() - r[b].min())
+            a2 = float(r2[b].max() - r2[b].min())
+            blk[b][SCAN_COLS.index("settle")] = a2 / a1 if a1 > 0 else float('nan')
+        del t2, r2
+    del mf, traj
+    if DEVICE == 'cuda': torch.cuda.empty_cache()
+    return torch.tensor(blk)
 
 
 if run_scan and (overwrite or not CACHE_SCAN.exists()):
@@ -355,7 +351,7 @@ CAND_J = 17.0     # the candidate; the scan says whether it is the right one
 def measure_point(J: float, dt: float, u_max: float) -> list[float]:
     """ (r, sigma/dt, period, ptp) for one system at one step, averaged over whole cycles. """
     Q = max(1, round(u_max / dt))
-    net = RDMIsingModel(J, **MODEL, dt=dt, hazard=HAZARD, Qm=[Q], device="cpu")
+    net = RDMIsingModel(J, **MODEL, dt=dt, hazard=HAZARD, Q=Q, device="cpu")
     net.forward(hlp.n_steps(T_EQUI, dt))
     traj = net.entropy_trajectory(hlp.n_steps(T_MEAS, dt), pb=False)
     r = traj["r_tot"]
@@ -524,7 +520,7 @@ if run_plot:
     print(f"    min lag-1 autocorrelation:   {float(S[dt2][:, col['acf1']].min()):.4f}  "
           f"(-1 would be the alternate-bin artifact)")
     print(f"    max ceiling occupancy:       {float(S[dt2][:, col['occ']].max()):.4f}  "
-          f"(mass in the {krn.n_abs_bins(PARAMS['t_abs'], dt2)} blocked bins)")
+          f"(mass in the {eq.n_abs_bins(PARAMS['t_abs'], dt2)} blocked bins)")
     print(f"    max rate * t_abs:            {float(S[dt2][:, col['rate_max']].max()) * PARAMS['t_abs']:.4f}  "
           f"(1.0 would be the dead-time ceiling)")
     lam = float(S[dt2][:, col['lam_max']].max())
@@ -553,7 +549,7 @@ if run_plot:
 # ── Plots ─────────────────────────────────────────────────────────────────────
 
 if run_plot:
-    hlp.pub_style()
+    rp.pub_style()
     banner = pre.banner(PRESET, dict(PARAMS, dt=DT_PAIR[1]))
 
     fig, axs = plt.subplots(2, 2, figsize=(11, 8))

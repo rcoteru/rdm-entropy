@@ -55,7 +55,7 @@ Call-site conventions:
   exposed, since m is what the discrete implementation reports and the comparison needs it,
   but only r is meaningful across different dt.
 
-  t_abs must be an integer number of bins: kernels.n_abs_bins refuses a dt that does not
+  t_abs must be an integer number of bins: equations.n_abs_bins refuses a dt that does not
   divide it, because a window that rounds moves with the step.
 
 Entropy production is a functional of Phi alone, so it is computed once for every hazard:

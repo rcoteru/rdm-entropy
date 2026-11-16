@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import math
 from typing import Callable
 
 import torch
 
 from rdme.hazards import Hazard
-import rdme.rdm as rdm
+import rdme.equations as eq
 
 """ Fixed points: the closed forms at stationarity, the model's overlap map, and the generic
 root finders that locate its roots.
@@ -55,7 +56,7 @@ def compute_stationary_survival(fprobs: torch.Tensor,   # (..., Q) age-resolved 
     saturates and a long product of (1-Phi) underflows to zero, which would send the
     normalization of the stationary distribution to a ratio of zeros. The hazard is clamped
     below one first, with a dtype-dependent bound (see hazard_clamp). """
-    log1m = torch.log1p(-fprobs.clamp(max=rdm.hazard_clamp(fprobs.dtype)))
+    log1m = torch.log1p(-fprobs.clamp(max=eq.hazard_clamp(fprobs.dtype)))
     cum = torch.cumsum(log1m[..., :-1], dim=-1)
     log_surv = torch.cat([torch.zeros_like(cum[..., :1]), cum], dim=-1)
     return log_surv if log else torch.exp(log_surv)
@@ -83,6 +84,15 @@ def compute_stationary_age_distribution(
     return p, m
 
 
+def renewal_rate(x: float, nu0: float, t_abs: float) -> float:
+    """ Stationary rate of a renewal process with a hard dead time t_abs followed by the
+    constant route-B hazard lambda = nu0 e^x: the mean interval is t_abs + 1/lambda, so
+    r = lambda / (1 + lambda t_abs) = (1/t_abs) sigma(x + ln(nu0 t_abs)). The continuum
+    answer for an uncoupled population with K_ref = 0 and an instantaneous synapse. """
+    lam = nu0 * math.exp(x)
+    return lam / (1.0 + lam * t_abs)
+
+
 def fp_guess_lattice(M: int,
                      n_per_axis: int = 5,
                      lo: float = 0.0,
@@ -104,7 +114,7 @@ def fp_guess_lattice(M: int,
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #
 # Composing the two closed forms above gives the overlap map F, whose roots m = F(m) are the
-# fixed points -- one O(sum_a Q^a) pass per evaluation, no time integration.
+# fixed points -- one O(M*Q) pass per evaluation, no time integration.
 
 def fp_overlap_map(m: torch.Tensor,        # (M,) trial overlaps
                    w: torch.Tensor,        # (M, M)
@@ -112,7 +122,7 @@ def fp_overlap_map(m: torch.Tensor,        # (M,) trial overlaps
                    alpha: torch.Tensor,    # (M,)
                    beta: torch.Tensor,     # (M,)
                    theta: torch.Tensor,    # (M,)
-                   R: list[torch.Tensor],  # M tensors, (Qm[i],)
+                   R: torch.Tensor,        # (M, Q)
                    hazard: Hazard,
                    nu0: float,
                    dt: float,
@@ -127,14 +137,7 @@ def fp_overlap_map(m: torch.Tensor,        # (M,) trial overlaps
     Note this works in overlaps m, not rates, so that the residual lives on the same scale as
     the generic Newton and bracketing routines below (which clamp to
     [0, 1]) applies unchanged. Rates are m/dt throughout the class API. """
-    I = rdm.compute_total_input(m / dt, w, E)       # w is unscaled here, so feed it the rate
-    rates = []
-    for i, R_i in enumerate(R):
-        S_i = compute_stationary_forward_field(I[..., i], alpha[..., i], R_i.shape[-1])
-        h_i = S_i + R_i - theta[..., i, None]
-        phi_i = hazard.phi(h_i, beta[..., i, None], nu0, dt)
-        rates.append(compute_stationary_age_distribution(phi_i)[1])
-    return torch.stack(rates, dim=-1)
+    return _stationary(m, w, E, alpha, beta, theta, R, hazard, nu0, dt)[2]
 
 
 def fp_state(m: torch.Tensor,
@@ -143,21 +146,29 @@ def fp_state(m: torch.Tensor,
              alpha: torch.Tensor,
              beta: torch.Tensor,
              theta: torch.Tensor,
-             R: list[torch.Tensor],
+             R: torch.Tensor,
              hazard: Hazard,
              nu0: float,
              dt: float,
-             ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """ The full stationary state (p, S) implied by a set of overlaps. """
-    I = rdm.compute_total_input(m / dt, w, E)
-    p_out, S_out = [], []
-    for i, R_i in enumerate(R):
-        S_i = compute_stationary_forward_field(I[..., i], alpha[..., i], R_i.shape[-1])
-        h_i = S_i + R_i - theta[..., i, None]
-        phi_i = hazard.phi(h_i, beta[..., i, None], nu0, dt)
-        p_out.append(compute_stationary_age_distribution(phi_i)[0])
-        S_out.append(S_i)
-    return p_out, S_out
+             ) -> tuple[torch.Tensor, torch.Tensor]:
+    """ The full stationary state (p, S), each (..., M, Q), implied by a set of overlaps. """
+    return _stationary(m, w, E, alpha, beta, theta, R, hazard, nu0, dt)[:2]
+
+
+def _stationary(m, w, E, alpha, beta, theta, R, hazard: Hazard, nu0: float, dt: float):
+    """ (p, S, F(m)) at the overlaps m: the state and the overlaps it fires at. """
+    I = eq.compute_total_input(m / dt, w, E)       # w is unscaled here, so feed it the rate
+    S = compute_stationary_forward_field(I, alpha, R.shape[-1])
+    phi = hazard.phi(S + R - theta[..., None], beta[..., None], nu0, dt)
+    p, m_new = compute_stationary_age_distribution(phi)
+    return p, S, m_new
+
+
+def fp_residual(m: torch.Tensor, w: torch.Tensor, E: torch.Tensor, alpha: torch.Tensor,
+                beta: torch.Tensor, theta: torch.Tensor, R: torch.Tensor,
+                hazard: Hazard, nu0: float, dt: float) -> torch.Tensor:
+    """ G(m) = m - F(m), in overlaps; F is fp_overlap_map. """
+    return m - fp_overlap_map(m, w, E, alpha, beta, theta, R, hazard, nu0, dt)
 
 
 # Root finding: Newton
