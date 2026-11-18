@@ -161,6 +161,8 @@ def n_abs_bins(t_abs: float, dt: float) -> int: ...
 def n_abs_bins(t_abs: float | torch.Tensor, dt: float) -> int | torch.Tensor:
     """ Number of leading age bins an absolute refractory period of t_abs blocks. A tensor
     t_abs gives a long tensor of the same shape, each distinct value checked as below.
+    "Blocks" is exact: the hazard on those bins is masked to Phi = 0, never floored (see
+    refractory_kernel).
 
     round(t_abs/dt) - 1, NOT round(t_abs/dt), and the off-by-one is the whole content of this
     function. A neuron that fires enters bin 0 and is first eligible again one step LATER, so
@@ -204,68 +206,24 @@ def n_abs_bins(t_abs: float | torch.Tensor, dt: float) -> int | torch.Tensor:
     return max(round(ratio) - 1, 0)
 
 
-def abs_refractory_floor(w: torch.Tensor,        # (M, M) weights, row = target
-                         E: torch.Tensor,        # (M,) external drive
-                         theta: torch.Tensor,    # (M,) threshold
-                         beta: torch.Tensor,     # (M,) gain
-                         r_max,                  # (1/ms) float or (M,): per SOURCE ceiling
-                         margin: float = 40.0,
-                         ) -> torch.Tensor:      # (M,) R_abs per population
-    """ How deep the absolute-refractory floor has to be, per population.
-
-    The window blocks firing by pushing the field to S - R_abs, and R_abs has to be sized
-    against the DRIVE, not against K_ref: what must be suppressed is Phi(beta*(S - R_abs -
-    theta)) at the largest S the network reaches. Taking
-
-        R_abs = S_max - theta + margin/beta,     margin ~ 40
-
-    puts the hazard at sigma(-40) ~ 4e-18, below any rate that can matter and still comfortably
-    inside float64. R_abs is finite rather than -inf on purpose: -inf gives 0 * -inf = nan in
-    the log-probability branches of the entropy production and in dPhi/dh.
-
-    S_max is bounded self-consistently. The window itself caps each population's rate at
-    r_max^b = 1/t_abs^b, so S_max^a <= sum_b max(w_ab, 0) * r_max^b + max(E_a, 0) -- the
-    argument closes on itself, which is why this works for the unbounded route-B kernels as
-    well as for "bernoulli". A source with no window (r_max^b = inf) leaves S_max^a infinite
-    wherever it excites a; a source it does not excite contributes nothing, not inf * 0.
-
-    That the rule covers "poisson" and "poisson_exact", whose rate is exponential rather than
-    linear in the field, is worth checking rather than assuming: an exponential outruns a
-    softplus, so a rule sized on the latter need not hold for the former. It does here because
-    the margin is a bound on the FIELD and not on the rate -- the floor puts beta*h at
-    -margin, where the growth of the rate function is irrelevant and every kernel sits on the
-    same Arrhenius tail. At margin = 40 the residual per-bin probability is of order
-    e^{-40} * nu0*dt, i.e. below 4e-18 for every dt <= 1 ms at nu0 = 1/ms, and it falls
-    linearly with dt as the step refines. The reference log-odds of "poisson" only ever shift
-    the field DOWN (ell < 0 for c < 1/2), so that kernel is the mildest of the three here
-    rather than the worst.
-
-    Requires beta > 0: at zero gain the hazard does not depend on the field at all, so no
-    finite floor suppresses firing and margin/beta is +inf -- which then reaches the hazard
-    as beta*h = 0 * -inf = nan. Raised here rather than returned as inf, because a nan born
-    in the first step only shows up much later, as a nan truncation_error. """
-    if not bool((beta > 0).all()):
-        raise ValueError("abs_refractory_floor needs beta > 0 everywhere; the absolute "
-                         "refractory window is undefined at zero gain (got min beta = "
-                         f"{float(beta.min()):g}).")
-    w_pos = w.clamp_min(0.0)
-    r_max = torch.as_tensor(r_max, dtype=w.dtype, device=w.device)
-    r_max = r_max.unsqueeze(-2) if r_max.ndim else r_max       # (..., 1, M): along the sources
-    S_max = torch.where(w_pos > 0, w_pos * r_max, 0.0).sum(dim=-1) + E.clamp_min(0.0)
-    return (S_max - theta + margin / beta).clamp_min(margin / beta)
-
-
 def refractory_kernel(Q: int, K, tau_r, dt: float = 1.0,
-                      t_abs: float | torch.Tensor = 0.0, R_abs=None, device='cpu') -> torch.Tensor:
+                      t_abs: float | torch.Tensor = 0.0, device='cpu') -> torch.Tensor:
     """ The refractory kernel: Gerstner's SRM_0 kernel (Neuronal Dynamics, Eq. 9.24), a hard
     absolute window on the first n_abs_bins(t_abs, dt) age bins followed by an exponential
     relative term that starts decaying when the window ENDS, not at the spike:
 
         R(u) = -K exp(-(u - t_abs)/tau_r),   u >= t_abs
-             = -R_abs,                       u <  t_abs
+             = -infinity,                    u <  t_abs
 
-    K is therefore the amplitude at the first instant the neuron can fire again, and -R_abs is
-    the finite stand-in for Gerstner's -infinity.
+    K is therefore the amplitude at the first instant the neuron can fire again.
+
+    The -infinity is NOT stored. What this returns is the relative part only, and on the
+    blocked bins it holds the clamped value -K, which nothing reads: the window is applied by
+    the caller as a boolean mask on the hazard (Phi = 0, ln(1 - Phi) = 0, dPhi/dh = 0, ln Phi
+    = -inf exactly), never through the field. A finite field value would leak e^{-margin}
+    and an infinite one would turn 0 * (-inf) into nan; the mask does neither. Every weight
+    a blocked bin carries is exactly 0 -- a path has non-zero probability iff every ISI is
+    >= t_abs, and reversal keeps the ISIs -- so the -inf in ln Phi only ever meets a zero.
 
     Discretization: bin n is evaluated at u = (n+1)*dt, the interspike interval a spike fired
     from that bin produces (see n_abs_bins). The first eligible bin, n_abs = t_abs/dt - 1,
@@ -301,35 +259,22 @@ def refractory_kernel(Q: int, K, tau_r, dt: float = 1.0,
        model rather than of a family of them. n_abs_bins refuses a dt that does not divide
        t_abs, for that reason.
 
-    This is also the standard SRM treatment, where eta(u) is taken to -infinity below the
-    absolute refractory period. Since the kernel enters the model only through S + R - theta,
-    and nothing assumes its functional form, the window propagates to the dynamics, the fixed
-    points, the Jacobian and the entropy production with no other edit.
+    This is the standard SRM treatment, where eta(u) is taken to -infinity below the absolute
+    refractory period, taken literally: the mask is exact, so no drive however strong reaches
+    a blocked bin.
 
-    R_abs must be sized against the drive; abs_refractory_floor computes it. Passing a value
-    too small is not an error but silently makes the window soft again, which is the failure
-    this is here to prevent.
-
-    K, tau_r, t_abs and R_abs may be scalars, or tensors shaped (..., 1) that broadcast against
-    the age axis: RDMNetwork passes (*b, M, 1) and gets every population's kernel, (*b, M, Q),
-    in one call, each with its own window.
+    K, tau_r and t_abs may be scalars, or tensors shaped (..., 1) that broadcast against the
+    age axis: RDMNetwork passes (*b, M, 1) and gets every population's kernel, (*b, M, Q), in
+    one call; its window mask is RDMNetwork.blocked.
     """
     K, tau_r = torch.as_tensor(K, device=device), torch.as_tensor(tau_r, device=device)
     # in K's dtype: an integer n would put n * dt in torch's global default instead
     n = torch.arange(Q, device=device, dtype=K.dtype)
     # time since the end of the window, at the ISI (n+1)*dt each bin stands for; clamped so
-    # the blocked bins (overwritten by the floor below) stay finite
+    # the blocked bins (never read: see above) stay finite
     x = ((n + 1) * dt - torch.as_tensor(t_abs, device=device, dtype=K.dtype)).clamp_min(0.0)
     on = (K != 0) & (tau_r > 0)
-    R = torch.where(on, -K * torch.exp(-x / torch.where(on, tau_r, 1.0)), 0.0).to(K.dtype)
-    n_abs = torch.as_tensor(n_abs_bins(t_abs, dt), device=device)
-    if not bool((n_abs > 0).any()):
-        return R
-    if R_abs is None:
-        raise ValueError(f"t_abs={t_abs} blocks {n_abs} bins but R_abs is None. Size it with "
-                         "abs_refractory_floor(w, E, theta, beta, r_max=1/t_abs).")
-    R_abs = torch.as_tensor(R_abs, device=device)
-    return torch.where(n < n_abs, -R_abs.to(R.dtype), R)
+    return torch.where(on, -K * torch.exp(-x / torch.where(on, tau_r, 1.0)), 0.0).to(K.dtype)
 
 
 def tau2alpha(tau: torch.Tensor, dt: float = 1.0) -> torch.Tensor:

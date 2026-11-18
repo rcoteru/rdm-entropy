@@ -34,7 +34,7 @@ def test_refractory_kernel_matches_spin_model(dt, t_abs):
         sm.update()
         seen |= sm.s == 1                      # R is a function of age only after a spike
         ok = seen & (sm.n < mf.Q)
-        got = sm.R_eff(sm.R, sm.n)[ok]
+        got = sm.R[ok]
         assert torch.allclose(got, ref[sm.n[ok]], rtol=1e-4, atol=1e-6)
     assert seen.all()
 

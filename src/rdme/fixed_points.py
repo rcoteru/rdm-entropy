@@ -123,6 +123,7 @@ def fp_overlap_map(m: torch.Tensor,        # (M,) trial overlaps
                    beta: torch.Tensor,     # (M,)
                    theta: torch.Tensor,    # (M,)
                    R: torch.Tensor,        # (M, Q)
+                   blocked: torch.Tensor,  # (M, Q) bool, the absolute window
                    hazard: Hazard,
                    nu0: float,
                    dt: float,
@@ -137,7 +138,7 @@ def fp_overlap_map(m: torch.Tensor,        # (M,) trial overlaps
     Note this works in overlaps m, not rates, so that the residual lives on the same scale as
     the generic Newton and bracketing routines below (which clamp to
     [0, 1]) applies unchanged. Rates are m/dt throughout the class API. """
-    return _stationary(m, w, E, alpha, beta, theta, R, hazard, nu0, dt)[2]
+    return _stationary(m, w, E, alpha, beta, theta, R, blocked, hazard, nu0, dt)[2]
 
 
 def fp_state(m: torch.Tensor,
@@ -147,28 +148,31 @@ def fp_state(m: torch.Tensor,
              beta: torch.Tensor,
              theta: torch.Tensor,
              R: torch.Tensor,
+             blocked: torch.Tensor,
              hazard: Hazard,
              nu0: float,
              dt: float,
              ) -> tuple[torch.Tensor, torch.Tensor]:
     """ The full stationary state (p, S), each (..., M, Q), implied by a set of overlaps. """
-    return _stationary(m, w, E, alpha, beta, theta, R, hazard, nu0, dt)[:2]
+    return _stationary(m, w, E, alpha, beta, theta, R, blocked, hazard, nu0, dt)[:2]
 
 
-def _stationary(m, w, E, alpha, beta, theta, R, hazard: Hazard, nu0: float, dt: float):
-    """ (p, S, F(m)) at the overlaps m: the state and the overlaps it fires at. """
+def _stationary(m, w, E, alpha, beta, theta, R, blocked, hazard: Hazard, nu0: float,
+                dt: float):
+    """ (p, S, F(m)) at the overlaps m: the state and the overlaps it fires at. Phi is exactly
+    0 on the blocked bins, where the survival then carries ln(1 - 0) = 0. """
     I = eq.compute_total_input(m / dt, w, E)       # w is unscaled here, so feed it the rate
     S = compute_stationary_forward_field(I, alpha, R.shape[-1])
-    phi = hazard.phi(S + R - theta[..., None], beta[..., None], nu0, dt)
+    phi = hazard.phi(S + R - theta[..., None], beta[..., None], nu0, dt).masked_fill(blocked, 0.0)
     p, m_new = compute_stationary_age_distribution(phi)
     return p, S, m_new
 
 
 def fp_residual(m: torch.Tensor, w: torch.Tensor, E: torch.Tensor, alpha: torch.Tensor,
                 beta: torch.Tensor, theta: torch.Tensor, R: torch.Tensor,
-                hazard: Hazard, nu0: float, dt: float) -> torch.Tensor:
+                blocked: torch.Tensor, hazard: Hazard, nu0: float, dt: float) -> torch.Tensor:
     """ G(m) = m - F(m), in overlaps; F is fp_overlap_map. """
-    return m - fp_overlap_map(m, w, E, alpha, beta, theta, R, hazard, nu0, dt)
+    return m - fp_overlap_map(m, w, E, alpha, beta, theta, R, blocked, hazard, nu0, dt)
 
 
 # Root finding: Newton

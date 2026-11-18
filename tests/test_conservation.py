@@ -13,4 +13,7 @@ def test_age_mass_is_conserved(hazard, dt):
         net.forward(500)
         for p in net.p:
             assert p.sum().item() == pytest.approx(1.0, abs=1e-12)
-            assert bool((p >= 0).all())
+            # the lumped last bin is 1 - sum(rest), exact normalization by construction (and
+            # the closure the tangent map mirrors); when its true mass is below roundoff it
+            # carries O(eps) of either sign, so non-negativity holds to roundoff, not to 0
+            assert p.min().item() >= -1e-14

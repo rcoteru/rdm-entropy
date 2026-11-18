@@ -46,12 +46,11 @@ def _pair(delta, beta=6.0):
 
 @pytest.mark.parametrize("delta", [-0.2, 0.3])
 def test_the_trajectory_is_gauge_invariant(delta):
-    """ Exact except in the absolute-refractory floor, whose Phi stays below 1e-15 either way:
-    the floor is placed relative to theta, so the gauge leaves a factor e^{beta delta} there
-    that nothing cancels. """
+    """ Exact up to rounding, absolute window included: it is a mask, Phi = 0 on both sides,
+    not a floor placed relative to theta. """
     a, b = _pair(delta)
     n = int(a.n_abs[0])
-    assert max(float(a.firing_prob()[0][:n].max()), float(b.firing_prob()[0][:n].max())) < 1e-15
+    assert bool((a.firing_prob()[0][:n] == 0).all()) and bool((b.firing_prob()[0][:n] == 0).all())
     for _ in range(400):
         a.update(); b.update()
         assert torch.allclose(a.rates(), b.rates(), rtol=1e-10, atol=1e-14)

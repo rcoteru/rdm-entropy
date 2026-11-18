@@ -74,7 +74,7 @@ def test_the_window_bounds_the_entropy_production(J, beta):
     I = torch.stack(Is, -1)
 
     def sigma(q):
-        prm = (ref.R[..., :q], ref.alpha_int[..., None], ref.beta[..., None],
+        prm = (ref.R[..., :q], ref.blocked[..., :q], ref.alpha_int[..., None], ref.beta[..., None],
                ref.theta[..., None], hzd.HAZARDS[ref.hazard], ref.nu0, dt)
         total = 0.0
         for t in range(steps):

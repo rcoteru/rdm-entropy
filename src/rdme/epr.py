@@ -108,19 +108,29 @@ class _Kernel:
     drive Phi rounds to one, and ln(1 - Phi) read off it is -inf, or, clamped, a floor set by
     the clamp rather than by the model -- which in the saturated regime is what H_rev is made
     of. The logs are evaluated out of place, so a caller takes them FIRST and hands the field
-    to phi last, which with inplace may consume it. """
+    to phi last, which with inplace may consume it.
+
+    Every method takes the absolute window's mask `blk`, gathered at the same (time, age)
+    indices as h, and returns the window's exact values there: Phi = 0, ln(1 - Phi) = 0 and
+    ln Phi = -inf. The -inf is deliberate rather than a finite stand-in: its weight is
+    exactly 0 (see epr_from_parts), and a non-zero one would surface as an infinite H instead
+    of being hidden. """
 
     def __init__(self, hazard: Hazard, beta, nu0: float, dt: float, inplace: bool):
         self.hazard, self.beta, self.nu0, self.dt, self.inplace = hazard, beta, nu0, dt, inplace
 
-    def phi(self, h):
-        return self.hazard.phi(h, self.beta, self.nu0, self.dt, inplace=self.inplace)
+    def _mask(self, x, blk, fill: float):
+        return x.masked_fill_(blk, fill) if self.inplace else x.masked_fill(blk, fill)
 
-    def logphi(self, h):
-        return self.hazard.logphi(h, self.beta, self.nu0, self.dt)
+    def phi(self, h, blk):
+        return self._mask(self.hazard.phi(h, self.beta, self.nu0, self.dt, inplace=self.inplace),
+                          blk, 0.0)
 
-    def log1m(self, h):
-        return self.hazard.log1m_phi(h, self.beta, self.nu0, self.dt)
+    def logphi(self, h, blk):
+        return self._mask(self.hazard.logphi(h, self.beta, self.nu0, self.dt), blk, -math.inf)
+
+    def log1m(self, h, blk):
+        return self._mask(self.hazard.log1m_phi(h, self.beta, self.nu0, self.dt), blk, 0.0)
 
 
 def _cumsum(L: torch.Tensor, inplace: bool) -> torch.Tensor:
@@ -152,13 +162,22 @@ def epr_from_parts(p_fwd: torch.Tensor,    # (..., Q) row sums of the joint == p
 
     The spike weights are indicators, not probabilities: the forward transition emits s(t+1),
     which happens iff k == 0; the reverse emits s(t), iff n == 0. The logs are the kernel's
-    exact branches (see _Kernel), finite wherever the field is, so a zero weight against a
-    saturated or silent hazard is 0 rather than the NaN of 0 * -inf. They are read, not
-    written: the sliding path still needs the forward ln(1 - Phi) after this. """
+    exact branches (see _Kernel): finite wherever the field is, except ln Phi = -inf on the
+    absolute window's blocked bins. Every product is taken with 0 * l = 0 (_wlog), the 0 ln 0
+    = 0 convention, which is exact there: a blocked bin's spike weight is exactly 0, forward
+    (p * Phi with Phi = 0) and reverse (a first passage through Phi = 0). A non-zero weight
+    against -inf is not masked and gives an infinite H. The logs are read, not written: the
+    sliding path still needs the forward ln(1 - Phi) after this. """
     sm = lambda x: x.sum(dim=-1)
-    H_fwd = -(sm(lp_fwd * spike_f) + sm(l1_fwd * (p_fwd - spike_f)))
-    H_rev = -(sm(lp_rev * spike_r) + sm(l1_rev * (p_rev - spike_r)))
+    H_fwd = -(sm(_wlog(spike_f, lp_fwd)) + sm(_wlog(p_fwd - spike_f, l1_fwd)))
+    H_rev = -(sm(_wlog(spike_r, lp_rev)) + sm(_wlog(p_rev - spike_r, l1_rev)))
     return torch.stack([H_rev - H_fwd, H_fwd, H_rev], dim=-1)
+
+
+def _wlog(w: torch.Tensor, l: torch.Tensor) -> torch.Tensor:
+    """ w * l, with w = 0 giving exactly 0 whatever l is, -inf included (xlogy's convention,
+    on a log that is already taken). The only product of a weight and a log in the EPR. """
+    return torch.where(w == 0, 0.0, w * l)
 
 
 def poisson_reference_entropy(m: torch.Tensor,    # (...) per-bin firing probability
@@ -247,7 +266,9 @@ def poisson_reference_entropy(m: torch.Tensor,    # (...) per-bin firing probabi
 #     L_end    (..., Q)    ln(1 - Phi[t+K-2, min(n+K-2, Q-1)]), at the window-edge hazards
 #
 # Every init and step takes one population's parameters as the trailing positional arguments
-# R (..., Q), alpha, beta, theta (each (..., 1) or a float), hazard, nu0, dt.
+# R (..., Q), blocked (..., Q) (the absolute window, bool), alpha, beta, theta (each (..., 1) or
+# a float), hazard, nu0, dt. Wherever the field is gathered at some (time, age), the mask is
+# gathered at the same ages and handed to the _Kernel with it.
 
 
 def synaptic_diagonal(I: torch.Tensor,                 # (..., n) inputs I_t .. I_{t+n-1}
@@ -299,6 +320,7 @@ def init_epr_state(p: torch.Tensor,       # (..., Q) p_t
                    S: torch.Tensor,       # (..., Q) S_t
                    I: torch.Tensor,       # (..., K-1) inputs I_t .. I_{t+K-2}
                    R: torch.Tensor,
+                   blocked: torch.Tensor,
                    alpha: float | torch.Tensor,
                    beta: float | torch.Tensor,
                    theta: float | torch.Tensor,
@@ -336,9 +358,9 @@ def init_epr_state(p: torch.Tensor,       # (..., Q) p_t
         # the field on the whole row, then gathered: the same elementwise sums as gathering S
         # and R first, with one (..., Q) temporary instead of three
         a = torch.clamp(n_idx + k, max=Q - 1)
-        h = hazard_field(S_k, R, theta, inplace)[..., a]
-        L = kern.log1m(h)
-        phi = kern.phi(h)
+        h, blk = hazard_field(S_k, R, theta, inplace)[..., a], blocked[..., a]
+        L = kern.log1m(h, blk)
+        phi = kern.phi(h, blk)
         del h
         if acc is None:
             G[..., k] = (phi * p).sum(dim=-1)                # first passage at lag k
@@ -361,17 +383,19 @@ def init_epr_state(p: torch.Tensor,       # (..., Q) p_t
     return p, S, I, G, logV, L_end
 
 
-def _edge_field(S: torch.Tensor, R: torch.Tensor, theta, inplace: bool) -> torch.Tensor:
+def _edge_field(S: torch.Tensor, R: torch.Tensor, blocked: torch.Tensor, theta,
+                inplace: bool) -> tuple[torch.Tensor, torch.Tensor]:
     """ hazard_field(S[a_end], R[a_end], theta) for the window-edge ages a_end = min(n+Q-2, Q-1),
     which are only two: Q-2 for n = 0 and Q-1 for every other n. The field is formed on those
     two and gathered after, the same elementwise sums on the same operands as gathering S and
-    R first, without the two (..., Q) gathers. """
+    R first, without the two (..., Q) gathers. Returns it with the mask at the same ages. """
     Q = S.shape[-1]
     a = _window_edge_ages(Q, S.device) - (Q - 2)
-    return hazard_field(S[..., Q - 2:], R[..., Q - 2:], theta, inplace)[..., a]
+    return (hazard_field(S[..., Q - 2:], R[..., Q - 2:], theta, inplace)[..., a],
+            blocked[..., Q - 2:][..., a])
 
 
-def _epr_now(p, G, I, I_new, phi_t, lp_t, L_t, R, alpha, theta, kern: _Kernel,
+def _epr_now(p, G, I, I_new, phi_t, lp_t, L_t, R, blocked, alpha, theta, kern: _Kernel,
              inplace: bool) -> torch.Tensor:
     """ (..., 3) [sigma, H_fwd, H_rev] at the reported t, from the four marginals of J_t: the
     row sums p and column sums G the state carries, column 0 off the hazard row phi_t, and
@@ -381,8 +405,8 @@ def _epr_now(p, G, I, I_new, phi_t, lp_t, L_t, R, alpha, theta, kern: _Kernel,
     # row 0: the age-0 cohort's first-passage law, off the diagonal Phi[t+j, j] (K == Q, so
     # the diagonal's ages are R's own and need no gather)
     h = hazard_field(synaptic_diagonal(I, alpha), R, theta, inplace)
-    L = kern.log1m(h)
-    d = kern.phi(h)                                                  # (..., K)
+    L = kern.log1m(h, blocked)
+    d = kern.phi(h, blocked)                                         # (..., K)
     del h
     row0 = _first_passage(d, L, p[..., :1], inplace)                 # (..., K), last col bare
     del d, L
@@ -390,19 +414,20 @@ def _epr_now(p, G, I, I_new, phi_t, lp_t, L_t, R, alpha, theta, kern: _Kernel,
     I_full = torch.cat([I, I_new.unsqueeze(-1)], dim=-1)             # I_t .. I_{t+K-1}
     h_r = hazard_field(anchor_reverse_synaptic_term(I_full, alpha), R, theta, inplace)
     del I_full
-    lp_r, L_r = kern.logphi(h_r), kern.log1m(h_r)                    # the reverse needs no Phi
+    lp_r, L_r = kern.logphi(h_r, blocked), kern.log1m(h_r, blocked)  # the reverse needs no Phi
     del h_r
     return epr_from_parts(p, G, col0, row0, lp_t, L_t, lp_r, L_r)
 
 
-def _newborn_cohort(I, p0_next, R, alpha, theta, kern: _Kernel, inplace: bool):
+def _newborn_cohort(I, p0_next, R, blocked, alpha, theta, kern: _Kernel, inplace: bool):
     """ The cohort born at t+1, at ages 0..K-3, whose one diagonal of hazards gives both its
     own survival window logV_{t+1}(0) and the next step's row 0 up to lag K-3. Returns
     (logV0 (...), row0_next (..., K-2)). """
     K = I.shape[-1] + 1
     h = hazard_field(synaptic_diagonal(I[..., 1:K - 2], alpha), R[..., :K - 2], theta, inplace)
-    L2 = kern.log1m(h)
-    d2 = kern.phi(h)
+    blk = blocked[..., :K - 2]
+    L2 = kern.log1m(h, blk)
+    d2 = kern.phi(h, blk)
     del h
     log_surv2 = _cumsum(L2, inplace)
     del L2
@@ -451,6 +476,7 @@ def epr_step(state: tuple,                # (p, S, I, G, logV, L_end) at the rep
              S_live: torch.Tensor,        # (..., Q) the model's S at t+K-1, the window's edge
              I_new: torch.Tensor,         # (...) the model's input at t+K-1
              R: torch.Tensor,
+             blocked: torch.Tensor,
              alpha: float | torch.Tensor,
              beta: float | torch.Tensor,
              theta: float | torch.Tensor,
@@ -477,21 +503,22 @@ def epr_step(state: tuple,                # (p, S, I, G, logV, L_end) at the rep
 
     # the hazard row at time t, shared by H_fwd, column 0, the p update and the logV slide
     h = hazard_field(S, R, theta, inplace)
-    lp_t, L_t = kern.logphi(h), kern.log1m(h)
-    phi_t = kern.phi(h)                                              # (Q,)
+    lp_t, L_t = kern.logphi(h, blocked), kern.log1m(h, blocked)
+    phi_t = kern.phi(h, blocked)                                     # (Q,)
     del h
-    epr = _epr_now(p, G, I, I_new, phi_t, lp_t, L_t, R, alpha, theta, kern, inplace)
+    epr = _epr_now(p, G, I, I_new, phi_t, lp_t, L_t, R, blocked, alpha, theta, kern, inplace)
     del lp_t
     p_next = eq.update_age_distribution(p, phi_t)
     del phi_t
 
-    logV0, row0_next = _newborn_cohort(I, p_next[..., :1], R, alpha, theta, kern, inplace)
+    logV0, row0_next = _newborn_cohort(I, p_next[..., :1], R, blocked, alpha, theta, kern,
+                                       inplace)
     logV_next = _slide_logV(logV, L_t, L_end, logV0, inplace)
     del L_t, logV0
-    h = _edge_field(S_live, R, theta, inplace)
-    L_end_next = kern.log1m(h)
-    phi_end_next = kern.phi(h)                                       # Phi[t+K-1, .]
-    del h
+    h, blk = _edge_field(S_live, R, blocked, theta, inplace)
+    L_end_next = kern.log1m(h, blk)
+    phi_end_next = kern.phi(h, blk)                                  # Phi[t+K-1, .]
+    del h, blk
     G_next = _slide_G(G, row0_next, logV_next, p_next, phi_end_next, inplace)
     del row0_next
 
@@ -513,6 +540,7 @@ def epr_step(state: tuple,                # (p, S, I, G, logV, L_end) at the rep
 def joint_distribution(p: torch.Tensor,        # (Q,)   p_t(n)
                        buff_S: torch.Tensor,   # (K, Q) buff_S[j, n] = S_{t+j}(n), j=0 is t
                        R: torch.Tensor,        # (Q,)
+                       blocked: torch.Tensor,  # (Q,) bool, the absolute window
                        beta: float | torch.Tensor,
                        theta: float | torch.Tensor,
                        hazard: Hazard,
@@ -550,8 +578,9 @@ def joint_distribution(p: torch.Tensor,        # (Q,)   p_t(n)
     # the two index tensors consume the last two axes, so the ellipsis carries any batch
     h = h_all[..., future_time, future_age]                         # (..., Q, K)
     del h_all               # the gather already copied; holding the source doubles the peak
-    L = kern.log1m(h)
-    phi = kern.phi(h)
+    blk = blocked[..., future_age]                                  # (..., Q, K), same ages
+    L = kern.log1m(h, blk)
+    phi = kern.phi(h, blk)
     del h
 
     if inplace:
@@ -600,7 +629,7 @@ def synaptic_window(S: torch.Tensor,      # (..., Q) S_t
 
 
 def epr_step_joint(state: tuple,       # (p, S, I) at the reported t
-                   S_live, I_new, R, alpha, beta, theta, hazard: Hazard, nu0: float,
+                   S_live, I_new, R, blocked, alpha, beta, theta, hazard: Hazard, nu0: float,
                    dt: float, inplace: bool = False):
     """ The reference path as an observer: same feed and same return as epr_step, but the EPR
     is read off the explicit (Q, K) joint, rebuilt every step from the lagged S and the input
@@ -610,20 +639,21 @@ def epr_step_joint(state: tuple,       # (p, S, I) at the reported t
     p, S, I = state
     I_full = torch.cat([I, I_new.unsqueeze(-1)], dim=-1)                # I_t .. I_{t+K-1}
     kern = _Kernel(hazard, beta, nu0, dt, inplace)
-    J = joint_distribution(p, synaptic_window(S, I, alpha), R, beta, theta,
+    J = joint_distribution(p, synaptic_window(S, I, alpha), R, blocked, beta, theta,
                            hazard, nu0, dt, inplace=inplace)
     h_f = hazard_field(S, R, theta, inplace)
-    lp_f, l1_f = kern.logphi(h_f), kern.log1m(h_f)
-    phi_f = kern.phi(h_f)
+    lp_f, l1_f = kern.logphi(h_f, blocked), kern.log1m(h_f, blocked)
+    phi_f = kern.phi(h_f, blocked)
     h_r = hazard_field(anchor_reverse_synaptic_term(I_full, alpha), R, theta, inplace)
-    e = epr_from_joint(J, lp_f, l1_f, kern.logphi(h_r), kern.log1m(h_r))
+    e = epr_from_joint(J, lp_f, l1_f, kern.logphi(h_r, blocked), kern.log1m(h_r, blocked))
     nxt = (eq.update_age_distribution(p, phi_f),
            eq.update_synaptic_term(S, alpha, I[..., :1]),
            I_full[..., 1:])
     return nxt, e[..., 0], e[..., 1], e[..., 2]
 
 
-def init_joint_state(p, S, I, R, alpha, beta, theta, hazard: Hazard, nu0: float, dt: float,
+def init_joint_state(p, S, I, R, blocked, alpha, beta, theta, hazard: Hazard, nu0: float,
+                     dt: float,
                      inplace: bool = False) -> tuple:
     """ The joint path's state (p, S, I) at the first reported step: it carries the inputs and
     rebuilds everything else every step. Same signature as init_epr_state. """

@@ -118,15 +118,12 @@ class SpinModel:
         self.theta_net = self.theta[self.pop_idx]
         self.beta_net = self.beta[self.pop_idx]
 
-        # Absolute refractory window. The mean field carries this inside its R(u) kernel; here
-        # R is a per-NEURON state with no age axis, so the window has to be applied through the
-        # age n instead. The two must agree, which is what the spin-vs-mean-field tests pin.
-        # t_abs is a physical dead time; see equations.refractory_kernel.
+        # Absolute refractory window: a mask on the age n, n < n_abs, the per-neuron
+        # counterpart of the mean field's RDMNetwork.blocked. Phi = 0 there exactly, and the
+        # EPR's log branches take their exact values (Hazard.neg_log_prob). The two must
+        # agree, which is what the spin-vs-mean-field tests pin. t_abs is a physical dead
+        # time; see equations.refractory_kernel.
         self.n_abs = eq.n_abs_bins(self.t_abs, self.dt)
-        R_abs = (eq.abs_refractory_floor(self.w, self.E, self.theta, self.beta,
-                                          r_max=1.0 / self.t_abs)
-                 if self.t_abs > 0 else torch.zeros_like(self.theta))
-        self.R_abs_net = R_abs.float()[self.pop_idx]   # (N,)
 
     @property
     def batch_shape(self) -> tuple[int, ...]:
@@ -216,27 +213,26 @@ class SpinModel:
         pop_I = self.rates() @ self.w.T + self.E      # (*b, M)
         return pop_I[..., self.pop_idx]               # (*b, N)
 
-    def R_eff(self, R: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
-        """ The refractory term the hazard actually sees: the exponential state R, floored at
-        -R_abs for neurons younger than n_abs bins.
+    def blocked(self, n: torch.Tensor) -> torch.Tensor:
+        """ The absolute window at ages n: True where the neuron cannot fire.
 
-        Takes R and n as ARGUMENTS rather than reading self, because the entropy production
-        needs exactly this transformation applied to the reverse trajectory's own (R, n) --
-        which are reconstructed by backward recursion and are not the live state. Routing both
-        directions through one function is what keeps them from drifting apart. """
-        if self.n_abs == 0:
-            return R
-        return torch.where(n < self.n_abs, -self.R_abs_net.to(R.dtype), R)
+        Takes n as an ARGUMENT rather than reading self, because the entropy production needs
+        the same mask on the reverse trajectory's own age -- reconstructed by backward
+        recursion, not the live state. Routing both directions through one function is what
+        keeps them from drifting apart. """
+        return n < self.n_abs
 
     @torch.inference_mode()
     def field(self) -> torch.Tensor:
-        return self.S + self.R_eff(self.R, self.n)
+        """ S + R. Inside the absolute window R holds -K_ref, which the hazard never reads:
+        the window is the mask, not a field value (see blocked). """
+        return self.S + self.R
 
     @torch.inference_mode()
     def firing_prob(self) -> torch.Tensor:
         """ Per-step firing probability P(s_i(t+1)=1) = Phi(beta*(H_i(t)+X_i(t)-theta)), with
-        Phi the chosen hazard. """
-        return self._phi(self.field() - self.theta_net)
+        Phi the chosen hazard; exactly 0 inside the absolute window. """
+        return self._phi(self.field() - self.theta_net).masked_fill(self.blocked(self.n), 0.0)
 
     @torch.inference_mode()
     def hazard_rate(self) -> torch.Tensor:
@@ -246,18 +242,22 @@ class SpinModel:
         on this step. "poisson" and "poisson_exact" share it exactly -- they are one model
         under two discretization maps -- while "bernoulli" has its own, saturating at nu0. """
         return HAZARDS[self.hazard].rate(self.field() - self.theta_net, self.beta_net,
-                                         self.nu0, self.dt)
+                                         self.nu0, self.dt).masked_fill(self.blocked(self.n), 0.0)
 
     def _phi(self, h: torch.Tensor) -> torch.Tensor:
         """ The hazard applied to a raw field h = S + R - theta (beta not yet folded in). """
         return HAZARDS[self.hazard].phi(h, self.beta_net, self.nu0, self.dt)
 
-    def _neg_log_prob(self, s: torch.Tensor, hb: torch.Tensor) -> torch.Tensor:
-        """ -ln p(s | h) for the current hazard, given a field hb that ALREADY carries beta.
+    def _neg_log_prob(self, s: torch.Tensor, hb: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+        """ -ln p(s | h) for the current hazard, given a field hb that ALREADY carries beta and
+        the age n it is evaluated at, for the absolute window: 0 for a silent blocked neuron,
+        +inf for a spike from one -- which a realised trajectory never contains, forward or
+        reversed, since reversal keeps every ISI >= t_abs.
 
         beta=1 is passed on because the EPR passes expand the gain into the stored fields once
         rather than per bond; the hazard only ever sees beta*h, so this is the same number. """
-        return HAZARDS[self.hazard].neg_log_prob(s, hb, 1.0, self.nu0, self.dt)
+        return HAZARDS[self.hazard].neg_log_prob(s, hb, 1.0, self.nu0, self.dt,
+                                                 blocked=self.blocked(n))
 
     @torch.inference_mode()
     def fdist(self, Q: int) -> torch.Tensor:
@@ -284,16 +284,9 @@ class SpinModel:
         # float64 draws: what every run so far has used, through the scripts' global default
         fired = torch.rand(self.s.shape, device=self.device, dtype=torch.float64) < probs
         if self.n_abs:
-            # The absolute window must be enforced on the DRAW, not only through the field.
-            # R_abs is finite on purpose (-inf gives 0*-inf = nan in the log-probability
-            # branches), so a blocked neuron has Phi ~ 1e-34 rather than 0 -- and
-            # torch.rand returns exactly 0.0 with probability ~2^-24 in float32, for which
-            # `0.0 < Phi` is True at ANY positive Phi. That leaks one spike per ~6e-8
-            # neuron-steps through a window that is supposed to be absolute, and no increase
-            # in R_abs removes it. Measured before this mask: 1 escape in 6e7 draws, at an
-            # age of 1 bin against n_abs = 4. The mean field has no counterpart, being
-            # deterministic -- 1e-34 of age mass is simply negligible there.
-            fired &= self.n >= self.n_abs
+            # The absolute window, on the draw. probs is already exactly 0 there, and
+            # `rand < 0` is never True, so this restates the mask rather than adding to it.
+            fired &= ~self.blocked(self.n)
         
         self.s = fired.int() # set new state based on fired neurons
         
@@ -334,7 +327,7 @@ class SpinModel:
         "m_tot"/"r_tot" (*b, T) their network aggregates -- the keys RDMNetwork.trajectory
         uses. The leading axes are none for one network and (B,) for a batch. Optional keys:
           s    — full spin state, shape (*b, T, N)
-          pot  — membrane potential h = S + R_eff, shape (*b, T, N)
+          pot  — membrane potential h = S + R, shape (*b, T, N)
           fdist — firing distribution over ages, shape (*b, T, M, Q)
         All tensors are moved to CPU.
         """
@@ -400,6 +393,12 @@ class SpinModel:
         if buffer < 2:
             raise ValueError("buffer must be >= 2; in practice use several "
                              "times max(tau_int, tau_ref).")
+        if buffer <= self.n_abs:
+            # the reverse age starts at 0 at the tail's end (the reversed path's initial
+            # condition is not fixed by the forward one), so a neuron silent through the
+            # whole tail is inside the window there; past n_abs steps it never reaches a
+            # reported bond
+            raise ValueError(f"buffer must exceed the absolute window, n_abs = {self.n_abs}")
 
         dev = self.device
         L = T + buffer
@@ -446,8 +445,8 @@ class SpinModel:
                                    torch.where(n_rev[t] > self.n_abs,
                                                (1 - self.a_ref_net) * R_rev[t + 1], R_rev[t + 1]))
 
-        hf = self.beta_net * (S_fwd + self.R_eff(R_fwd, n_fwd) - self.theta_net)
-        hr = self.beta_net * (S_rev + self.R_eff(R_rev, n_rev) - self.theta_net)
+        hf = self.beta_net * (S_fwd + R_fwd - self.theta_net)
+        hr = self.beta_net * (S_rev + R_rev - self.theta_net)
 
         # both halves of the bond (t, t+1): forward emits s[t+1] from hf[t], reverse
         # emits s[t] from hr[t+1]
@@ -458,8 +457,8 @@ class SpinModel:
 
         # -ln p(s | h) under the chosen hazard. For a logistic kernel ("poisson", or
         # "bernoulli" at nu0*dt = 1) this is the -s*h + softplus(h) this used to compute.
-        ent_f = self._neg_log_prob(s_next, hf_a)
-        ent_r = self._neg_log_prob(s_cur,  hr_a)
+        ent_f = self._neg_log_prob(s_next, hf_a, n_fwd[lo:hi])
+        ent_r = self._neg_log_prob(s_cur,  hr_a, n_rev[lo + 1:hi + 1])
 
         # same dict contract as RDMNetwork.entropy_trajectory: per-population (*b, T, M)
         # arrays, plus the N-weighted network aggregates under the _tot suffix
@@ -476,7 +475,7 @@ class SpinModel:
             "H_rev_tot": ent_r.mean(dim=-1),
         }
         if s:   out["s"]   = s_trj[lo:hi]
-        if pot: out["pot"] = (S_fwd + self.R_eff(R_fwd, n_fwd))[lo:hi]
+        if pot: out["pot"] = (S_fwd + R_fwd)[lo:hi]
         if fields:
             out["hf"] = hf_a
             out["hr"] = hr_a
@@ -536,6 +535,10 @@ class SpinModel:
         """
         if overlap < 4:
             raise ValueError("overlap must be >= 4")
+        if overlap <= self.n_abs:
+            # see entropy_trajectory: the zero reverse-age boundary must not reach a
+            # reported bond
+            raise ValueError(f"overlap must exceed the absolute window, n_abs = {self.n_abs}")
         if chunk < overlap:
             raise ValueError("chunk must be >= overlap (the slide would self-overlap)")
 
@@ -626,14 +629,13 @@ class SpinModel:
                 k = t - 1
                 if k < n_emit:
                     i  = emitted + k
-                    hf = self.beta_net * (S_win[k] + self.R_eff(R_win[k], n_win[k])
-                                          - self.theta_net)
-                    hr = self.beta_net * (h_rev + self.R_eff(x_rev, a_rev) - self.theta_net)
+                    hf = self.beta_net * (S_win[k] + R_win[k] - self.theta_net)
+                    hr = self.beta_net * (h_rev + x_rev - self.theta_net)
                     sn = s_win[k + 1].to(store_dtype)   # s[t+1], forward emission
                     sc = s_win[k].to(store_dtype)       # s[t],   reverse emission
 
-                    lp_f = -self._neg_log_prob(sn, hf)
-                    lp_r = -self._neg_log_prob(sc, hr)
+                    lp_f = -self._neg_log_prob(sn, hf, n_win[k])
+                    lp_r = -self._neg_log_prob(sc, hr, a_rev)
 
                     out["sigma_tot"][..., i] = (lp_f - lp_r).mean(dim=-1, dtype=acc)
                     out["H_fwd_tot"][..., i] = (-lp_f).mean(dim=-1, dtype=acc)
@@ -648,7 +650,7 @@ class SpinModel:
                     out["sigma"][..., i, :] = pops[2] - pops[1]
 
                     if s:      out["s"][..., i, :]   = s_win[k]
-                    if pot:    out["pot"][..., i, :] = S_win[k] + self.R_eff(R_win[k], n_win[k])
+                    if pot:    out["pot"][..., i, :] = S_win[k] + R_win[k]
                     if fields: out["hf"][..., i, :]  = hf; out["hr"][..., i, :] = hr
                     if fd_win is not None: out["fdist"][..., i, :, :] = fd_win[k]
 

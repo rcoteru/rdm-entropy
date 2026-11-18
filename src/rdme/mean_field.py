@@ -109,7 +109,8 @@ class RDMNetwork:
     m: torch.Tensor           # (*b, M) per-bin firing probability; the rate is m/dt
     p: torch.Tensor           # (*b, M, Q) age MASS per population, sums to 1; density p/dt
     S: torch.Tensor           # (*b, M, Q) synaptic term
-    R: torch.Tensor           # (*b, M, Q) refractory kernel
+    R: torch.Tensor           # (*b, M, Q) refractory kernel, relative part (see blocked)
+    blocked: torch.Tensor     # (*b, M, Q) bool, the absolute window: Phi = 0 exactly there
 
     E: torch.Tensor           # (*b, M) external drive
     beta: torch.Tensor        # (*b, M) gain
@@ -210,7 +211,7 @@ class RDMNetwork:
         self.N_ratios = self.N_ratios / self.N_ratios.sum()
         self.alpha_int = eq.tau2alpha(self.tau_int, dt)
 
-        self._abs_window()
+        self.n_abs = eq.n_abs_bins(self.t_abs, self.dt)
         self.tol = tol
         self.drive = eq.drive_bound(self.w, self.E, self.t_abs, self.tau_int)
         if Q is None:
@@ -218,39 +219,22 @@ class RDMNetwork:
                               self.drive, tol)
             Q = max(math.ceil(U.max().item() / dt) + 1, int(self.n_abs.max()) + 1, 2)
         assert isinstance(Q, int) and Q > 0, f"Q must be a positive int, got {Q!r}"
+        if Q <= int(self.n_abs.max()):
+            # the lumped last bin must be eligible, or its mass could never fire again
+            raise ValueError(f"Q={Q} does not reach past the absolute window "
+                             f"({int(self.n_abs.max())} blocked bins); need Q > n_abs.")
         self.Q = Q
         self.R = eq.refractory_kernel(Q, self.K_ref[..., None], self.tau_ref[..., None], dt=dt,
-                                      t_abs=self.t_abs[..., None], R_abs=self.R_abs[..., None],
-                                      device=device)
+                                      t_abs=self.t_abs[..., None], device=device)
+        # the absolute window, as a mask on the hazard rather than a field value: see
+        # equations.refractory_kernel
+        self.blocked = torch.arange(Q, device=device) < self.n_abs[..., None]
 
         # all age mass in the oldest bin, zero integrated field
         self.p = torch.zeros(lead + (M, Q), device=device, dtype=dtype)
         self.p[..., -1] = 1.0
         self.S = torch.zeros(lead + (M, Q), device=device, dtype=dtype)
         self.m = torch.zeros(lead + (M,), device=device, dtype=dtype)
-
-    def _abs_window(self) -> None:
-        """ n_abs and R_abs, each (*b, M), from t_abs: how many leading bins each population's
-        window blocks, and how deep its floor sits.
-
-        R_abs is sized from the element's weights and from the rate ceiling 1/t_abs of every
-        SOURCE population (equations.abs_refractory_floor). A population without a window
-        gets R_abs = 0, never read; one with a window that is excited by a population without
-        one has no finite floor, because nothing caps the drive it receives, and is refused. """
-        on = self.t_abs > 0
-        self.n_abs = eq.n_abs_bins(self.t_abs, self.dt)
-        if not bool(on.any()):
-            self.R_abs = torch.zeros_like(self.theta)
-            return
-        # beta = 0 is refused by the floor, but only matters where there is a window to floor
-        floor = eq.abs_refractory_floor(self.w, self.E, self.theta,
-                                        torch.where(on, self.beta, 1.0), r_max=1.0 / self.t_abs)
-        if not bool(torch.isfinite(floor[on]).all()):
-            raise ValueError("A population with a dead time (t_abs > 0) is excited by one "
-                             "without (t_abs = 0): the source's rate has no ceiling, so no "
-                             "finite floor bounds the drive. Give the source a window too, or "
-                             "set the target's t_abs to 0.")
-        self.R_abs = torch.where(on, floor, 0.0)
 
     @property
     def batch_shape(self) -> tuple[int, ...]:
@@ -264,7 +248,7 @@ class RDMNetwork:
 
     # every tensor with the batch axis leading: what select() slices
     _PER_SYSTEM = ("w", "E", "beta", "theta", "tau_int", "tau_ref", "K_ref", "alpha_int",
-                   "t_abs", "n_abs", "R_abs", "R", "p", "S", "m")
+                   "t_abs", "n_abs", "R", "blocked", "p", "S", "m")
 
     def select(self, b: int) -> RDMNetwork:
         """ Batch element b as a standalone single system (no leading axis).
@@ -364,20 +348,23 @@ class RDMNetwork:
         """ The firing rate lambda(h) the hazard represents, in 1/ms, (*b, M, Q).
         Bounded by nu0 for "bernoulli", unbounded and exponential for "poisson" /
         "poisson_exact", which share it exactly. """
-        return eq.per_population(hzd.HAZARDS[self.hazard].rate, self.field(), self.beta,
-                                 self.nu0, self.dt)
+        return self._per_age(hzd.HAZARDS[self.hazard].rate, self.field())
 
     @torch.inference_mode()
     def firing_prob(self) -> torch.Tensor:
         """ Per-bin hazard Phi, (*b, M, Q). """
-        return eq.per_population(hzd.HAZARDS[self.hazard].phi, self.field(), self.beta,
-                                 self.nu0, self.dt)
+        return self._per_age(hzd.HAZARDS[self.hazard].phi, self.field())
 
     @torch.inference_mode()
     def d_firing_prob(self) -> torch.Tensor:
         """ dPhi/dh at the current state, (*b, M, Q). Needed by the tangent map. """
-        return eq.per_population(hzd.HAZARDS[self.hazard].dphi, self.field(), self.beta,
-                                 self.nu0, self.dt)
+        return self._per_age(hzd.HAZARDS[self.hazard].dphi, self.field())
+
+    def _per_age(self, fn: Callable[..., torch.Tensor], h: torch.Tensor) -> torch.Tensor:
+        """ A hazard function (phi, dphi or rate) on the field (*b, M, Q), exactly 0 on the
+        blocked bins of the absolute window. """
+        return eq.per_population(fn, h, self.beta, self.nu0, self.dt).masked_fill(self.blocked,
+                                                                                  0.0)
 
     @torch.inference_mode()
     def stationary_rate(self) -> torch.Tensor:
@@ -394,7 +381,7 @@ class RDMNetwork:
     # ~~~~~~~~~~~~
 
     def _fp_args(self) -> tuple:
-        return (self.w, self.E, self.alpha_int, self.beta, self.theta, self.R,
+        return (self.w, self.E, self.alpha_int, self.beta, self.theta, self.R, self.blocked,
                 hzd.HAZARDS[self.hazard], self.nu0, self.dt)
 
     def fp_residual(self, m: torch.Tensor) -> torch.Tensor:
@@ -480,7 +467,7 @@ class RDMNetwork:
 
         def rep(t): return t.reshape((B,) + t.shape[len(lead):]).repeat_interleave(K, dim=0)
         params = (rep(self.w), rep(self.E), rep(self.alpha_int), rep(self.beta),
-                  rep(self.theta), rep(self.R))
+                  rep(self.theta), rep(self.R), rep(self.blocked))
         m0 = guesses.repeat(B, 1)                                    # (B*K, M)
 
         m = fpts.newton_iterate(self._fp_residual_one, m0, params, tol=tol, **kwargs)
@@ -508,8 +495,7 @@ class RDMNetwork:
         carried in the state, so the map has no spurious zero mode from a redundant variable. """
         p, S = self.unflatten_state(x)
         I = eq.total_input(p[..., 0], self.w, self.E, self.dt)
-        fprobs = eq.per_population(hzd.HAZARDS[self.hazard].phi, eq.field(S, self.R, self.theta),
-                                   self.beta, self.nu0, self.dt)
+        fprobs = self._per_age(hzd.HAZARDS[self.hazard].phi, eq.field(S, self.R, self.theta))
         _, p_new, S_new = eq.advance(p, S, I, fprobs, self.alpha_int)
         return self.flatten_state(p_new, S_new)
 
@@ -652,7 +638,7 @@ class RDMNetwork:
         """ The entropy_trajectory loop, for any observer (init, step) with epr_step's feed:
         init(p_t, S_t, I_window, *params, inplace) -> state, and
         step(state, S_live, I_new, *params, inplace) -> (state, sigma, H_fwd, H_rev), where
-        params is (R, alpha, beta, theta, hazard, nu0, dt) with the population axis leading the
+        params is (R, blocked, alpha, beta, theta, hazard, nu0, dt) with the population axis leading the
         age axis, and state is a tuple whose first two entries are the lagged marginal p_t and
         synaptic term S_t. """
         M, Q, lead = self.M, self.Q, self.batch_shape
@@ -663,7 +649,7 @@ class RDMNetwork:
         p0, S0 = self.p.clone(), self.S.clone()
         I_hist = []                                 # I_0 .. I_{Q-2}: init only
         state = None
-        prm = (self.R, self.alpha_int[..., None], self.beta[..., None], self.theta[..., None],
+        prm = (self.R, self.blocked, self.alpha_int[..., None], self.beta[..., None], self.theta[..., None],
                hzd.HAZARDS[self.hazard], self.nu0, self.dt)
 
         # Model time tau runs T + Q - 1 steps. The observer lags it by Q - 1, so at tau it

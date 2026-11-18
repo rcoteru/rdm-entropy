@@ -139,17 +139,21 @@ def _two_populations(t_abs, w):
 
 
 def test_each_population_has_its_own_dead_time():
-    """ The window floors exactly n_abs bins of each population's own kernel; a population
+    """ The window masks exactly n_abs bins of each population's own hazard; a population
     with t_abs = 0 has none. """
     net = _two_populations([2.0, 0.0], [[0.5, -1.0], [1.0, -1.0]])
     assert net.n_abs.tolist() == [7, 0]
-    assert bool((net.R[0, :7] == -net.R_abs[0]).all()) and net.R[0, 7] == -net.K_ref[0]
+    assert net.blocked[0].tolist() == [True] * 7 + [False] * 53 and not net.blocked[1].any()
+    assert net.R[0, 7] == -net.K_ref[0]
     assert torch.equal(net.R[1], -net.K_ref[1] * torch.exp(-((torch.arange(60) + 1) * 0.25) / 3.0))
     net.forward(200)
 
 
-def test_a_floor_needs_every_exciting_source_to_have_a_ceiling():
-    """ The floor bounds the drive by each source's 1/t_abs; an exciting source with no dead
-    time has no such bound, so the window above it cannot be sized and is refused. """
-    with pytest.raises(ValueError, match="no ceiling"):
-        _two_populations([1.0, 0.0], [[0.5, 1.0], [1.0, -1.0]])
+def test_a_window_above_an_unbounded_source_is_allowed():
+    """ The window is a mask, so it needs no bound on the drive: a windowed population excited
+    by one with no dead time is a valid model (with Q given, since the age window does need
+    the source's 1/t_abs ceiling). """
+    net = _two_populations([1.0, 0.0], [[0.5, 1.0], [1.0, -1.0]])
+    net.forward(200)
+    assert bool(torch.isfinite(net.rates()).all())
+    assert bool((net.firing_prob()[0, :3] == 0).all())

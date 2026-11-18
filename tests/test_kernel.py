@@ -15,14 +15,13 @@ DTS = [1.0, 0.5, 0.25, 0.2, 0.125, 0.1, 0.05]
 
 
 def _kernel(dt, K=K, tau=TAU, t_abs=T_ABS):
-    return eq.refractory_kernel(int(20 / dt), K, tau, dt=dt, t_abs=t_abs, R_abs=100.0)
+    return eq.refractory_kernel(int(20 / dt), K, tau, dt=dt, t_abs=t_abs)
 
 
 @pytest.mark.parametrize("dt", DTS)
 def test_first_eligible_bin_is_minus_K(dt):
     R = _kernel(dt)
     n_abs = eq.n_abs_bins(T_ABS, dt)
-    assert bool((R[:n_abs] == -100.0).all())
     assert R[n_abs].item() == -K
 
 
@@ -39,7 +38,7 @@ def test_no_relative_term_is_pure_dead_time(K_ref, tau_ref):
     dt = 0.25
     R = _kernel(dt, K=K_ref, tau=tau_ref)
     n_abs = eq.n_abs_bins(T_ABS, dt)
-    assert bool((R[:n_abs] == -100.0).all()) and bool((R[n_abs:] == 0.0).all())
+    assert bool((R[n_abs:] == 0.0).all())
 
     one = torch.tensor([1.0])
     tail = eq.field_tail(5.0, K_ref * one, tau_ref * one, T_ABS * one, 6.0 * one, 1.0 * one)
@@ -62,4 +61,4 @@ def test_no_relative_term_is_pure_dead_time(K_ref, tau_ref):
     for _ in range(400):
         sm.update()
         assert bool(torch.isfinite(sm.R).all())
-        assert bool((sm.R_eff(sm.R, sm.n)[sm.n >= sm.n_abs] == 0.0).all())
+        assert bool((sm.R[~sm.blocked(sm.n)] == 0.0).all())

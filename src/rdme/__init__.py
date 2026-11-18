@@ -35,8 +35,9 @@ The continuum equations are the transport pair
     d_t q^a + d_u q^a = -lambda(h^a(u,t)) q^a(u,t),      q^a(0,t) = r^a(t),
     d_t S^a + d_u S^a = (I^a(t) - S^a(u,t)) / tau_int^a, S^a(0,t) = 0,
 
-with R^a(u) = -K^a exp(-(u - t_abs^a)/tau_ref^a) after the dead time and -R_abs during it
-(Gerstner's SRM_0 kernel, so K^a is the amplitude when the window ends), the input
+with R^a(u) = -K^a exp(-(u - t_abs^a)/tau_ref^a) after the dead time and -infinity during it
+(Gerstner's SRM_0 kernel, so K^a is the amplitude when the window ends; the -infinity is
+applied as an exact mask, lambda = 0 on u < t_abs^a, not as a field value), the input
 I^a(t) = sum_b w^{ab} r^b(t) + E^a, and the closure r^a(t) = int lambda(h^a(u,t)) q^a(u,t) du.
 
 Scheme. Age and time are advanced together on a single grid, du = dt, so cohorts move along

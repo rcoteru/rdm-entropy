@@ -363,22 +363,27 @@ class Hazard(NamedTuple):
     log1m_phi:  Callable[..., torch.Tensor]
     step_cap: Callable[[float], float | None]
 
-    def neg_log_prob(self, s, h, beta, nu0, dt, inplace: bool = False):
+    def neg_log_prob(self, s, h, beta, nu0, dt, inplace: bool = False, blocked=None):
         """ -ln p(s | h) for one Bernoulli spike, s in {0, 1}, broadcast over h.
 
         Selected with where() rather than weighted as -(s*lnPhi + (1-s)*ln(1-Phi)): a branch
         that is multiplied by zero may still be -inf, and 0 * -inf is nan, which is exactly the
         saturated-drive case this is wanted for.
 
+        `blocked` (bool, broadcast against h) marks the absolute refractory window, where the
+        branches take their exact values ln Phi = -inf and ln(1 - Phi) = 0 whatever h is: a
+        silent blocked neuron costs 0, and a spike from one is impossible and costs +inf.
+
         Both branches need h, so inplace can only be handed to the second one -- which is why
         this saves one buffer rather than the two the kernels manage on their own. """
         if inplace:
             lp = self.logphi(h, beta, nu0, dt)
             l1 = self.log1m_phi(h, beta, nu0, dt, inplace=True)
-            return torch.where(s > 0, lp, l1).neg_()
-        return -torch.where(s > 0,
-                            self.logphi(h, beta, nu0, dt),
-                            self.log1m_phi(h, beta, nu0, dt))
+        else:
+            lp, l1 = self.logphi(h, beta, nu0, dt), self.log1m_phi(h, beta, nu0, dt)
+        if blocked is not None:
+            lp, l1 = lp.masked_fill_(blocked, -math.inf), l1.masked_fill_(blocked, 0.0)
+        return torch.where(s > 0, lp, l1).neg_()
 
 
 # The step caps, as functions of nu0. Each returns the largest admissible dt, or None.
