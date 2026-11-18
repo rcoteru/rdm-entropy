@@ -59,6 +59,28 @@ def cycle_amplitude_ratio(x: torch.Tensor) -> float:
     return float((last.max() - last.min()) / (first.max() - first.min()))
 
 
+def phase_profile(x: torch.Tensor, r: torch.Tensor, n_bins: int) -> torch.Tensor:
+    """ Mean of `x` against the phase of `r`, (n_bins,), over every whole cycle of r.
+
+    Phase 0 is an upward crossing of r's mean, located between steps by linear interpolation,
+    and each cycle is rescaled to [0, 1) by its own length -- so traces at different dt, whose
+    periods differ slightly, land on one axis. Bin k holds phases [k, k+1)/n_bins; a bin no
+    sample falls in is nan. For diagnosis: a per-step quantity's profile, not a reported
+    number. """
+    y  = (r - r.mean()).double()
+    up = _up_crossings(r)
+    if len(up) < 2:
+        raise ValueError("phase_profile needs at least one whole cycle of r")
+    tc = up.double() + (-y[up]) / (y[up + 1] - y[up])     # crossing times, in steps
+    i  = torch.arange(int(up[0]) + 1, int(up[-1]) + 1)    # samples inside whole cycles
+    k  = torch.searchsorted(tc, i.double(), right=True) - 1
+    ph = (i.double() - tc[k]) / (tc[k + 1] - tc[k])
+    b  = (ph * n_bins).long().clamp(max=n_bins - 1)
+    s  = torch.zeros(n_bins, dtype=torch.float64).index_add_(0, b, x[i].double())
+    c  = torch.zeros(n_bins, dtype=torch.float64).index_add_(0, b, torch.ones_like(ph))
+    return s / c
+
+
 # Standard outputs
 # ~~~~~~~~~~~~~~~~
 

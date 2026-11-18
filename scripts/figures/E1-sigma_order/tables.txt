@@ -1,0 +1,57 @@
+e1_sigma_order.py; mean field only; poisson_exact; silent start; T_equi 5000 ms, T_meas 3000 ms; averages over whole cycles (analysis.cycle_window on r)
+
+=== E1-15-onset   cycles [43, 43, 43]  amp ratio [1.0, 1.0, 1.0]  max|H_rev - H_fwd - sigma| 9.95e-14 nats/s
+  sigma (nats/s)  dt=0.2 3.28253  0.1 4.03302  0.05 4.45792
+  r_mean (Hz)     dt=0.2 19.4683  0.1 19.2186  0.05 19.0951
+  period (ms)     dt=0.2 68.7721  0.1 68.8977  0.05 68.9558
+  p[sigma] = 0.821    (diffs -0.7505, -0.4249)
+  p[r_mean] = 1.015    (diffs +0.2497, +0.1235)
+  p[period] = 1.111    (diffs -0.1256, -0.05814)
+  Richardson (0.1, 0.05): observed p 5.01241   p=1 4.88282   p=2 4.59955
+  H 0.2->0.1: dH_fwd +11.236  dH_rev +11.986  r_mean ln2 13.321 (r_mean at 0.1)  remainders fwd -2.0857  rev -1.3352   (H_fwd 103.11 -> 114.35)
+  H 0.1->0.05: dH_fwd +12.064  dH_rev +12.489  r_mean ln2 13.236 (r_mean at 0.05)  remainders fwd -1.1713  rev -0.74636   (H_fwd 114.35 -> 126.41)
+  phase-binned sigma change 0.1->0.05 +0.42488 nats/s (period-avg diff +0.4249); in burst (r_0.05 > mean): 1.3506  [burst from r_0.1: 1.2884]  burst phase width 0.300
+=== E1-30-onset   cycles [129, 129, 128]  amp ratio [1.0, 1.0001, 1.0]  max|H_rev - H_fwd - sigma| 1.56e-13 nats/s
+  sigma (nats/s)  dt=0.2 0.53024  0.1 1.08928  0.05 1.441
+  r_mean (Hz)     dt=0.2 46.5046  0.1 46.239  0.05 46.1006
+  period (ms)     dt=0.2 23.1054  0.1 23.1248  0.05 23.1363
+  p[sigma] = 0.669    (diffs -0.559, -0.3517)
+  p[r_mean] = 0.941    (diffs +0.2656, +0.1383)
+  p[period] = 0.750    (diffs -0.01938, -0.01152)
+  Richardson (0.1, 0.05): observed p 2.0377   p=1 1.79272   p=2 1.55824
+  H 0.2->0.1: dH_fwd +29.866  dH_rev +30.426  r_mean ln2 32.05 (r_mean at 0.1)  remainders fwd -2.1839  rev -1.6249   (H_fwd 185.51 -> 215.37)
+  H 0.1->0.05: dH_fwd +30.646  dH_rev +30.998  r_mean ln2 31.955 (r_mean at 0.05)  remainders fwd -1.3081  rev -0.95641   (H_fwd 215.37 -> 246.02)
+  phase-binned sigma change 0.1->0.05 +0.35219 nats/s (period-avg diff +0.35172); in burst (r_0.05 > mean): 3.4141  [burst from r_0.1: 3.3689]  burst phase width 0.380
+=== E1-15-strong   cycles [50, 51, 52]  amp ratio [1.0678, 1.0101, 1.0843]  max|H_rev - H_fwd - sigma| 2.91e-11 nats/s
+  sigma (nats/s)  dt=0.2 1708.91  0.1 2377.5  0.05 2809.89
+  r_mean (Hz)     dt=0.2 20.7336  0.1 20.5044  0.05 20.4132
+  period (ms)     dt=0.2 58.028  0.1 57.7843  0.05 57.5942
+  p[sigma] = 0.629    (diffs -668.6, -432.4)
+  p[r_mean] = 1.329    (diffs +0.2291, +0.09118)
+  p[period] = 0.358  out of range  (diffs +0.2437, +0.1901)
+  Richardson (0.1, 0.05): observed p 3601.47   p=1 3242.29   p=2 2954.02
+  H 0.2->0.1: dH_fwd +7.2692  dH_rev +675.86  r_mean ln2 14.213 (r_mean at 0.1)  remainders fwd -6.9434  rev +661.65   (H_fwd 66.669 -> 73.938)
+  H 0.1->0.05: dH_fwd +8.3559  dH_rev +440.75  r_mean ln2 14.149 (r_mean at 0.05)  remainders fwd -5.7934  rev +426.6   (H_fwd 73.938 -> 82.294)
+  phase-binned sigma change 0.1->0.05 +431.51 nats/s (period-avg diff +432.39); in burst (r_0.05 > mean): 1.0027  [burst from r_0.1: 1.0003]  burst phase width 0.102
+=== E1-30-strong   cycles [133, 134, 133]  amp ratio [1.0028, 0.9985, 0.9991]  max|H_rev - H_fwd - sigma| 1.36e-12 nats/s
+  sigma (nats/s)  dt=0.2 113.996  0.1 147.733  0.05 164.776
+  r_mean (Hz)     dt=0.2 47.8032  0.1 47.3428  0.05 47.182
+  period (ms)     dt=0.2 22.391  0.1 22.3537  0.05 22.3068
+  p[sigma] = 0.985    (diffs -33.74, -17.04)
+  p[r_mean] = 1.518    (diffs +0.4604, +0.1608)
+  p[period] = -0.334  out of range  (diffs +0.03725, +0.04696)
+  Richardson (0.1, 0.05): observed p 182.176   p=1 181.82   p=2 170.457
+  H 0.2->0.1: dH_fwd +23.008  dH_rev +56.745  r_mean ln2 32.816 (r_mean at 0.1)  remainders fwd -9.8074  rev +23.93   (H_fwd 151.74 -> 174.75)
+  H 0.1->0.05: dH_fwd +25.828  dH_rev +42.872  r_mean ln2 32.704 (r_mean at 0.05)  remainders fwd -6.8757  rev +10.168   (H_fwd 174.75 -> 200.58)
+  phase-binned sigma change 0.1->0.05 +17.049 nats/s (period-avg diff +17.043); in burst (r_0.05 > mean): 1.3292  [burst from r_0.1: 0.7782]  burst phase width 0.152
+=== E30-1.25JH   cycles [131, 130, 130]  amp ratio [1.0005, 1.0003, 1.0]  max|H_rev - H_fwd - sigma| 2.05e-13 nats/s
+  sigma (nats/s)  dt=0.2 3.38502  0.1 5.2326  0.05 6.34279
+  r_mean (Hz)     dt=0.2 47.1508  0.1 46.7356  0.05 46.5272
+  period (ms)     dt=0.2 22.8489  0.1 22.9062  0.05 22.9304
+  p[sigma] = 0.735    (diffs -1.848, -1.11)
+  p[r_mean] = 0.995    (diffs +0.4153, +0.2084)
+  p[period] = 1.242    (diffs -0.0573, -0.02423)
+  Richardson (0.1, 0.05): observed p 8.0143   p=1 7.45299   p=2 6.71286
+  H 0.2->0.1: dH_fwd +28.715  dH_rev +30.563  r_mean ln2 32.395 (r_mean at 0.1)  remainders fwd -3.6793  rev -1.8317   (H_fwd 181.81 -> 210.53)
+  H 0.1->0.05: dH_fwd +30.04  dH_rev +31.15  r_mean ln2 32.25 (r_mean at 0.05)  remainders fwd -2.2102  rev -1.1   (H_fwd 210.53 -> 240.57)
+  phase-binned sigma change 0.1->0.05 +1.1105 nats/s (period-avg diff +1.1102); in burst (r_0.05 > mean): 2.1713  [burst from r_0.1: 1.8751]  burst phase width 0.305

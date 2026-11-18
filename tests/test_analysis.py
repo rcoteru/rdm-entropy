@@ -63,3 +63,27 @@ def test_without_cycles_no_state():
     o = an.rate_and_epr(_traj(_sine(0.0)), DT, 4.0)
     assert (o["state"], o["n_cycles"], o["amp_ratio"]) == (None, None, None)
     assert o["dead_frac"] == pytest.approx(o["r_mean"] * 4.0 * 1e-3)
+
+
+@pytest.mark.parametrize("dt", [0.2, 0.1, 0.05])
+def test_phase_profile_recovers_the_waveform(dt):
+    """ A rate with a known period and a second signal locked to it: the profile is that
+    signal's shape at each phase, whatever the step -- crossings interpolated between steps,
+    so a period that is not a whole number of steps does not smear it. """
+    period, n_bins = 22.37, 50
+    t = torch.arange(int(T / dt), dtype=torch.float64) * dt + 0.3   # not starting at a crossing
+    ph = (t / period) % 1.0
+    r = 40.0 + 10.0 * torch.sin(2 * math.pi * ph)
+    x = torch.cos(2 * math.pi * ph) ** 2
+    prof = an.phase_profile(x, r, n_bins)
+    centre = (torch.arange(n_bins, dtype=torch.float64) + 0.5) / n_bins
+    expect = torch.cos(2 * math.pi * centre) ** 2
+    assert not prof.isnan().any()
+    assert (prof - expect).abs().max() < 0.07                 # a bin is 1/50 of a period wide
+    assert float(prof.mean()) == pytest.approx(float(x.mean()), abs=5e-3)
+
+
+def test_phase_profile_needs_a_cycle():
+    r = torch.full((100,), 40.0, dtype=torch.float64)
+    with pytest.raises(ValueError):
+        an.phase_profile(r, r, 10)
