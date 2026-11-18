@@ -17,15 +17,24 @@ from rdme.spin_model import SpinIsingModel
 # ── Parameters ────────────────────────────────────────────────────────────────
 
 N       = 20000     # spins in the network model
-J       = 30.0      # recurrent coupling, physical units (not divided by dt)
-E       = 0.0       # external drive
-beta    = 6.0       # gain
-theta   = 0.5       # threshold
-nu0     = 1.0       # 1/ms, Poisson reference rate
-t_abs   = 1.0       # ms, absolute refractory period
-tau_int = 15.0      # ms, synaptic integration
-tau_ref = 20.0      # ms, relative refractory decay
-K_ref   = 15.0      # relative refractory amplitude
+
+# model points: J physical (not divided by dt), nu0 in 1/ms (Poisson reference rate),
+# t_abs / tau_int / tau_ref in ms (absolute window, synaptic integration, relative decay)
+POINTS = {
+    "default": dict(J=15.0, E=0.0, beta=6.0, theta=0.5, 
+                    tau_int=15.0, tau_ref=20.0, K_ref=15.0,
+                    nu0=1.0, t_abs=1.0),
+    # Schwalger, Deger & Gerstner 2017, Fig. 3: uncoupled LIF with exponential escape noise
+    # (c = 10 Hz, Delta_u = 2 mV, u_th = 15 mV, tau_m = 20 ms, t_ref = 4 ms); paper reports
+    # 6.6 Hz / CV 0.66 at E = 15 mV and 37 Hz / CV 0.2 at E = 30 mV
+    "fig3-E15": dict(J=0.0, E=15.0, beta=0.5, theta=15.0, 
+                    tau_int=20.0, tau_ref=1.0, K_ref=0.0,
+                    nu0=0.01, t_abs=4.0),
+    "fig3-E30": dict(J=0.0, E=30.0, beta=0.5, theta=15.0, 
+                    tau_int=20.0, tau_ref=1.0, K_ref=0.0,
+                    nu0=0.01, t_abs=4.0),
+}
+POINT = POINTS["default"]  # choose one of the above points
 
 hazard  = "poisson_exact"   # "poisson_exact" | "poisson" | "bernoulli"
 IC      = "silent"          # "silent" | "random", the same start for both models
@@ -48,8 +57,7 @@ overwrite = False   # the hash covers every parameter,
 
 # ── Paths, dicts & switches ──────────────────────────────────────────────────
 
-PARAMS: dict = dict(J=J, E=E, beta=beta, theta=theta, tau_int=tau_int, tau_ref=tau_ref, K_ref=K_ref,
-                      nu0=nu0, t_abs=t_abs, dt=dt, hazard=hazard)
+PARAMS: dict = dict(POINT, dt=dt, hazard=hazard)
 STEPS  = (hlp.n_steps(T_EQUI, dt, name="T_EQUI"), hlp.n_steps(T_MEAS, dt, name="T_MEAS"))
 
 TITLE = (f'hazard={hazard}  ·  dt={dt:g}  ·  ic={IC}  —  '
@@ -62,7 +70,7 @@ CACHE = hlp.cache_path(Path(__file__).stem,
                             ic=IC, age_max=AGE_MAX,
                             # only when on, so a default run still finds its existing cache
                             **({"spikes": True} if STORE_SPIKES else {})),
-                       tag=f"J{J:g}-{IC}", root=Path(__file__).parents[1] / "cache")
+                       tag=f"J{POINT['J']:g}-{IC}", root=Path(__file__).parents[1] / "cache")
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -142,8 +150,8 @@ if run_plot:
                   suptitle='Entropy trajectories')
 
     if True:  # standard outputs: rate and EPR in physical units
-        out = {"Spin Model": an.rate_and_epr(sm_traj2, dt, t_abs),
-               "Mean Field": an.rate_and_epr(mf_traj2, dt, t_abs, cycles=True)}
+        out = {"Spin Model": an.rate_and_epr(sm_traj2, dt, POINT["t_abs"]),
+               "Mean Field": an.rate_and_epr(mf_traj2, dt, POINT["t_abs"], cycles=True)}
 
         fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(12, 6))
         fig.suptitle(TITLE, fontsize=9)
