@@ -16,7 +16,7 @@ def _run(global_dtype):
            "tangent": wc.init_tangent(2, generator=torch.Generator().manual_seed(0))}
     out |= {f"wc.{k}": v for k, v in wc.entropy_trajectory(30, pb=False).items()}
     pts = RDMWilsonCowanPoints(**{**WC, "w_EE": [1.5, 2.5]}, dt=0.2, hazard="poisson_exact")
-    out["points.r"] = pts.trajectory(30)["r"]
+    out["points.m"] = pts.trajectory(30)["m"]
     ising = RDMIsingModelBatch([1.2375, 17.0], 0.0, 6.0, 0.5, 15.0, 15.0, 15.0,
                                dt=0.5, hazard="poisson_exact")
     out["ising.sigma"] = ising.entropy_trajectory(30, pb=False)["sigma"]

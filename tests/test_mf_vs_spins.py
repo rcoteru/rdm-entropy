@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import conftest
-import rdme.helpers as hlp
+import rdme.analysis as an
 from rdme.mean_field import RDMIsingModel
 from rdme.spin_model import SpinIsingModel
 
@@ -66,8 +66,8 @@ def _mf(J, ms):
     mf = RDMIsingModel(J, **S1)
     mf.forward(int(4000 / DT))
     t = mf.entropy_trajectory(int(ms / DT), pb=False)
-    a, b, _ = hlp.cycle_window(t["r_tot"])
-    return float(t["r_tot"][a:b].mean()), float(t["sigma_tot"][a:b].mean()) / DT
+    o = an.rate_and_epr(t, DT, S1["t_abs"], cycles=True)
+    return o["r_mean"] * 1e-3, o["sigma_mean"] * 1e-3          # Hz, nats/s -> per ms
 
 
 @pytest.mark.slow

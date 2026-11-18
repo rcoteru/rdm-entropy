@@ -1,6 +1,7 @@
-""" Is the solver step fine enough: dt, extrapolated to its dt -> 0 limit. The age grid needs
-no check of this kind -- equations.age_window sizes it from a bound -- but every reported
-number has to come with this one. """
+""" From a trajectory to a reported number: the window it is averaged over, the units it is
+reported in, and whether the solver step resolves it -- dt, extrapolated to its dt -> 0 limit.
+The age grid needs no check of this kind -- equations.age_window sizes it from a bound -- but
+every reported number has to come with this one. """
 
 from __future__ import annotations
 
@@ -11,6 +12,66 @@ import numpy as np
 import torch
 
 import rdme.helpers as hlp
+
+# Cycle windows
+# ~~~~~~~~~~~~~
+
+def cycle_window(x: torch.Tensor, rel_tol: float = 1e-9) -> tuple[int, int, int]:
+    """ (start, stop, n_cycles) spanning a whole number of periods of `x`.
+
+    For averaging a periodic signal: a window that is not a whole number of periods leaves a
+    phase error of order amplitude/n_periods, which on a burst whose amplitude is several times
+    its mean is larger than most things worth measuring. Delimited by upward crossings of the
+    mean rather than by peaks -- a crossing of a smooth signal is located to within one step,
+    while the peak of a flat-topped burst is not.
+
+    A settled state has no crossings to find and returns the whole window with n_cycles = 0,
+    which is the honest answer: there are no cycles to align to and none are needed. So is a
+    NOISY signal's answer meaningful only when the oscillation is deterministic -- a finite-N
+    trajectory crosses its mean many times per period, and this will happily report those as
+    cycles. Use it on the mean field, and a plain long average on the samples.
+
+    `rel_tol` is the peak-to-peak, relative to the mean, below which the signal counts as
+    settled. """
+    if float(x.max() - x.min()) < rel_tol * float(x.mean().abs()):
+        return 0, len(x), 0
+    y  = x - x.mean()
+    up = ((y[:-1] <= 0) & (y[1:] > 0)).nonzero().flatten()
+    if len(up) < 2:
+        return 0, len(x), 0
+    return int(up[0]), int(up[-1]), len(up) - 1
+
+
+# Standard outputs
+# ~~~~~~~~~~~~~~~~
+
+def rate_and_epr(traj: dict, dt: float, t_abs: float, *, cycles: bool = False) -> dict:
+    """ Rate and entropy production of one trajectory, in physical units.
+
+    `traj` is an entropy_trajectory dict: m_tot is the fraction of neurons spiking per bin,
+    sigma_tot the entropy production in nats per neuron per bin. `dt` and `t_abs` are in ms.
+    The average runs over the whole trajectory, or with `cycles` over a whole number of
+    periods of r (cycle_window): for the mean field only, since on a finite-N trace it counts
+    noise crossings as cycles.
+
+    Returns
+      r, sigma           traces: Hz, nats per neuron per s
+      r_mean, r_max      over the averaging window, Hz
+      sigma_mean         nats per neuron per s; the EPR
+      sigma_per_spike    sigma_mean / r_mean, nats per spike; nan at r_mean = 0
+      dead_frac          r_max * t_abs, dimensionless: how close the peak rate comes to the
+                         dead-time ceiling 1/t_abs; on a finite-N trace r_max is a single noisy
+                         bin, so this overstates it
+      n_cycles           periods averaged over (0 if settled); None without `cycles` """
+    r     = traj["m_tot"] / dt * 1e3        # spikes per neuron per s
+    sigma = traj["sigma_tot"] / dt * 1e3    # nats per neuron per s
+    a, b, n = cycle_window(r) if cycles else (0, len(r), None)
+    r_mean, sigma_mean = r[a:b].mean().item(), sigma[a:b].mean().item()
+    r_max = r[a:b].max().item()
+    return dict(r=r, sigma=sigma, r_mean=r_mean, r_max=r_max, sigma_mean=sigma_mean,
+                sigma_per_spike=sigma_mean / r_mean if r_mean > 0 else float("nan"),
+                dead_frac=r_max * t_abs * 1e-3, n_cycles=n)
+
 
 # The dt -> 0 limit
 # ~~~~~~~~~~~~~~~~~

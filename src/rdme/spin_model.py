@@ -361,8 +361,8 @@ class SpinModel:
                    Q: int | None = None, pb: bool = True) -> dict[str, torch.Tensor]:
         """Run for T steps, returning only the requested quantities.
 
-        Always returns "m"/"r" (*b, T, M), the per-population activity and rate, and
-        "m_tot"/"r_tot" (*b, T) their network aggregates -- the keys RDMNetwork.trajectory
+        Always returns "m" (*b, T, M), the per-population activity per bin, and
+        "m_tot" (*b, T) its network aggregate -- the keys RDMNetwork.trajectory
         uses. The leading axes are none for one network and (B,) for a batch. Optional keys:
           s    — full spin state, shape (*b, T, N)
           pot  — membrane potential h = S + R, shape (*b, T, N)
@@ -384,7 +384,6 @@ class SpinModel:
             if pot: out["pot"][..., t, :] = self.field()
             if fdist: out["fdist"][..., t, :, :] = self.fdist(Q)
             self.update()
-        out["r"], out["r_tot"] = out["m"] / self.dt, out["m_tot"] / self.dt
         return {k: v.cpu() for k, v in out.items()}
     
     @torch.inference_mode()
@@ -443,8 +442,8 @@ class SpinModel:
         costs (chunk + lookahead)/chunk per step. store_dtype is what the chunked window
         stores the input in; every reduction accumulates in float64.
 
-        Returns the same dict contract as RDMNetwork.entropy_trajectory: m/r (*b, T, M)
-        per-population activity and rate and m_tot/r_tot (*b, T) their network aggregates;
+        Returns the same dict contract as RDMNetwork.entropy_trajectory: m (*b, T, M)
+        per-population activity per bin and m_tot (*b, T) its network aggregate;
         sigma/H_fwd/H_rev (*b, T, M) the per-population entropy-production decomposition
         (sigma = H_rev - H_fwd) and sigma_tot/H_fwd_tot/H_rev_tot (*b, T) the same
         quantities over the whole network. The leading axes are none for one network and
@@ -553,7 +552,6 @@ class SpinModel:
         nb = len(self.batch_shape)
         out = {k: v.movedim(0, nb) for k, v in out.items()}
         if P_fwd is not None: out["fdist"] = P_fwd[lo:hi].movedim(0, nb)
-        out["r"], out["r_tot"] = out["m"] / self.dt, out["m_tot"] / self.dt
 
         # rewind off the tail, so the live state matches reported index T -- the same
         # contract RDMNetwork.entropy_trajectory honours, and what makes a post-hoc
@@ -670,7 +668,6 @@ class SpinModel:
 
         out["sigma_tot"] = out["H_rev_tot"] - out["H_fwd_tot"]
         out["sigma"] = out["H_rev"] - out["H_fwd"]
-        out["r"], out["r_tot"] = out["m"] / self.dt, out["m_tot"] / self.dt
 
         # rewind off the lookahead, so the live state matches reported index T
         assert end_state is not None

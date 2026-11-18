@@ -587,30 +587,26 @@ class RDMNetwork:
 
     @torch.inference_mode()
     def trajectory(self, T: int,
-                   r_tot: bool = False,
                    q: bool = False,
                    S: bool = False,
                    pb: bool = True,
                    ) -> dict[str, torch.Tensor]:
-        """ Run for T steps. Always returns "r" and "m" (*grid, T, M), the rates in 1/ms and
-        the per-bin overlaps. Optional: r_tot (*grid, T) the N-weighted rate; q/S, each
-        (*grid, T, M, Q). The leading axes are none for one system, (B,) for
+        """ Run for T steps. Always returns "m" (*grid, T, M), the per-bin overlaps, and
+        "m_tot" (*grid, T) their N-weighted aggregate; divide by dt for the rate in 1/ms.
+        Optional: q/S, each (*grid, T, M, Q). The leading axes are none for one system, (B,) for
         a batch, the grid axes for a batch built from a grid. CPU float64 tensors when the
         model runs on CPU or CUDA. Time axis is in steps; multiply by dt for ms. """
         ok, lead = self._out_device_kwargs(), self.batch_shape
-        out: dict = {"r": torch.zeros(lead + (T, self.M), **ok),
-                     "m": torch.zeros(lead + (T, self.M), **ok)}
-        if r_tot: out["r_tot"] = torch.zeros(lead + (T,), **ok)
+        out: dict = {"m": torch.zeros(lead + (T, self.M), **ok)}
         if q: out["q"] = torch.zeros(lead + (T, self.M, self.Q), **ok)
         if S: out["S"] = torch.zeros(lead + (T, self.M, self.Q), **ok)
 
         for t in tqdm.tqdm(range(T), disable=not pb):
-            out["r"][..., t, :].copy_(self.rates(), non_blocking=True)
             out["m"][..., t, :].copy_(self.m, non_blocking=True)
-            if r_tot: out["r_tot"][..., t].copy_(self.activity(), non_blocking=True)
             if q: out["q"][..., t, :, :].copy_(self.p / self.dt, non_blocking=True)
             if S: out["S"][..., t, :, :].copy_(self.S, non_blocking=True)
             self.update()
+        out["m_tot"] = (out["m"] * self.N_ratios.to(ok["device"])).sum(dim=-1)
         return self._unflatten_out(out)
 
     @torch.inference_mode()
@@ -633,7 +629,7 @@ class RDMNetwork:
         `inplace` lets the hazard and survival chains in rdme.epr reuse their own temporaries;
         bit for bit with the out-of-place oracle (inplace=False), and ~10% faster at large Q.
 
-        Returns r/m (*grid, T, M), r_tot/m_tot (*grid, T); sigma/H_fwd/H_rev (*grid, T, M) and
+        Returns m (*grid, T, M), m_tot (*grid, T); sigma/H_fwd/H_rev (*grid, T, M) and
         their N-weighted aggregates. sigma is per bin; divide by dt for the rate, the only one
         of the three with a continuum limit (see the rdme package docstring). """
         observers = {"sliding": (epr.init_epr_state, epr.epr_step),
@@ -652,7 +648,7 @@ class RDMNetwork:
         M, Q, lead = self.M, self.Q, self.batch_shape
         ok = self._out_device_kwargs()
 
-        out = {k: torch.zeros(lead + (T, M), **ok) for k in ("r", "m", "sigma", "H_fwd", "H_rev")}
+        out = {k: torch.zeros(lead + (T, M), **ok) for k in ("m", "sigma", "H_fwd", "H_rev")}
 
         p0, S0 = self.p.clone(), self.S.clone()
         I_hist = []                                 # I_0 .. I_{Q-2}: init only
@@ -682,9 +678,7 @@ class RDMNetwork:
             self.update()
 
         N_ratios = self.N_ratios.to(ok["device"])
-        out["r"] = out["m"] / self.dt
         out["m_tot"] = (out["m"] * N_ratios).sum(dim=-1)
-        out["r_tot"] = out["m_tot"] / self.dt
 
         # rewind the live state to the last reported step, discarding the look-ahead
         assert state is not None

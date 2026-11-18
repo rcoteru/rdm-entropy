@@ -1,5 +1,5 @@
-""" Small utilities for the scripts -- run durations, cache naming, cycle windows, device
-memory -- rather than for the model. The file exists so that an array utility or a path rule does not
+""" Small utilities for the scripts -- run durations, cache naming, device memory --
+rather than for the model. The file exists so that an array utility or a path rule does not
 have to live in a physics module to be shared between scripts. """
 
 from __future__ import annotations
@@ -14,32 +14,6 @@ import torch
 def grab_closest_idxs(vector: torch.Tensor, values: Sequence[float]) -> list[int]:
     """ Indices of the entries of `vector` closest to each of `values`. """
     return [int(torch.argmin((vector - value).abs())) for value in values]
-
-
-def cycle_window(x: torch.Tensor, rel_tol: float = 1e-9) -> tuple[int, int, int]:
-    """ (start, stop, n_cycles) spanning a whole number of periods of `x`.
-
-    For averaging a periodic signal: a window that is not a whole number of periods leaves a
-    phase error of order amplitude/n_periods, which on a burst whose amplitude is several times
-    its mean is larger than most things worth measuring. Delimited by upward crossings of the
-    mean rather than by peaks -- a crossing of a smooth signal is located to within one step,
-    while the peak of a flat-topped burst is not.
-
-    A settled state has no crossings to find and returns the whole window with n_cycles = 0,
-    which is the honest answer: there are no cycles to align to and none are needed. So is a
-    NOISY signal's answer meaningful only when the oscillation is deterministic -- a finite-N
-    trajectory crosses its mean many times per period, and this will happily report those as
-    cycles. Use it on the mean field, and a plain long average on the samples.
-
-    `rel_tol` is the peak-to-peak, relative to the mean, below which the signal counts as
-    settled. """
-    if float(x.max() - x.min()) < rel_tol * float(x.mean().abs()):
-        return 0, len(x), 0
-    y  = x - x.mean()
-    up = ((y[:-1] <= 0) & (y[1:] > 0)).nonzero().flatten()
-    if len(up) < 2:
-        return 0, len(x), 0
-    return int(up[0]), int(up[-1]), len(up) - 1
 
 
 # Durations

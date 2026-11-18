@@ -27,10 +27,8 @@ from matplotlib.figure import Figure
 LABELS = {
     "m":         'Mean Activity',
     "m_tot":     'Mean Activity',
-    "r":         'Firing Rate (1/ms)',
-    "r_tot":     'Firing Rate (1/ms)',
-    "sigma":     'Entropy Production Rate (nats/ms)',
-    "sigma_tot": 'Entropy Production Rate (nats/ms)',
+    "sigma":     'Entropy Production (nats/neuron/bin)',
+    "sigma_tot": 'Entropy Production (nats/neuron/bin)',
     "H_fwd":     'Forward Entropy (nats)',
     "H_fwd_tot": 'Forward Entropy (nats)',
     "H_rev":     'Backward Entropy (nats)',
@@ -40,10 +38,8 @@ LABELS = {
 TITLES = {
     "m":         'Activity',
     "m_tot":     'Activity',
-    "r":         'Rate',
-    "r_tot":     'Rate',
-    "sigma":     'Entropy Production Rate',
-    "sigma_tot": 'Entropy Production Rate',
+    "sigma":     'Entropy Production',
+    "sigma_tot": 'Entropy Production',
     "H_fwd":     'Forward Entropy',
     "H_fwd_tot": 'Forward Entropy',
     "H_rev":     'Backward Entropy',
@@ -54,7 +50,7 @@ TITLES = {
 def _np(x) -> np.ndarray:
     """ Tensor or array to a plottable array, with a trailing singleton axis dropped.
 
-    The squeeze is not cosmetic: a single-population "m" or "r" is (T, 1), and plotting it
+    The squeeze is not cosmetic: a single-population "m" is (T, 1), and plotting it
     next to an aggregate (T,) series would otherwise need a different call. """
     if torch.is_tensor(x):
         x = x.detach().cpu().numpy()

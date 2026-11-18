@@ -83,7 +83,7 @@ def _free_run(x, dt, *, nu0=1.0, t_abs=1.0, tol=1e-4, eq_ms=80.0, rec_ms=40.0):
                         K_ref=0.0, dt=dt, nu0=nu0, t_abs=t_abs, hazard="poisson_exact",
                         tol=tol)
     net.forward(int(eq_ms / dt))
-    r = float(net.trajectory(int(rec_ms / dt), pb=False)["r"][:, 0].mean())
+    r = float(net.trajectory(int(rec_ms / dt), pb=False)["m"][:, 0].mean()) / dt
     return r, net.truncation_error()
 
 

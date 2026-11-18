@@ -7,6 +7,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
 
+import rdme.analysis as an
 import rdme.fixed_points as fpts
 import rdme.helpers as hlp
 import rdme.plots as rp
@@ -15,8 +16,8 @@ from rdme.spin_model import SpinIsingModel
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 
-N       = 50000     # spins in the network model
-J       = 15.0      # recurrent coupling, physical units (not divided by dt)
+N       = 20000     # spins in the network model
+J       = 30.0      # recurrent coupling, physical units (not divided by dt)
 E       = 0.0       # external drive
 beta    = 6.0       # gain
 theta   = 0.5       # threshold
@@ -36,29 +37,28 @@ TOL    = 1e-2      # truncation tolerance: sets the mean field's Q and the spin 
 DEVICE = 'cpu'     # 'cuda' if torch.cuda.is_available() else 'cpu'
 
 T_EQUI, T_MEAS = 5000.0, 2500.0   # ms: equilibration, then entropy recording
-SKIP_MS        = 10.0             # ms trimmed from each end of the recording before averaging
+
+run_sim   = True
+run_plot  = True
+overwrite = False   # the hash covers every parameter, 
+                    # so this is only for a change to the CODE
+
+
+# ── Paths, dicts & switches ──────────────────────────────────────────────────
 
 PARAMS: dict = dict(J=J, E=E, beta=beta, theta=theta, tau_int=tau_int, tau_ref=tau_ref, K_ref=K_ref,
                       nu0=nu0, t_abs=t_abs, dt=dt, hazard=hazard)
 STEPS  = (hlp.n_steps(T_EQUI, dt, name="T_EQUI"), hlp.n_steps(T_MEAS, dt, name="T_MEAS"))
-SKIP   = hlp.n_steps(SKIP_MS, dt, name="SKIP_MS")
 
 TITLE = (f'hazard={hazard}  ·  dt={dt:g}  ·  ic={IC}  —  '
          + ',  '.join(f'{k}={PARAMS[k]:g}' for k in
                       ("J", "E", "beta", "theta", "tau_int", "tau_ref", "K_ref", "nu0", "t_abs")))
-
-
-# ── Paths & switches ──────────────────────────────────────────────────────────
 
 # the parameters name the file, so a changed parameter never reads a stale cache
 CACHE = hlp.cache_path(Path(__file__).stem,
                        dict(PARAMS, N=N, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL,
                             ic=IC, age_max=AGE_MAX),
                        tag=f"J{J:g}-{IC}", root=Path(__file__).parents[1] / "cache")
-
-run_sim   = True
-run_plot  = True
-overwrite = False  # the hash covers every parameter, so this is only for a change to the CODE
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -67,16 +67,19 @@ if run_sim and (overwrite or not CACHE.exists()):
 
     steps1, steps2 = STEPS
 
+    print("Initializing models.")
     sm = SpinIsingModel(N, **PARAMS, ic=IC, age_max=AGE_MAX, tol=TOL, device=DEVICE)
     mf = RDMIsingModel(**PARAMS, ic=IC, age_max=AGE_MAX, tol=TOL, device=DEVICE)
     roots = mf.fixed_points(method='bracket', n_grid=2001)
-    print(f"Q = {mf.Q} age bins. Running {T_EQUI + T_MEAS:g} ms of each model "
+    print(f"Running {T_EQUI + T_MEAS:g} ms of each model "
           f"({steps1 + steps2} steps at dt={dt:g}) on {DEVICE}.")
-
+    print(f"Q = {mf.Q} age bins.")
     t0 = time.time()
+    print("Running the mean field trajectories.")
     mf_traj1 = mf.trajectory(T=steps1)
     mf_traj2 = mf.entropy_trajectory(T=steps2)
     t1 = time.time()
+    print("Running the spin model trajectories.")
     sm_traj1 = sm.trajectory(T=steps1)
     sm_traj2 = sm.entropy_trajectory(T=steps2)
     t2 = time.time()
@@ -133,11 +136,27 @@ if run_plot:
                   ["m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot"], dt=dt,
                   suptitle='Entropy trajectories')
 
-        for name, traj in (("Spin Model", sm_traj2), ("Mean Field", mf_traj2)):
-            print(f"{name} (trimmed {SKIP_MS:g} ms each end): "
-                  f"<sigma> = {traj['sigma'][SKIP:-SKIP].mean():.8f} nats/bin, "
-                  f"<H_fwd> = {traj['H_fwd'][SKIP:-SKIP].mean():.8f}, "
-                  f"<H_rev> = {traj['H_rev'][SKIP:-SKIP].mean():.8f}")
+    if True:  # standard outputs: rate and EPR in physical units
+        out = {"Spin Model": an.rate_and_epr(sm_traj2, dt, t_abs),
+               "Mean Field": an.rate_and_epr(mf_traj2, dt, t_abs, cycles=True)}
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(12, 6))
+        fig.suptitle(TITLE, fontsize=9)
+        rp.curves({k: o["r"] for k, o in out.items()}, dt=dt, ax=ax1, ylabel='r (Hz)',
+                  title='Firing rate')
+        rp.curves({k: o["sigma"] for k, o in out.items()}, dt=dt, ax=ax2,
+                  ylabel='σ (nats / neuron / s)', title='Entropy production (spin model: '
+                  'sampled per step, unsmoothed)')
+        for ax in (ax1, ax2):
+            ax.grid()
+        fig.tight_layout()
+
+        print(f"\n{'model':<11} {'r (Hz)':>9} {'r_max':>9} {'σ (nats/s)':>12} "
+              f"{'σ/r (nats/spike)':>17} {'r_max·t_abs':>12} {'cycles':>7}")
+        for k, o in out.items():
+            print(f"{k:<11} {o['r_mean']:9.3f} {o['r_max']:9.3f} "
+                  f"{o['sigma_mean']:12.6g} {o['sigma_per_spike']:17.6g} {o['dead_frac']:12.4f} "
+                  f"{'n/a' if o['n_cycles'] is None else o['n_cycles']:>7}")
 
     if True:  # fixed-point objective G(m) = m - F(m)
         m_grid, G, roots, rho = d["m_grid"], d["G"], d["roots"], d["rho"]
