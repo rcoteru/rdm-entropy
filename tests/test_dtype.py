@@ -4,8 +4,7 @@ accumulators. """
 
 import torch
 
-import rdme.presets as pre
-from conftest import WC
+from conftest import S1, WC
 from rdme.mean_field import RDMIsingModelBatch, RDMWilsonCowan, RDMWilsonCowanPoints
 from rdme.spin_model import SpinIsingModel
 
@@ -35,10 +34,10 @@ def test_the_mean_field_ignores_the_global_default_dtype():
 def _spins(global_dtype):
     torch.set_default_dtype(global_dtype)
     torch.manual_seed(0)
-    sm = SpinIsingModel(500, 17.0, **pre.params("S1", hazard="poisson_exact", dt=0.5),
+    sm = SpinIsingModel(500, 17.0, **S1 | dict(hazard="poisson_exact", dt=0.5),
                         device="cpu", ic="random")
     sm.forward(100)
-    return sm.trajectory(100) | sm.entropy_trajectory_chunked(100, chunk=64, overlap=64)
+    return sm.trajectory(100) | sm.entropy_trajectory(100, chunk=64, lookahead=64)
 
 
 def test_the_spin_model_ignores_the_global_default_dtype():

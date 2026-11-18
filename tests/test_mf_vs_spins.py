@@ -2,19 +2,19 @@
 the dead time exactly; the spins' fluctuations vanish as 1/N about the mean field; and their
 entropy production converges onto the mean field's, zero at a fixed point and not on a cycle.
 
-S1 at dt = 0.25. The age grid is pinned at Q = 600: the preset's default (277 bins) truncates
+S1 at dt = 0.25. The age grid is pinned at Q = 600: the default (277 bins) truncates
 enough mass at both points to move the mean field's rate and sigma by percent. """
 
 import pytest
 import torch
 
+import conftest
 import rdme.helpers as hlp
-import rdme.presets as pre
 from rdme.mean_field import RDMIsingModel
 from rdme.spin_model import SpinIsingModel
 
 DT = 0.25
-S1 = pre.params("S1", hazard="poisson_exact", dt=DT)
+S1 = conftest.S1 | dict(hazard="poisson_exact", dt=DT)
 J_FP, J_CYC = 10.0, 17.0
 
 
@@ -92,7 +92,7 @@ def _spin_sigma(J, N, ms=4000.0, blocks=40):
     torch.manual_seed(0)
     sm = SpinIsingModel(N, J, **S1, device="cpu", ic="random")
     sm.forward(int(2000 / DT))
-    sg = sm.entropy_trajectory_chunked(int(ms / DT), chunk=4096, overlap=4096)["sigma_tot"]
+    sg = sm.entropy_trajectory(int(ms / DT), chunk=4096, lookahead=4096)["sigma_tot"]
     sg = sg.double() / DT
     blk = sg[:len(sg) // blocks * blocks].reshape(blocks, -1).mean(dim=1)
     return float(sg.mean()), float(blk.std()) / blocks ** 0.5
@@ -107,3 +107,30 @@ def test_spin_sigma_converges_to_the_mean_field(J):
     assert abs(sig - sig_mf) < 4 * sem, (sig, sig_mf, sem)
     if J == J_CYC:
         assert sig_mf > 10 * sem, "on the cycle sigma must be resolvably nonzero"
+
+
+@pytest.mark.parametrize("tol", [1e-2, 1e-3])
+def test_the_spins_take_the_mean_field_age_window(tol):
+    """ One tol, one Q: the spins' fdist grid and EPR lookahead are the mean field's grid. """
+    kw = S1 | dict(J=J_CYC)
+    assert SpinIsingModel(100, **kw, tol=tol).Q == RDMIsingModel(**kw, tol=tol).Q
+
+
+def test_chunked_epr_is_the_full_one():
+    """ With one window as long as the run, the chunked reverse pass starts from the same
+    boundary as the full one, so the two compute the same numbers by different routes. """
+    torch.manual_seed(0)
+    sm = SpinIsingModel(400, J_CYC, **S1, ic="random")
+    sm.forward(400)
+    snap, rng = sm._snapshot(), torch.get_rng_state()
+    T, L = 600, 150
+    kw = dict(lookahead=L, s=True, pot=True, fields=True, fdist=True, pb=False)
+    a = sm.entropy_trajectory(T, method="full", **kw)
+    end_a = sm._snapshot()
+    sm._restore(snap); torch.set_rng_state(rng)
+    b = sm.entropy_trajectory(T, method="chunked", chunk=T, **kw)
+    assert a.keys() == b.keys()
+    for k in a:         # float32 rounding: the two recursions order their operations differently
+        x, y = a[k].double(), b[k].double()
+        assert (x - y).abs().max() <= 1e-6 * x.abs().max(), k
+    assert all(torch.equal(x, y) for x, y in zip(end_a, sm._snapshot()))

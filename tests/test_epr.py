@@ -6,8 +6,7 @@ import math
 import pytest
 import torch
 
-import rdme.presets as pre
-from conftest import HAZ_DT, SETTLED, WC
+from conftest import HAZ_DT, S1, SETTLED, WC
 from rdme.epr import anchor_reverse_synaptic_term, poisson_reference_entropy
 from rdme.mean_field import RDMIsingModel, RDMWilsonCowan, RDMWilsonCowanPoints
 
@@ -69,7 +68,7 @@ def test_saturated_sigma_does_not_depend_on_the_dtype():
     there. Read off Phi, that log is a floor set by a dtype-dependent clamp, and float32 gave a
     sigma 40% below float64's (both far below the spins'); off the kernel's exact branch the
     two agree. """
-    P = pre.params("S1", hazard="poisson_exact", dt=0.5)
+    P = S1 | dict(hazard="poisson_exact", dt=0.5)
     sig = []
     for dtype in (torch.float32, torch.float64):
         net = RDMIsingModel(60.0, **P, dtype=dtype)

@@ -207,7 +207,8 @@ def n_abs_bins(t_abs: float | torch.Tensor, dt: float) -> int | torch.Tensor:
 
 
 def refractory_kernel(Q: int, K, tau_r, dt: float = 1.0,
-                      t_abs: float | torch.Tensor = 0.0, device='cpu') -> torch.Tensor:
+                      t_abs: float | torch.Tensor = 0.0,
+                      device: str | torch.device = 'cpu') -> torch.Tensor:
     """ The refractory kernel: Gerstner's SRM_0 kernel (Neuronal Dynamics, Eq. 9.24), a hard
     absolute window on the first n_abs_bins(t_abs, dt) age bins followed by an exponential
     relative term that starts decaying when the window ENDS, not at the spike:
@@ -275,6 +276,23 @@ def refractory_kernel(Q: int, K, tau_r, dt: float = 1.0,
     x = ((n + 1) * dt - torch.as_tensor(t_abs, device=device, dtype=K.dtype)).clamp_min(0.0)
     on = (K != 0) & (tau_r > 0)
     return torch.where(on, -K * torch.exp(-x / torch.where(on, tau_r, 1.0)), 0.0).to(K.dtype)
+
+
+# The initial conditions the mean field and the spins share. Both have S = 0 (no input history)
+# and R read off the refractory kernel at each neuron's age, so the mean field's starting state
+# is exactly the expectation of the spins' one, and fdist(Q) matches p at t = 0.
+#   "silent": every neuron older than any age grid, none firing: all mass in the last bin.
+#   "random": ages uniform on bins 0..K-1, K = random_age_bins(age_max, dt); the ones at age
+#             0 are the ones firing now, so the starting activity is 1/K.
+INITIAL_CONDITIONS = ("silent", "random")
+
+
+def random_age_bins(age_max: float, dt: float) -> int:
+    """ K, the number of age bins the "random" initial condition spreads ages over: age_max is
+    in ms, so the window is the same at every dt. """
+    if not age_max > 0 or round(age_max / dt) < 1:
+        raise ValueError(f"age_max={age_max} ms must cover at least one step of dt={dt} ms")
+    return round(age_max / dt)
 
 
 def tau2alpha(tau: torch.Tensor, dt: float = 1.0) -> torch.Tensor:

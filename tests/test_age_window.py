@@ -5,7 +5,7 @@ import pytest
 import torch
 
 import rdme.hazards as hzd
-import rdme.presets as pre
+from conftest import S1
 from rdme import epr
 from rdme.mean_field import RDMIsingModel
 
@@ -23,7 +23,7 @@ def _worst_step_error(hazard, dt, J, beta, tol=TOL):
     """ Largest relative firing error, over a stretch of a long-grid trajectory, of lumping
     every cohort older than the tol-sized window into one bin at the field of its age -- which
     is exactly what one step of the truncated model does from that state. """
-    P = pre.params("S1", hazard=hazard, J=J, beta=beta, dt=dt)
+    P = S1 | dict(hazard=hazard, J=J, beta=beta, dt=dt)
     Q = RDMIsingModel(**P, tol=tol).Q
     ref = RDMIsingModel(**P, tol=1e-12)
     assert ref.Q > 2 * Q
@@ -59,7 +59,7 @@ def test_the_window_bounds_the_entropy_production(J, beta):
     two boundaries (the forward lumped bin and the reverse censoring bin) can differ. Averaged
     over 300 ms, longer than the bursting cell's 255 ms period. """
     dt = 0.5
-    P = pre.params("S1", hazard="poisson_exact", J=J, beta=beta, dt=dt)
+    P = S1 | dict(hazard="poisson_exact", J=J, beta=beta, dt=dt)
     Q = RDMIsingModel(**P, tol=TOL).Q
     ref = RDMIsingModel(**P, tol=1e-8)
     QR, steps = ref.Q, int(300 / dt)
@@ -91,5 +91,5 @@ def test_the_window_bounds_the_entropy_production(J, beta):
 
 def test_the_window_does_not_depend_on_dt():
     """ U_max = (Q-1)*dt is a property of the model and tol; only its rounding to bins moves. """
-    U = [(RDMIsingModel(**pre.params("S1", J=17.0, dt=dt)).Q - 1) * dt for dt in (0.5, 0.25, 0.1)]
+    U = [(RDMIsingModel(**S1 | dict(hazard="poisson_exact", J=17.0, dt=dt)).Q - 1) * dt for dt in (0.5, 0.25, 0.1)]
     assert max(U) - min(U) <= 0.5, U

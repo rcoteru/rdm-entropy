@@ -228,3 +228,6 @@ data/*
 # Local run records and vault hand-off (dumps, briefs): not git history, travels to/from
 # the research vault by hand
 agents/
+
+# Old exploration scripts: kept locally, not tracked
+scripts/old/

@@ -30,3 +30,6 @@ addopts = "-m 'not slow'"
 
 [tool.ruff]
 src = ["src", "tests"]
+
+[tool.ruff.lint]
+ignore = ["C408"]   # dict(a=1) over {"a": 1} is fine

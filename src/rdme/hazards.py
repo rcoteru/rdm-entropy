@@ -412,7 +412,7 @@ HAZARDS: dict[str, Hazard] = {
 }
 
 #: The hazard a measurement is run with unless it says otherwise (route B, 2026-11-07). It is
-#: still its own axis and every script states it; this is what `presets.params` falls back to.
+#: still its own axis and every script states it.
 DEFAULT_HAZARD = "poisson_exact"
 
 

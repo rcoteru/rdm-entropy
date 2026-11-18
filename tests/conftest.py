@@ -7,6 +7,10 @@ from typing import Any
 import pytest
 import torch
 
+# The single-population (Ising) system, with no J: J is the axis it is studied along.
+S1: dict[str, Any] = {"E": 0.0, "beta": 6.0, "theta": 0.5, "tau_int": 15.0, "tau_ref": 15.0,
+                      "K_ref": 15.0, "nu0": 1.0, "t_abs": 1.0}
+
 # Two-population Wilson-Cowan cell. From its default start it rings for a long transient before
 # settling on a focus, so short runs exercise moving dynamics; small time constants keep the
 # age grids short.

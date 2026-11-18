@@ -10,7 +10,7 @@ import torch
 import rdme.epr as epr
 import rdme.equations as eq
 import rdme.hazards as hzd
-import rdme.presets as pre
+from conftest import S1
 from rdme.mean_field import RDMIsingModel, RDMNetwork
 from rdme.spin_model import SpinIsingModel
 
@@ -18,7 +18,7 @@ HZ = "poisson_exact"
 
 
 def _cycle(**kw):
-    return RDMIsingModel(**pre.params("S1", hazard=HZ, J=17.0, dt=0.25) | kw)
+    return RDMIsingModel(**S1 | dict(hazard=HZ, J=17.0, dt=0.25) | kw)
 
 
 def test_blocked_bins_carry_exactly_zero_hazard():
@@ -65,15 +65,15 @@ def test_a_nonzero_weight_on_a_blocked_bin_is_not_hidden():
 
 def test_spins_never_fire_in_the_window_and_their_epr_is_finite():
     torch.manual_seed(0)
-    sm = SpinIsingModel(500, **pre.params("S1", hazard=HZ, J=17.0, dt=0.25), ic="silent")
+    sm = SpinIsingModel(500, **S1 | dict(hazard=HZ, J=17.0, dt=0.25), ic="silent")
     for _ in range(400):
         b = sm.blocked(sm.n)
         assert bool((sm.firing_prob()[b] == 0).all())
         sm.update()
-    e = sm.entropy_trajectory(300, buffer=200, pb=False)
+    e = sm.entropy_trajectory(300, method="full", lookahead=200, pb=False)
     assert all(bool(torch.isfinite(v).all()) for v in e.values())
     with pytest.raises(ValueError, match="absolute window"):
-        sm.entropy_trajectory(10, buffer=sm.n_abs, pb=False)
+        sm.entropy_trajectory(10, lookahead=sm.n_abs, pb=False)
 
 
 def test_zero_gain_with_a_window_is_allowed():
@@ -84,7 +84,7 @@ def test_zero_gain_with_a_window_is_allowed():
     phi = net.firing_prob()[0]
     assert bool((phi[net.blocked[0]] == 0).all()) and bool(torch.isfinite(net.rates()).all())
     torch.manual_seed(0)
-    sm = SpinIsingModel(200, **pre.params("S1", hazard=HZ, J=17.0, dt=0.25) | {"beta": 0.0},
+    sm = SpinIsingModel(200, **S1 | dict(hazard=HZ, J=17.0, dt=0.25) | {"beta": 0.0},
                         ic="silent")
     sm.forward(100)
 

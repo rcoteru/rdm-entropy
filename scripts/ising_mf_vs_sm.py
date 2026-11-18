@@ -1,8 +1,8 @@
 """ Mean field vs spin network for one single-population (Ising) system: equilibration,
 age distribution, return map, entropy trajectories and the fixed-point objective G(m). """
 
-from pathlib import Path
 import time
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
@@ -10,52 +10,40 @@ import torch
 import rdme.fixed_points as fpts
 import rdme.helpers as hlp
 import rdme.plots as rp
-
 from rdme.mean_field import RDMIsingModel
 from rdme.spin_model import SpinIsingModel
 
-
 # ── Parameters ────────────────────────────────────────────────────────────────
 
-# Base parameter sets, written out in full. A regime is one of these plus overrides.
-S1     = dict(E=0.0, beta=6.0,  theta=0.5, tau_int=15.0, tau_ref=15.0, K_ref=15.0, nu0=1.0, t_abs=1.0)
-S1_SAT = dict(E=0.0, beta=8.0,  theta=0.5, tau_int=10.0, tau_ref=25.0, K_ref=25.0, nu0=1.0, t_abs=1.0, J=40.0)
-D2     = dict(E=1.0, beta=40.0, theta=0.5, tau_int=15.0, tau_ref=1.0,  K_ref=0.0,  nu0=1.0, t_abs=1.0, J=6.0)
+N       = 50000     # spins in the network model
+J       = 15.0      # recurrent coupling, physical units (not divided by dt)
+E       = 0.0       # external drive
+beta    = 6.0       # gain
+theta   = 0.5       # threshold
+nu0     = 1.0       # 1/ms, Poisson reference rate
+t_abs   = 1.0       # ms, absolute refractory period
+tau_int = 15.0      # ms, synaptic integration
+tau_ref = 20.0      # ms, relative refractory decay
+K_ref   = 15.0      # relative refractory amplitude
 
-# dt must divide t_abs. Optional "t_equi"/"t_meas" (ms) override the defaults below.
-REGIMES: dict[str, dict] = {
-    "S1_fp":                S1 | dict(J=10.0, dt=0.5),
-    "S1_cycle":             S1 | dict(J=17.0, dt=0.1),
-    "ref_lowbeta":          S1 | dict(tau_int=20.0, J=30.0, dt=0.5),
-    "noref_lowbeta":        S1_SAT | dict(tau_int=15.0, K_ref=0.0, J=20.0, dt=0.5),
-    "ref_lowbeta_strong":   S1_SAT | dict(dt=0.5),
-    "noref_driven_strong":  D2 | dict(dt=0.1),
-    "nu0_reanchored_fp":    S1 | dict(nu0=0.01, J=10.0, dt=1.0),
-    "nu0_reanchored_cycle": S1 | dict(nu0=0.01, J=80.0, dt=1.0),
-}
+hazard  = "poisson_exact"   # "poisson_exact" | "poisson" | "bernoulli"
+IC      = "silent"          # "silent" | "random", the same start for both models
+AGE_MAX = 25.0              # ms, age window of the "random" start
 
-regime = "S1_cycle"       # pick one of the above
-HAZARD = "poisson_exact"  # "poisson_exact" | "poisson" | "bernoulli"
-MF_IC  = "quiet"         # "active": start MF just above the highest root; "quiet": all age
-                          # mass in the oldest bin (the constructor's default)
-
-TOL    = 1e-2      # age-grid truncation tolerance (sets Q)
-N      = 40000     # spins in the network model
+# numerical parameters
+dt     = 0.1       # ms, solver step; must divide t_abs
+TOL    = 1e-2      # truncation tolerance: sets the mean field's Q and the spin EPR's lookahead
 DEVICE = 'cpu'     # 'cuda' if torch.cuda.is_available() else 'cpu'
 
 T_EQUI, T_MEAS = 5000.0, 2500.0   # ms: equilibration, then entropy recording
 SKIP_MS        = 10.0             # ms trimmed from each end of the recording before averaging
 
-RUN_KEYS = ("t_equi", "t_meas")   # regime entries that are the run, not the model
-PARAMS: dict = {k: v for k, v in REGIMES[regime].items() if k not in RUN_KEYS} | {"hazard": HAZARD}
+PARAMS: dict = dict(J=J, E=E, beta=beta, theta=theta, tau_int=tau_int, tau_ref=tau_ref, K_ref=K_ref,
+                      nu0=nu0, t_abs=t_abs, dt=dt, hazard=hazard)
+STEPS  = (hlp.n_steps(T_EQUI, dt, name="T_EQUI"), hlp.n_steps(T_MEAS, dt, name="T_MEAS"))
+SKIP   = hlp.n_steps(SKIP_MS, dt, name="SKIP_MS")
 
-T_EQUI = REGIMES[regime].get("t_equi", T_EQUI)
-T_MEAS = REGIMES[regime].get("t_meas", T_MEAS)
-DT     = PARAMS["dt"]
-STEPS  = (hlp.n_steps(T_EQUI, DT, name="T_EQUI"), hlp.n_steps(T_MEAS, DT, name="T_MEAS"))
-SKIP   = hlp.n_steps(SKIP_MS, DT, name="SKIP_MS")
-
-TITLE = (f'{regime}  ·  hazard={HAZARD}  ·  dt={DT:g}  —  '
+TITLE = (f'hazard={hazard}  ·  dt={dt:g}  ·  ic={IC}  —  '
          + ',  '.join(f'{k}={PARAMS[k]:g}' for k in
                       ("J", "E", "beta", "theta", "tau_int", "tau_ref", "K_ref", "nu0", "t_abs")))
 
@@ -63,9 +51,10 @@ TITLE = (f'{regime}  ·  hazard={HAZARD}  ·  dt={DT:g}  —  '
 # ── Paths & switches ──────────────────────────────────────────────────────────
 
 # the parameters name the file, so a changed parameter never reads a stale cache
-CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, N=N, t_equi=T_EQUI, t_meas=T_MEAS,
-                                                tol=TOL, mf_ic=MF_IC),
-                       tag=f"{regime}-{MF_IC}", root=Path(__file__).parents[1] / "cache")
+CACHE = hlp.cache_path(Path(__file__).stem,
+                       dict(PARAMS, N=N, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL,
+                            ic=IC, age_max=AGE_MAX),
+                       tag=f"J{J:g}-{IC}", root=Path(__file__).parents[1] / "cache")
 
 run_sim   = True
 run_plot  = True
@@ -78,31 +67,25 @@ if run_sim and (overwrite or not CACHE.exists()):
 
     steps1, steps2 = STEPS
 
-    sm = SpinIsingModel(N, **PARAMS, device=DEVICE, ic="silent")
-    mf = RDMIsingModel(**PARAMS, tol=TOL, device=DEVICE)
+    sm = SpinIsingModel(N, **PARAMS, ic=IC, age_max=AGE_MAX, tol=TOL, device=DEVICE)
+    mf = RDMIsingModel(**PARAMS, ic=IC, age_max=AGE_MAX, tol=TOL, device=DEVICE)
     roots = mf.fixed_points(method='bracket', n_grid=2001)
-    if MF_IC == "active":
-        if roots.shape[0] == 0:
-            raise RuntimeError("MF_IC='active' needs a fixed point to start from; none found")
-        mf.set_state(roots[-1] * 1.001)
-    elif MF_IC != "quiet":
-        raise ValueError(f"Unknown MF_IC {MF_IC!r}; use 'quiet' or 'active'")
     print(f"Q = {mf.Q} age bins. Running {T_EQUI + T_MEAS:g} ms of each model "
-          f"({steps1 + steps2} steps at dt={DT:g}) on {DEVICE}.")
+          f"({steps1 + steps2} steps at dt={dt:g}) on {DEVICE}.")
 
     t0 = time.time()
     mf_traj1 = mf.trajectory(T=steps1)
     mf_traj2 = mf.entropy_trajectory(T=steps2)
     t1 = time.time()
     sm_traj1 = sm.trajectory(T=steps1)
-    sm_traj2 = sm.entropy_trajectory_chunked(T=steps2, overlap=1024)
+    sm_traj2 = sm.entropy_trajectory(T=steps2)
     t2 = time.time()
     print(f"Mean field: {t1 - t0:.2f}s. Spin model: {t2 - t1:.2f}s.")
 
     # G(m) = m - F(m): every zero is a stationary state of the mean field
     m_grid = torch.linspace(0, 1, 2001, device=DEVICE, dtype=torch.float64).unsqueeze(-1)  # (K, 1)
     out = {
-        "params": PARAMS, "regime": regime, "t_equi": T_EQUI, "t_meas": T_MEAS,
+        "params": PARAMS, "ic": IC, "t_equi": T_EQUI, "t_meas": T_MEAS,
         "steps": STEPS, "N": N, "Q": mf.Q,
         "mf_traj1": mf_traj1, "mf_traj2": mf_traj2,
         "sm_traj1": sm_traj1, "sm_traj2": sm_traj2,
@@ -133,13 +116,13 @@ if run_plot:
 
     if True:  # final age distribution, on the physical age axis
         rp.curves({'Spin Model': d["p_sm"], 'Mean Field': d["p_mf"]},
-                  x=torch.arange(len(d["p_mf"]), dtype=torch.float64) * DT,
+                  x=torch.arange(len(d["p_mf"]), dtype=torch.float64) * dt,
                   title="Firing age distribution (mean-field vs spin model)",
                   xlabel='age u (ms)', ylabel='p(u)')
 
     if True:  # equilibration trajectories
         rp.curves({'Spin Model': sm_traj1["m_tot"], 'Mean Field': mf_traj1["m"]},
-                  dt=DT, title=f'Equilibration trajectories\n{TITLE}')
+                  dt=dt, title=f'Equilibration trajectories\n{TITLE}')
 
     if True:  # return map (m_t vs m_{t+1}) of the non-transient trajectories
         rp.return_maps({'Spin Model': sm_traj2["m_tot"], 'Mean Field': mf_traj2["m_tot"]},
@@ -147,7 +130,7 @@ if run_plot:
 
     if True:  # entropy trajectories
         rp.panels({'Spin Model': sm_traj2, 'Mean Field': mf_traj2},
-                  ["m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot"], dt=DT,
+                  ["m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot"], dt=dt,
                   suptitle='Entropy trajectories')
 
         for name, traj in (("Spin Model", sm_traj2), ("Mean Field", mf_traj2)):

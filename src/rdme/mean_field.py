@@ -9,9 +9,6 @@ shared by every population, so the population axis is a tensor axis like any oth
 a batch down to one system. "One system" means NO leading axis, not B = 1: a B = 1 batch takes
 a different reduction path in the backend and its rows differ from a 1-D run in the last bit.
 
-The driver knows nothing about presets: rdme.presets turns a preset name and overrides into the
-keyword arguments the factories at the bottom take.
-
 Weights are in physical units and NOT divided by dt -- pass J, never J/dt. The input is built
 from the rate r = m/dt, which is what makes a coupling independent of the step; see
 equations.compute_total_input, which states the convention once. """
@@ -145,6 +142,8 @@ class RDMNetwork:
                  t_abs: float | torch.Tensor | list[float] = 1.0,
                  Q: int | None = None,
                  tol: float = 1e-2,
+                 ic: str = "silent",
+                 age_max: float = 25.0,
                  grid_shape: tuple[int, ...] | None = None,
                  grid_axes: dict[str, torch.Tensor] | None = None,
                  device: str = 'cpu',
@@ -177,6 +176,10 @@ class RDMNetwork:
         population anywhere in it. Q overrides that, for putting two models on one grid
         (comparing a batch element to its single system); truncation_error() then reports what
         the grid costs.
+
+        ic is the initial condition, "silent" or "random", with age_max (ms) the random one's
+        age window: the definitions are shared with the spin model, see
+        equations.INITIAL_CONDITIONS. set_state replaces it with a stationary state.
 
         grid_shape/grid_axes describe a batch built from a flattened parameter grid (see
         flatten_param_grid): trajectory outputs then come back with the batch axis expanded
@@ -230,11 +233,16 @@ class RDMNetwork:
         # equations.refractory_kernel
         self.blocked = torch.arange(Q, device=device) < self.n_abs[..., None]
 
-        # all age mass in the oldest bin, zero integrated field
-        self.p = torch.zeros(lead + (M, Q), device=device, dtype=dtype)
-        self.p[..., -1] = 1.0
+        # silent: all age mass in the oldest bin; random: uniform on the first K bins, any
+        # past the grid counted in the last one, as SpinModel.fdist does. Zero field either way.
+        if ic not in eq.INITIAL_CONDITIONS:
+            raise ValueError(f"Unknown initial condition {ic!r}; use one of {eq.INITIAL_CONDITIONS}")
+        ages = (torch.tensor([Q - 1], device=device) if ic == "silent" else
+                torch.arange(eq.random_age_bins(age_max, dt), device=device).clamp(max=Q - 1))
+        mass = torch.bincount(ages, minlength=Q).to(dtype) / len(ages)
+        self.p = mass.expand(lead + (M, Q)).clone()
         self.S = torch.zeros(lead + (M, Q), device=device, dtype=dtype)
-        self.m = torch.zeros(lead + (M,), device=device, dtype=dtype)
+        self.m = self.p[..., 0].clone()             # the age-0 mass is the cohort firing now
 
     @property
     def batch_shape(self) -> tuple[int, ...]:
@@ -697,19 +705,20 @@ class RDMNetwork:
 def RDMIsingModel(J: float, E: float, beta: float, theta: float, tau_int: float,
                   tau_ref: float, K_ref: float, *, dt: float, hazard: str,
                   nu0: float = 1.0, t_abs: float = 1.0, Q: int | None = None,
-                  tol: float = 1e-2, device: str = 'cpu',
-                  dtype: torch.dtype = torch.float64) -> RDMNetwork:
+                  tol: float = 1e-2, ic: str = "silent", age_max: float = 25.0,
+                  device: str = 'cpu', dtype: torch.dtype = torch.float64) -> RDMNetwork:
     """ One single-population (M=1) network. """
     return RDMNetwork(M=1, w=torch.tensor([[J]], dtype=dtype), N=[1000], E=[E], beta=[beta], theta=[theta],
                       tau_int=[tau_int], tau_ref=[tau_ref], K_ref=[K_ref],
                       dt=dt, nu0=nu0, hazard=hazard, t_abs=[t_abs], Q=Q, tol=tol,
-                      device=device, dtype=dtype)
+                      ic=ic, age_max=age_max, device=device, dtype=dtype)
 
 
 def RDMIsingModelBatch(J, E, beta, theta, tau_int, tau_ref, K_ref,
                        *, dt: float, hazard: str, nu0: float = 1.0,
                        t_abs: float | torch.Tensor = 1.0,
                        Q: int | None = None, tol: float = 1e-2,
+                       ic: str = "silent", age_max: float = 25.0,
                        device: str = 'cpu', dtype: torch.dtype = torch.float64) -> RDMNetwork:
     """ A batch of single-population (M=1) networks. Each parameter may be a scalar or a 1D
     tensor, and the batch is the **outer product** of them all, so passing two vectors gives
@@ -724,7 +733,7 @@ def RDMIsingModelBatch(J, E, beta, theta, tau_int, tau_ref, K_ref,
         M=1, w=flat["J"].reshape(-1, 1, 1), N=[1000], E=col("E"), beta=col("beta"),
         theta=col("theta"), tau_int=col("tau_int"), tau_ref=col("tau_ref"),
         K_ref=col("K_ref"), dt=dt, nu0=nu0, hazard=hazard, t_abs=col("t_abs"), Q=Q, tol=tol,
-        grid_shape=grid_shape, grid_axes=axes, device=device, dtype=dtype)
+        ic=ic, age_max=age_max, grid_shape=grid_shape, grid_axes=axes, device=device, dtype=dtype)
 
 
 def RDMWilsonCowan(E_ratio: float, w_EE: float, w_EI: float, w_IE: float, w_II: float,
@@ -733,6 +742,7 @@ def RDMWilsonCowan(E_ratio: float, w_EE: float, w_EI: float, w_IE: float, w_II: 
                    tau_ref_E: float, tau_ref_I: float, K_ref_E: float, K_ref_I: float,
                    *, dt: float, hazard: str, nu0: float = 1.0, t_abs: float = 1.0,
                    Q: int | None = None, tol: float = 1e-2,
+                   ic: str = "silent", age_max: float = 25.0,
                    device: str = 'cpu', dtype: torch.dtype = torch.float64) -> RDMNetwork:
     """ One Wilson-Cowan-like two-population (M=2, order [E, I]) network. t_abs is the dead
     time of both populations; build an RDMNetwork directly to give them different ones. """
@@ -744,11 +754,11 @@ def RDMWilsonCowan(E_ratio: float, w_EE: float, w_EI: float, w_IE: float, w_II: 
                       theta=[theta_E, theta_I], tau_int=[tau_int_E, tau_int_I],
                       tau_ref=[tau_ref_E, tau_ref_I], K_ref=[K_ref_E, K_ref_I],
                       dt=dt, nu0=nu0, hazard=hazard, t_abs=[t_abs, t_abs], Q=Q, tol=tol,
-                      device=device, dtype=dtype)
+                      ic=ic, age_max=age_max, device=device, dtype=dtype)
 
 
 def _wilson_cowan_from_flat(flat: dict[str, torch.Tensor], E_ratio: float, dt: float,
-                            nu0, hazard, Q, tol, grid_shape, grid_axes,
+                            nu0, hazard, Q, tol, ic, age_max, grid_shape, grid_axes,
                             device) -> RDMNetwork:
     """ Assemble a two-population batch from flat (B,) parameter columns. Shared by the two
     batched Wilson-Cowan factories, which differ only in how they get to `flat`: outer
@@ -766,7 +776,7 @@ def _wilson_cowan_from_flat(flat: dict[str, torch.Tensor], E_ratio: float, dt: f
         theta=two("theta_E", "theta_I"), tau_int=two("tau_int_E", "tau_int_I"),
         tau_ref=two("tau_ref_E", "tau_ref_I"), K_ref=two("K_ref_E", "K_ref_I"),
         dt=dt, nu0=nu0, hazard=hazard, t_abs=two("t_abs", "t_abs"), Q=Q, tol=tol,
-        grid_shape=grid_shape, grid_axes=grid_axes, device=device, dtype=w.dtype)
+        ic=ic, age_max=age_max, grid_shape=grid_shape, grid_axes=grid_axes, device=device, dtype=w.dtype)
 
 
 _WC_NAMES = ["w_EE", "w_EI", "w_IE", "w_II", "E_exc", "E_inh", "beta_E", "beta_I",
@@ -778,7 +788,8 @@ def RDMWilsonCowanBatch(E_ratio, w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, b
                         theta_E, theta_I, tau_int_E, tau_int_I, tau_ref_E, tau_ref_I,
                         K_ref_E, K_ref_I, *, dt: float, hazard: str,
                         nu0: float = 1.0, t_abs: float | torch.Tensor = 1.0,
-                        Q: int | None = None, tol: float = 1e-2, device: str = 'cpu',
+                        Q: int | None = None, tol: float = 1e-2,
+                        ic: str = "silent", age_max: float = 25.0, device: str = 'cpu',
                         dtype: torch.dtype = torch.float64) -> RDMNetwork:
     """ A batch of two-population (M=2, order [E, I]) networks, the batch being the **outer
     product** of every argument. Scalars contribute a singleton axis that is dropped again on
@@ -788,7 +799,7 @@ def RDMWilsonCowanBatch(E_ratio, w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, b
                                 theta_E, theta_I, tau_int_E, tau_int_I, tau_ref_E, tau_ref_I,
                                 K_ref_E, K_ref_I])) | {"t_abs": t_abs}
     flat, grid_shape, axes = flatten_param_grid(vals, device=device, dtype=dtype)
-    return _wilson_cowan_from_flat(flat, E_ratio, dt, nu0, hazard, Q, tol,
+    return _wilson_cowan_from_flat(flat, E_ratio, dt, nu0, hazard, Q, tol, ic, age_max,
                                    grid_shape, axes, device)
 
 
@@ -797,7 +808,8 @@ def RDMWilsonCowanPoints(E_ratio, w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, 
                          K_ref_E, K_ref_I, *, dt: float, hazard: str,
                          nu0: float = 1.0, t_abs: float | torch.Tensor = 1.0,
                          Q: int | None = None,
-                         tol: float = 1e-2, grid_shape=None, grid_axes=None,
+                         tol: float = 1e-2, ic: str = "silent", age_max: float = 25.0,
+                         grid_shape=None, grid_axes=None,
                          device: str = 'cpu', dtype: torch.dtype = torch.float64) -> RDMNetwork:
     """ One parameter point per batch element -- the **elementwise** counterpart of
     RDMWilsonCowanBatch, for search axes that drive two parameters at once (a loop gain g with
@@ -821,5 +833,5 @@ def RDMWilsonCowanPoints(E_ratio, w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, 
                          f"got {bad}. Pass one value per batch element, or a scalar to hold it "
                          f"fixed.")
     flat = {k: (v.expand(B) if v.numel() == 1 else v) for k, v in cols.items()}
-    return _wilson_cowan_from_flat(flat, E_ratio, dt, nu0, hazard, Q, tol,
+    return _wilson_cowan_from_flat(flat, E_ratio, dt, nu0, hazard, Q, tol, ic, age_max,
                                    grid_shape, grid_axes, device)
