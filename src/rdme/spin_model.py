@@ -259,6 +259,19 @@ class SpinModel:
         keeps them from drifting apart. """
         return n < self.n_abs
 
+    def clamped(self, n: torch.Tensor) -> torch.Tensor:
+        """ Where the synaptic term is held at 0, at ages n: n <= n_abs, the reset (n = 0),
+        the rest of the absolute window, and its first eligible age, which has had zero time
+        to integrate. S starts integrating the input only when the window ends, as the GIF
+        model clamps its voltage at u_r for t_ref (Schwalger, Deger & Gerstner 2017, PLoS
+        Comput Biol 13(4): e1005507, Methods; u_r = 0 here) -- the per-neuron counterpart of
+        equations.update_synaptic_term. With t_abs = 0 (or dt) it is n == 0, the reset alone.
+
+        An argument rather than self.n for the reason blocked's is: the reverse passes apply
+        the same rule under the reverse age, so the reversed path is clamped for t_abs after
+        each reversed-time spike by this function and no other. """
+        return n <= self.n_abs
+
     @torch.inference_mode()
     def field(self) -> torch.Tensor:
         """ S + R. Inside the absolute window R holds -K_ref, which the hazard never reads:
@@ -331,8 +344,10 @@ class SpinModel:
         # update neuron ages: if fired, age is 0, else increment age by 1
         self.n = torch.where(fired, torch.zeros_like(self.n), self.n + 1).long()
         
-        # update field for next time step: integrate I and reset neurons that just fired
-        self.S = (self.a_int_net * I + (1 - self.a_int_net) * self.S).masked_fill_(fired, 0)
+        # update field for next time step: integrate I, reset neurons that just fired and hold
+        # S at 0 through the absolute window (clamped; self.n is already the new age here)
+        self.S = (self.a_int_net * I + (1 - self.a_int_net) * self.S).masked_fill_(
+            self.clamped(self.n), 0)
 
         # update refractory state for next time step: reset if fired, else hold through the
         # dead time and decay after it (self.n is already the new age here)
@@ -420,12 +435,13 @@ class SpinModel:
         non-negative by construction and cannot detect reversibility.
 
         The lookahead. The reverse field at t is a function of the future up to the neuron's
-        NEXT spike: S_rev filters I over (t, t_next], R_rev and the reverse age depend on
-        t_next - t. A neuron that fires within the lookahead gets its reverse field exactly;
-        one that does not starts from the zero boundary d >= lookahead - 1 steps away, and
-        that error is the filter tail the mean field's absorbing bin commits at age d*dt --
-        K_ref e^{-(d*dt - t_abs)/tau_ref} + A e^{-d*dt/tau_int}, drive_bound's A holding in
-        either direction of time. So lookahead defaults to self.Q, the mean field's age
+        NEXT spike: S_rev filters I over (t, t_next] less the dead time before t_next (it is
+        clamped, see clamped), R_rev and the reverse age depend on t_next - t. A neuron that
+        fires within the lookahead gets its reverse field exactly; one that does not starts
+        from the zero boundary d >= lookahead - 1 steps away, and that error is the filter
+        tail the mean field's absorbing bin commits at age d*dt --
+        K_ref e^{-(d*dt - t_abs)/tau_ref} + A e^{-(d*dt - t_abs)/tau_int}, drive_bound's A
+        holding in either direction of time. So lookahead defaults to self.Q, the mean field's age
         window at self.tol: every reported reverse field is then within Delta(U) of its
         infinite-lookahead value, and each emission probability off by a factor at most
         1 + tol. A neuron silent through the whole lookahead is not a failure: past U its
@@ -506,9 +522,9 @@ class SpinModel:
 
         for t in tqdm.tqdm(range(L - 2, -1, -1), desc="Reverse pass", disable=not pb):
             fired_t = s_trj[t] == 1
-            S_rev[t] = ((1 - self.a_int_net) * S_rev[t + 1]
-                        + self.a_int_net * I[t + 1]).masked_fill_(fired_t, 0)
             n_rev[t] = (n_rev[t + 1] + 1).masked_fill_(fired_t, 0)
+            S_rev[t] = ((1 - self.a_int_net) * S_rev[t + 1]
+                        + self.a_int_net * I[t + 1]).masked_fill_(self.clamped(n_rev[t]), 0)
             R_rev[t] = torch.where(fired_t, self.R_reset_net,
                                    torch.where(n_rev[t] > self.n_abs,
                                                (1 - self.a_ref_net) * R_rev[t + 1], R_rev[t + 1]))
@@ -642,11 +658,11 @@ class SpinModel:
             h_rev.zero_(); x_rev.zero_(); a_rev.zero_()
             for t in range(W - 2, 0, -1):
                 fired = s_win[t].bool()
-                h_rev.mul_(1.0 - self.a_int_net).addcmul_(I_win[t + 1][..., self.pop_idx],
-                                                          self.a_int_net)
-                h_rev.masked_fill_(fired, 0.0)
                 a_rev.add_(1)
                 a_rev.masked_fill_(fired, 0)
+                h_rev.mul_(1.0 - self.a_int_net).addcmul_(I_win[t + 1][..., self.pop_idx],
+                                                          self.a_int_net)
+                h_rev.masked_fill_(self.clamped(a_rev), 0.0)
                 x_rev = torch.where(fired, self.R_reset_net,
                                     torch.where(a_rev > self.n_abs,
                                                 (1.0 - self.a_ref_net) * x_rev, x_rev))

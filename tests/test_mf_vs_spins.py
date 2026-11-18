@@ -10,6 +10,7 @@ import torch
 
 import conftest
 import rdme.analysis as an
+import rdme.fixed_points as fpts
 from rdme.mean_field import RDMIsingModel
 from rdme.spin_model import SpinIsingModel
 
@@ -37,6 +38,41 @@ def test_refractory_kernel_matches_spin_model(dt, t_abs):
         got = sm.R[ok]
         assert torch.allclose(got, ref[sm.n[ok]], rtol=1e-4, atol=1e-6)
     assert seen.all()
+
+
+@pytest.mark.parametrize("t_abs", [0.0, 1.0])
+def test_synaptic_clamp_matches_spin_model(t_abs):
+    """ The synaptic term, forward and reverse, is held at 0 through the dead time and
+    integrates from its end, in the spins exactly as in the mean field. At J = 0 the input is
+    the constant E, so a spin's S at age n -- and its reverse S at reverse age n, the time to
+    its next spike -- is the mean field's stationary S(n). K_ref = 0 and beta = 1, theta = 0,
+    so the reverse field the EPR reports is S_rev itself. """
+    dt, E, tau_int = 0.25, 2.0, 3.0
+    kw = {"dt": dt, "t_abs": t_abs, "hazard": "poisson_exact"}
+    torch.manual_seed(0)
+    sm = SpinIsingModel(200, 0.0, E, 1.0, 0.0, tau_int, 1.0, 0.0, ic="silent", **kw)
+    mf = RDMIsingModel(0.0, E, 1.0, 0.0, tau_int, 1.0, 0.0, **kw)
+    S_mf = fpts.compute_stationary_forward_field(torch.tensor(E), mf.alpha_int[0],
+                                                 mf.blocked[0]).float()
+    assert int(mf.n_abs) == (3 if t_abs else 0)
+    seen = torch.zeros(sm.N, dtype=torch.bool)
+    for _ in range(200):
+        sm.update()
+        seen |= sm.s == 1
+        ok = seen & (sm.n < mf.Q)
+        assert torch.allclose(sm.S[ok], S_mf[sm.n[ok]], rtol=1e-5, atol=1e-6)
+    T = 300
+    tr = sm.entropy_trajectory(T, method="full", lookahead=200, s=True, fields=True, pb=False)
+    s = tr["s"].bool()
+    # reverse age at t+1 (the time hr[t] is taken at): steps to the next spike at or after it
+    nxt = torch.full((sm.N,), 10**9)
+    a_rev = torch.empty(T - 1, sm.N, dtype=torch.long)
+    for t in range(T - 1, 0, -1):
+        nxt = torch.where(s[t], t, nxt)
+        a_rev[t - 1] = nxt - t
+    ok = a_rev < 10**8
+    assert ok.float().mean() > 0.9
+    assert torch.allclose(tr["hr"][:-1][ok], S_mf[a_rev[ok]], rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("dt", [0.5, 0.2, 0.1])

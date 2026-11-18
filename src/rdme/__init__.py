@@ -33,9 +33,14 @@ step does.
 The continuum equations are the transport pair
 
     d_t q^a + d_u q^a = -lambda(h^a(u,t)) q^a(u,t),      q^a(0,t) = r^a(t),
-    d_t S^a + d_u S^a = (I^a(t) - S^a(u,t)) / tau_int^a, S^a(0,t) = 0,
+    d_t S^a + d_u S^a = (I^a(t) - S^a(u,t)) / tau_int^a, S^a(u,t) = 0 for u <= t_abs^a,
 
-with R^a(u) = -K^a exp(-(u - t_abs^a)/tau_ref^a) after the dead time and -infinity during it
+the synaptic term reset to 0 at the spike and CLAMPED there through the dead time, integrating
+the input only once it ends -- the GIF model's voltage clamp at u_r for t_ref (Schwalger,
+Deger & Gerstner 2017, PLoS Comput Biol 13(4): e1005507, Methods: "After each spike the
+voltage is reset to the potential u_r, where it is clamped for an absolute refractory period
+t_ref"; u_r = 0 here), so S and R both run on the time since the window ended. The rest is
+R^a(u) = -K^a exp(-(u - t_abs^a)/tau_ref^a) after the dead time and -infinity during it
 (Gerstner's SRM_0 kernel, so K^a is the amplitude when the window ends; the -infinity is
 applied as an exact mask, lambda = 0 on u < t_abs^a, not as a field value), the input
 I^a(t) = sum_b w^{ab} r^b(t) + E^a, and the closure r^a(t) = int lambda(h^a(u,t)) q^a(u,t) du.
@@ -44,9 +49,10 @@ Scheme. Age and time are advanced together on a single grid, du = dt, so cohorts
 the characteristics u - t = const exactly and no interpolation or numerical diffusion enters.
 Over one bin a cohort's mass is multiplied by 1 - Phi, and the synaptic recursion with
 alpha = 1 - exp(-dt/tau_int) is the exact solution of the second equation for an input frozen
-across the bin. The only errors are the variation of rate and input within a bin, O(dt) over a
-fixed physical time -- bounded locally by lambda*dt/2 for `poisson_exact`
-(hazards.step_error).
+across the bin; it is skipped on the window's bins, so S = 0 up to and including the first
+eligible one (equations.update_synaptic_term). The only errors are the variation of rate and
+input within a bin, O(dt) over a fixed physical time -- bounded locally by lambda*dt/2 for
+`poisson_exact` (hazards.step_error).
 
 Call-site conventions:
 

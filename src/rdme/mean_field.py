@@ -504,7 +504,7 @@ class RDMNetwork:
         p, S = self.unflatten_state(x)
         I = eq.total_input(p[..., 0], self.w, self.E, self.dt)
         fprobs = self._per_age(hzd.HAZARDS[self.hazard].phi, eq.field(S, self.R, self.theta))
-        _, p_new, S_new = eq.advance(p, S, I, fprobs, self.alpha_int)
+        _, p_new, S_new = eq.advance(p, S, I, fprobs, self.alpha_int, self.blocked)
         return self.flatten_state(p_new, S_new)
 
     def fp_eigenvalues(self, m: torch.Tensor) -> torch.Tensor:
@@ -538,7 +538,8 @@ class RDMNetwork:
         I      = self.total_input()
         fprobs = self.firing_prob()
         dphi   = self.d_firing_prob()
-        V.copy_(lyap.tangent_step(V, self.p, fprobs, dphi, self.w, self.alpha_int, self.dt))
+        V.copy_(lyap.tangent_step(V, self.p, fprobs, dphi, self.w, self.alpha_int, self.blocked,
+                                   self.dt))
         self._advance_from(I, fprobs)
 
     # Dynamics
@@ -555,7 +556,8 @@ class RDMNetwork:
         One system checks its age normalization every step (a NaN guard, in effect: the update
         keeps the mass at 1 by construction); a batch does not, as before the merge, since on
         a GPU the check is a host sync per step. """
-        self.m, self.p, self.S = eq.advance(self.p, self.S, I, fprobs, self.alpha_int)
+        self.m, self.p, self.S = eq.advance(self.p, self.S, I, fprobs, self.alpha_int,
+                                            self.blocked)
         if self.B is None:
             eq.check_age_normalization(self.p)
 

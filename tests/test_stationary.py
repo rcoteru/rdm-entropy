@@ -16,12 +16,16 @@ from rdme.mean_field import (
 )
 
 
-def test_stationary_field_is_the_geometric_sum():
-    """ At constant input the synaptic term is a fixed point of its own update. """
+@pytest.mark.parametrize("n_abs", [0, 3])
+def test_stationary_field_is_the_geometric_sum(n_abs):
+    """ At constant input the synaptic term is a fixed point of its own update, clamped at 0
+    through the window and on its first eligible bin, and integrating from there. """
     Q, alpha, I = 12, 0.3, torch.tensor(1.7)
-    S = fpts.compute_stationary_forward_field(I, alpha, Q)
-    assert S[0] == 0
-    assert torch.allclose(eq.update_synaptic_term(S, alpha, I), S, rtol=0, atol=1e-14)
+    blocked = torch.arange(Q) < n_abs
+    S = fpts.compute_stationary_forward_field(I, alpha, blocked)
+    assert bool((S[:n_abs + 1] == 0).all())
+    assert S[n_abs + 1].item() == pytest.approx(alpha * I.item(), abs=1e-15)
+    assert torch.allclose(eq.update_synaptic_term(S, alpha, I, blocked), S, rtol=0, atol=1e-14)
 
 
 def test_stationary_age_distribution_is_stationary():
@@ -73,13 +77,15 @@ def test_stationary_rate_matches_the_dynamics_at_a_fixed_point():
 # The dead-time transfer function
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #
-# No coupling, K_ref = 0, an instantaneous synapse and constant drive x: a renewal process with
-# dead time t_abs and constant hazard nu0 e^x, whose rate is fpts.renewal_rate.
+# No coupling, K_ref = 0, no input and threshold -x: a renewal process with dead time t_abs and
+# constant hazard nu0 e^x, whose rate is fpts.renewal_rate. The drive goes through theta, not
+# through E with an instantaneous synapse: S is clamped at 0 on the first eligible bin
+# (equations.update_synaptic_term), which would add a first-order error of its own there.
 
 def _free_run(x, dt, *, nu0=1.0, t_abs=1.0, tol=1e-4, eq_ms=80.0, rec_ms=40.0):
     """ Time-averaged rate: the hard window makes the age distribution ring with period
     t_abs, so one instant of rates() is not the stationary rate. """
-    net = RDMIsingModel(J=0.0, E=x, beta=1.0, theta=0.0, tau_int=dt / 50, tau_ref=1.0,
+    net = RDMIsingModel(J=0.0, E=0.0, beta=1.0, theta=-x, tau_int=1.0, tau_ref=1.0,
                         K_ref=0.0, dt=dt, nu0=nu0, t_abs=t_abs, hazard="poisson_exact",
                         tol=tol)
     net.forward(int(eq_ms / dt))

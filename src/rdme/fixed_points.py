@@ -30,20 +30,23 @@ from rdme.hazards import Hazard
 def compute_stationary_forward_field(
         I: torch.Tensor,               # (...) constant total input to the population
         alpha: float | torch.Tensor,   # integration kernel scaling factor
-        Q: int,                        # number of age bins
+        blocked: torch.Tensor,         # (..., Q) bool, the absolute window; Q from its length
         ) -> torch.Tensor:             # (..., Q) S_n at constant input
     """ The synaptic term at a fixed point, in closed form.
 
-    With I frozen, S_n = alpha*I + (1-alpha)*S_{n-1} and S_0 = 0 unrolls to the geometric
-    sum S_n = I*[1 - (1-alpha)^n]: the same saturating profile an isolated neuron has under
-    a constant external drive, with the drive replaced by the self-consistent input.
+    With I frozen, S_n = alpha*I + (1-alpha)*S_{n-1} from S = 0 unrolls to the geometric
+    sum S_n = I*[1 - (1-alpha)^e_n], e_n = max(n - n_abs, 0) the bins of input integrated
+    since the window ended (equations.integration_age: S is clamped at 0 through the
+    absolute window, see update_synaptic_term). The same saturating profile an isolated
+    neuron has under a constant external drive, with the drive replaced by the
+    self-consistent input; with t_abs = 0, e_n = n.
 
     This is the exact fixed point of update_synaptic_term, boundary bin included -- that
     update shifts rather than lumps, so its last bin is just the recursion at n = Q-1. """
     I = torch.as_tensor(I)
     decay = torch.as_tensor(1.0 - alpha, device=I.device, dtype=I.dtype)
-    n = torch.arange(Q, device=I.device, dtype=I.dtype)
-    return I.unsqueeze(-1) * (1.0 - decay.unsqueeze(-1) ** n)
+    e = eq.integration_age(blocked).to(I.dtype)
+    return I.unsqueeze(-1) * (1.0 - decay.unsqueeze(-1) ** e)
 
 
 def compute_stationary_survival(fprobs: torch.Tensor,   # (..., Q) age-resolved hazard
@@ -162,7 +165,7 @@ def _stationary(m, w, E, alpha, beta, theta, R, blocked, hazard: Hazard, nu0: fl
     """ (p, S, F(m)) at the overlaps m: the state and the overlaps it fires at. Phi is exactly
     0 on the blocked bins, where the survival then carries ln(1 - 0) = 0. """
     I = eq.compute_total_input(m / dt, w, E)       # w is unscaled here, so feed it the rate
-    S = compute_stationary_forward_field(I, alpha, R.shape[-1])
+    S = compute_stationary_forward_field(I, alpha, blocked)
     phi = hazard.phi(S + R - theta[..., None], beta[..., None], nu0, dt).masked_fill(blocked, 0.0)
     p, m_new = compute_stationary_age_distribution(phi)
     return p, S, m_new

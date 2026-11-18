@@ -7,7 +7,12 @@ import pytest
 import torch
 
 from conftest import HAZ_DT, S1, SETTLED, WC
-from rdme.epr import anchor_reverse_synaptic_term, poisson_reference_entropy
+import rdme.equations as eq
+from rdme.epr import (
+    anchor_reverse_synaptic_term,
+    compute_reverse_synaptic_term,
+    poisson_reference_entropy,
+)
 from rdme.mean_field import RDMIsingModel, RDMWilsonCowan, RDMWilsonCowanPoints
 
 
@@ -24,19 +29,38 @@ def test_sigma_vanishes_at_a_fixed_point(hazard, dt):
         assert float(t["sigma"].abs().max()) < 1e-14
 
 
-def test_reverse_field_is_anchored_at_t_plus_one():
+@pytest.mark.parametrize("n_abs", [0, 2])
+def test_reverse_field_is_anchored_at_t_plus_one(n_abs):
     """ The reverse field both EPR paths share, against its closed form:
-    S^dagger_{t+1}(n) = sum_{tau=1..n} alpha (1-alpha)^{tau-1} I_{t+1+tau}, with the censoring
-    lag clamped to the last resolvable one. Mis-anchoring moves cycle sigma by ~4%, which
-    the joint comparison cannot see and the spin comparison cannot resolve. """
-    K, alpha = 7, 0.45
+    S^dagger_{t+1}(n) = sum_{tau=1..n-n_abs} alpha (1-alpha)^{tau-1} I_{t+1+tau} (clamped at 0
+    for the window after the reversed spike), with the censoring lag clamped to the last
+    resolvable one. Mis-anchoring moves cycle sigma by ~4%, which the joint comparison cannot
+    see and the spin comparison cannot resolve. """
+    K, alpha = 9, 0.45
     I = torch.randn(K, generator=torch.Generator().manual_seed(11))   # I[j] = input at t + j
-    S = anchor_reverse_synaptic_term(I, alpha)
-    assert S[0] == 0
+    S = anchor_reverse_synaptic_term(I, alpha, torch.arange(K) < n_abs)
+    assert bool((S[:n_abs + 1] == 0).all())
     for n in range(1, K - 1):
-        want = sum(alpha * (1 - alpha) ** (tau - 1) * I[1 + tau] for tau in range(1, n + 1))
+        want = sum(alpha * (1 - alpha) ** (tau - 1) * I[1 + tau]
+                   for tau in range(1, n - n_abs + 1))
         assert S[n].item() == pytest.approx(float(want), abs=1e-15)
     assert S[K - 1] == S[K - 2]
+
+
+@pytest.mark.parametrize("n_abs", [0, 3])
+def test_reverse_field_is_the_forward_rule_under_the_reverse_age(n_abs):
+    """ A reverse age n is a cohort that, in reversed time, spiked at t+n and has since seen
+    the inputs I[n], I[n-1], ..., I[1]. Fed to the forward update itself, window clamp
+    included, that cohort lands at age n on the reverse field. """
+    Q, alpha = 10, 0.3
+    I = torch.randn(Q, generator=torch.Generator().manual_seed(5))
+    blocked = torch.arange(Q) < n_abs
+    S_rev = compute_reverse_synaptic_term(I, alpha, blocked)
+    for n in range(1, Q):
+        S = torch.zeros(Q)
+        for j in range(n, 0, -1):
+            S = eq.update_synaptic_term(S, alpha, I[j], blocked)
+        assert S[n].item() == pytest.approx(S_rev[n].item(), abs=1e-15), n
 
 
 @pytest.mark.parametrize("hazard,dt", HAZ_DT)

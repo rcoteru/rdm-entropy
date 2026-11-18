@@ -34,13 +34,22 @@ from rdme.hazards import Hazard
 def compute_reverse_synaptic_term(
         I: torch.Tensor,       # (..., Q) buffered I[j] = input at time t+j
         alpha: float | torch.Tensor,   # integration kernel scaling factor
+        blocked: torch.Tensor,         # (..., Q) bool, the absolute window
         ) -> torch.Tensor:             # (..., Q) backward field S^dagger_t(n)
     """ Age-dependent backward (time-reversed) field from a buffered trajectory of future
     population inputs, via a kernel-weighted cumulative sum:
 
-        S^dagger(n) = sum_{tau=1..n} kappa_tau * I[tau],   kappa_tau = alpha (1-alpha)^(tau-1)
+        S^dagger(n) = sum_{tau=1..e_n} kappa_tau * I[tau],   kappa_tau = alpha (1-alpha)^(tau-1)
 
-    so the field is anchored at the buffer's OWN row 0: it reads I[1] onwards and never
+    with e_n = equations.integration_age(blocked)[n] = max(n - n_abs, 0). The reversed path
+    obeys the forward rule under its own age: S is clamped at 0 for the absolute window after
+    each reversed-time spike (equations.update_synaptic_term), so a reverse age n has
+    integrated e_n bins, the ones nearest t. Those are exactly the first e_n terms of the
+    unclamped sum, so the clamp is the unclamped field read at age e_n -- the same clock, by
+    the same function, as the forward field's (fixed_points.compute_stationary_forward_field).
+    With t_abs = 0, e_n = n and the gather is the identity.
+
+    The field is anchored at the buffer's OWN row 0: it reads I[1] onwards and never
     touches I[0]. Callers that need the field at t+1 -- which is every EPR caller, since the
     EPR pairs h^dagger(n^dagger_{t+1}) against R(n^dagger_{t+1}) -- must hand over a buffer
     that starts at t+1, not at t. Use anchor_reverse_synaptic_term for that.
@@ -56,12 +65,13 @@ def compute_reverse_synaptic_term(
     out = w.new_empty(w.shape[:-1] + (Q,))
     out[..., 0] = 0
     out[..., 1:] = w
-    return out
+    return out.gather(-1, eq.integration_age(blocked).expand(out.shape))
 
 
 def anchor_reverse_synaptic_term(
         I: torch.Tensor,               # (..., K) buffered I[j] = input at time t+j, j=0 is t
         alpha: float | torch.Tensor,   # integration kernel scaling factor
+        blocked: torch.Tensor,         # (..., K) bool, the absolute window on the reverse age
         ) -> torch.Tensor:             # (..., K) S^dagger_{t+1}(n^dagger)
     """ The reverse synaptic term as the EPR needs it: anchored at t+1, from a buffer whose
     row 0 is time t.
@@ -78,7 +88,7 @@ def anchor_reverse_synaptic_term(
     I_{t+K} that does not exist yet. It takes the K-2 value instead, which is exact under the
     same boundary assumption the lumped age bin already rests on: S^dagger has saturated by
     n^dagger = Q. """
-    S = compute_reverse_synaptic_term(I[..., 1:], alpha)      # (..., K-1), anchored at t+1
+    S = compute_reverse_synaptic_term(I[..., 1:], alpha, blocked[..., :-1])  # (..., K-1), at t+1
     return torch.cat([S, S[..., -1:]], dim=-1)                # (..., K), censoring bin clamped
 
 
@@ -273,12 +283,15 @@ def poisson_reference_entropy(m: torch.Tensor,    # (...) per-bin firing probabi
 
 def synaptic_diagonal(I: torch.Tensor,                 # (..., n) inputs I_t .. I_{t+n-1}
                       alpha: float | torch.Tensor,
+                      blocked: torch.Tensor,           # (..., >= n) bool, the absolute window
                       ) -> torch.Tensor:               # (..., n+1)
     """ The synaptic term along the cohort born at t, at ages 0..n:
 
-        D_j = S_{t+j}(j) = sum_{i<j} alpha (1-alpha)^(j-1-i) I_{t+i},    D_0 = 0,
+        D_j = S_{t+j}(j) = sum_{i<j, i not blocked} alpha (1-alpha)^(j-1-i) I_{t+i},  D_0 = 0,
 
-    which is update_synaptic_term unrolled along the diagonal (a newborn's S is 0). Written as
+    which is update_synaptic_term unrolled along the diagonal (a newborn's S is 0, and stays 0
+    through the absolute window: the input the cohort receives at a blocked age i is not
+    integrated). Written as
     a kernel times a cumulative sum, the form compute_reverse_synaptic_term uses for the
     reverse field, with the forward kernel's growth folded into the summand:
 
@@ -290,6 +303,7 @@ def synaptic_diagonal(I: torch.Tensor,                 # (..., n) inputs I_t .. 
     9e-15). The divisor reaches exp(-U_max/tau_int) at the far end of the window, far from
     underflow for any grid the package sizes. """
     n = I.shape[-1]
+    I = torch.where(blocked[..., :n], 0.0, I)       # the clamp: blocked ages integrate nothing
     # exp(i log(1-alpha)) rather than (1-alpha)**i: the same accuracy, at an eighth of the cost
     log_keep = torch.log1p(-torch.as_tensor(alpha, dtype=I.dtype, device=I.device))
     decay = torch.exp(log_keep * torch.arange(n, device=I.device, dtype=I.dtype))
@@ -354,7 +368,8 @@ def init_epr_state(p: torch.Tensor,       # (..., Q) p_t
     for k in range(K - 1):
         if k > 0:
             # in place only on a row this function owns, never on the caller's S
-            S_k = eq.update_synaptic_term(S_k, alpha, I[..., k - 1:k], inplace=inplace and k > 1)
+            S_k = eq.update_synaptic_term(S_k, alpha, I[..., k - 1:k], blocked,
+                                          inplace=inplace and k > 1)
         # the field on the whole row, then gathered: the same elementwise sums as gathering S
         # and R first, with one (..., Q) temporary instead of three
         a = torch.clamp(n_idx + k, max=Q - 1)
@@ -404,7 +419,7 @@ def _epr_now(p, G, I, I_new, phi_t, lp_t, L_t, R, blocked, alpha, theta, kern: _
 
     # row 0: the age-0 cohort's first-passage law, off the diagonal Phi[t+j, j] (K == Q, so
     # the diagonal's ages are R's own and need no gather)
-    h = hazard_field(synaptic_diagonal(I, alpha), R, theta, inplace)
+    h = hazard_field(synaptic_diagonal(I, alpha, blocked), R, theta, inplace)
     L = kern.log1m(h, blocked)
     d = kern.phi(h, blocked)                                         # (..., K)
     del h
@@ -412,7 +427,7 @@ def _epr_now(p, G, I, I_new, phi_t, lp_t, L_t, R, blocked, alpha, theta, kern: _
     del d, L
 
     I_full = torch.cat([I, I_new.unsqueeze(-1)], dim=-1)             # I_t .. I_{t+K-1}
-    h_r = hazard_field(anchor_reverse_synaptic_term(I_full, alpha), R, theta, inplace)
+    h_r = hazard_field(anchor_reverse_synaptic_term(I_full, alpha, blocked), R, theta, inplace)
     del I_full
     lp_r, L_r = kern.logphi(h_r, blocked), kern.log1m(h_r, blocked)  # the reverse needs no Phi
     del h_r
@@ -424,7 +439,8 @@ def _newborn_cohort(I, p0_next, R, blocked, alpha, theta, kern: _Kernel, inplace
     own survival window logV_{t+1}(0) and the next step's row 0 up to lag K-3. Returns
     (logV0 (...), row0_next (..., K-2)). """
     K = I.shape[-1] + 1
-    h = hazard_field(synaptic_diagonal(I[..., 1:K - 2], alpha), R[..., :K - 2], theta, inplace)
+    h = hazard_field(synaptic_diagonal(I[..., 1:K - 2], alpha, blocked), R[..., :K - 2], theta,
+                     inplace)
     blk = blocked[..., :K - 2]
     L2 = kern.log1m(h, blk)
     d2 = kern.phi(h, blk)
@@ -522,8 +538,8 @@ def epr_step(state: tuple,                # (p, S, I, G, logV, L_end) at the rep
     G_next = _slide_G(G, row0_next, logV_next, p_next, phi_end_next, inplace)
     del row0_next
 
-    S_next = eq.update_synaptic_term(S.clone(), alpha, I[..., :1], inplace=True) if inplace \
-        else eq.update_synaptic_term(S, alpha, I[..., :1])
+    S_next = eq.update_synaptic_term(S.clone(), alpha, I[..., :1], blocked, inplace=True) \
+        if inplace else eq.update_synaptic_term(S, alpha, I[..., :1], blocked)
     I_next = torch.cat([I[..., 1:], I_new.unsqueeze(-1)], dim=-1)   # I_{t+1} .. I_{t+K-1}
     nxt = (p_next, S_next, I_next, G_next, logV_next, L_end_next)
     return nxt, epr[..., 0], epr[..., 1], epr[..., 2]
@@ -616,6 +632,7 @@ def epr_from_joint(p_joint: torch.Tensor,   # (Q, K)
 def synaptic_window(S: torch.Tensor,      # (..., Q) S_t
                     I: torch.Tensor,      # (..., K-1) inputs I_t .. I_{t+K-2}
                     alpha: float | torch.Tensor,
+                    blocked: torch.Tensor,  # (..., Q) bool, the absolute window
                     ) -> torch.Tensor:    # (..., K, Q) row j = S_{t+j}
     """ The look-ahead block the joint path reads, replayed from S_t and the input window by
     eq.update_synaptic_term -- the model's own update on the model's own inputs, so every row
@@ -624,7 +641,8 @@ def synaptic_window(S: torch.Tensor,      # (..., Q) S_t
     out = S.new_empty(S.shape[:-1] + (I.shape[-1] + 1, S.shape[-1]))
     out[..., 0, :] = S
     for j in range(I.shape[-1]):
-        out[..., j + 1, :] = eq.update_synaptic_term(out[..., j, :], alpha, I[..., j:j + 1])
+        out[..., j + 1, :] = eq.update_synaptic_term(out[..., j, :], alpha, I[..., j:j + 1],
+                                                     blocked)
     return out
 
 
@@ -639,15 +657,15 @@ def epr_step_joint(state: tuple,       # (p, S, I) at the reported t
     p, S, I = state
     I_full = torch.cat([I, I_new.unsqueeze(-1)], dim=-1)                # I_t .. I_{t+K-1}
     kern = _Kernel(hazard, beta, nu0, dt, inplace)
-    J = joint_distribution(p, synaptic_window(S, I, alpha), R, blocked, beta, theta,
+    J = joint_distribution(p, synaptic_window(S, I, alpha, blocked), R, blocked, beta, theta,
                            hazard, nu0, dt, inplace=inplace)
     h_f = hazard_field(S, R, theta, inplace)
     lp_f, l1_f = kern.logphi(h_f, blocked), kern.log1m(h_f, blocked)
     phi_f = kern.phi(h_f, blocked)
-    h_r = hazard_field(anchor_reverse_synaptic_term(I_full, alpha), R, theta, inplace)
+    h_r = hazard_field(anchor_reverse_synaptic_term(I_full, alpha, blocked), R, theta, inplace)
     e = epr_from_joint(J, lp_f, l1_f, kern.logphi(h_r, blocked), kern.log1m(h_r, blocked))
     nxt = (eq.update_age_distribution(p, phi_f),
-           eq.update_synaptic_term(S, alpha, I[..., :1]),
+           eq.update_synaptic_term(S, alpha, I[..., :1], blocked),
            I_full[..., 1:])
     return nxt, e[..., 0], e[..., 1], e[..., 2]
 

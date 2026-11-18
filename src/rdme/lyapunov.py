@@ -48,6 +48,7 @@ def update_tangent(V: torch.Tensor,        # (..., k, M, 2, Q) [dp, dS] per popu
                    dphi: torch.Tensor,     # (..., M, Q) hazard DERIVATIVES dPhi/dh
                    w: torch.Tensor,        # (..., M, M), unscaled
                    alpha: torch.Tensor,    # (..., M)
+                   blocked: torch.Tensor,  # (..., M, Q) bool, the absolute window
                    dt: float,
                    ) -> torch.Tensor:      # (..., k, M, 2, Q)
     """ One step of the linearized dynamics.
@@ -71,17 +72,21 @@ def update_tangent(V: torch.Tensor,        # (..., k, M, 2, Q) [dp, dS] per popu
     dp_new[..., 1:-1] = dp[..., :-2] * (1 - fp[..., :-2]) - p[..., :-2] * dfp[..., :-2]
     dp_new[..., -1]   = -dp_new[..., :-1].sum(dim=-1)
 
+    # S is clamped at 0 through the absolute window (equations.update_synaptic_term), so
+    # dS/dI = 0 there: the same gate on the tangent as on the state
     a = alpha.unsqueeze(-2).unsqueeze(-1)                                  # (..., 1, M, 1)
-    dS_new[..., 1:] = a * dI.unsqueeze(-1) + (1 - a) * dS[..., :-1]
+    dS_new[..., 1:] = torch.where(blocked[..., :-1].unsqueeze(-3), 0.0,
+                                  a * dI.unsqueeze(-1) + (1 - a) * dS[..., :-1])
     return out
 
 
 def tangent_step(V: torch.Tensor, p: torch.Tensor, fprobs: torch.Tensor, dphi: torch.Tensor,
-                 w: torch.Tensor, alpha: torch.Tensor, dt: float) -> torch.Tensor:
+                 w: torch.Tensor, alpha: torch.Tensor, blocked: torch.Tensor,
+                 dt: float) -> torch.Tensor:
     """ The linearized step on a flat tangent basis (..., k, M*2*Q), about the state whose
     hazards are fprobs/dphi; update_tangent on its (..., k, M, 2, Q) view. """
     M, Q = p.shape[-2:]
-    return update_tangent(V.unflatten(-1, (M, 2, Q)), p, fprobs, dphi, w, alpha,
+    return update_tangent(V.unflatten(-1, (M, 2, Q)), p, fprobs, dphi, w, alpha, blocked,
                           dt).flatten(-3)
 
 

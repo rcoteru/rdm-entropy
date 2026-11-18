@@ -42,7 +42,7 @@ def test_no_relative_term_is_pure_dead_time(K_ref, tau_ref):
 
     one = torch.tensor([1.0])
     tail = eq.field_tail(5.0, K_ref * one, tau_ref * one, T_ABS * one, 6.0 * one, 1.0 * one)
-    assert tail.item() == pytest.approx(math.exp(-5.0 / 6.0))
+    assert tail.item() == pytest.approx(math.exp(-(5.0 - T_ABS) / 6.0))   # S clamped to t_abs
     U = eq.age_window(1.0 * one, K_ref * one, tau_ref * one, T_ABS * one, 6.0 * one, 1.0 * one,
                       1e-6)
     assert bool(torch.isfinite(U).all())

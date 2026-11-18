@@ -37,6 +37,8 @@ TOL    = 1e-2      # truncation tolerance: sets the mean field's Q and the spin 
 DEVICE = 'cpu'     # 'cuda' if torch.cuda.is_available() else 'cpu'
 
 T_EQUI, T_MEAS = 5000.0, 2500.0   # ms: equilibration, then entropy recording
+STORE_SPIKES = False   # keep the spin raster of the recording, for the spin ISI CV;
+                       # int8 (T_MEAS/dt, N): 500 MB at the defaults
 
 run_sim   = True
 run_plot  = True
@@ -57,7 +59,9 @@ TITLE = (f'hazard={hazard}  ·  dt={dt:g}  ·  ic={IC}  —  '
 # the parameters name the file, so a changed parameter never reads a stale cache
 CACHE = hlp.cache_path(Path(__file__).stem,
                        dict(PARAMS, N=N, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL,
-                            ic=IC, age_max=AGE_MAX),
+                            ic=IC, age_max=AGE_MAX,
+                            # only when on, so a default run still finds its existing cache
+                            **({"spikes": True} if STORE_SPIKES else {})),
                        tag=f"J{J:g}-{IC}", root=Path(__file__).parents[1] / "cache")
 
 
@@ -81,7 +85,7 @@ if run_sim and (overwrite or not CACHE.exists()):
     t1 = time.time()
     print("Running the spin model trajectories.")
     sm_traj1 = sm.trajectory(T=steps1)
-    sm_traj2 = sm.entropy_trajectory(T=steps2)
+    sm_traj2 = sm.entropy_trajectory(T=steps2, s=STORE_SPIKES)
     t2 = time.time()
     print(f"Mean field: {t1 - t0:.2f}s. Spin model: {t2 - t1:.2f}s.")
 
@@ -93,6 +97,7 @@ if run_sim and (overwrite or not CACHE.exists()):
         "mf_traj1": mf_traj1, "mf_traj2": mf_traj2,
         "sm_traj1": sm_traj1, "sm_traj2": sm_traj2,
         "p_mf": mf.p[0].cpu(),               # age distributions, on the mean field's grid
+        "phi_mf": mf.firing_prob()[0].cpu(), # final hazard, for the stationary ISI density
         "p_sm": sm.fdist(mf.Q)[0].cpu(),
         "m_grid": m_grid.squeeze(-1).cpu(),
         "G": mf.fp_residual(m_grid).squeeze(-1).cpu(),
@@ -151,11 +156,18 @@ if run_plot:
             ax.grid()
         fig.tight_layout()
 
+        # ISI CV: the mean field's from the stationary ISI density of its final hazard (exact
+        # for an uncoupled or settled population, not on a cycle); the spins' from recorded
+        # ISIs, only if the spikes were stored
+        cv = {"Spin Model": an.isi_cv_spikes(sm_traj2["s"], dt) if "s" in sm_traj2 else None,
+              "Mean Field": an.isi_cv(d["phi_mf"], dt) if "phi_mf" in d else None}
+
         print(f"\n{'model':<11} {'r (Hz)':>9} {'r_max':>9} {'σ (nats/s)':>12} "
-              f"{'σ/r (nats/spike)':>17} {'r_max·t_abs':>12} {'cycles':>7}")
+              f"{'σ/r (nats/spike)':>17} {'r_max·t_abs':>12} {'ISI CV':>7} {'cycles':>7}")
         for k, o in out.items():
             print(f"{k:<11} {o['r_mean']:9.3f} {o['r_max']:9.3f} "
                   f"{o['sigma_mean']:12.6g} {o['sigma_per_spike']:17.6g} {o['dead_frac']:12.4f} "
+                  f"{'n/a' if cv[k] is None else f'{cv[k]:.4f}':>7} "
                   f"{'n/a' if o['n_cycles'] is None else o['n_cycles']:>7}")
 
     if True:  # fixed-point objective G(m) = m - F(m)

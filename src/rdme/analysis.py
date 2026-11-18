@@ -73,6 +73,30 @@ def rate_and_epr(traj: dict, dt: float, t_abs: float, *, cycles: bool = False) -
                 dead_frac=r_max * t_abs * 1e-3, n_cycles=n)
 
 
+def isi_cv(fprobs: torch.Tensor, dt: float) -> float:
+    """ CV of the interspike interval of a renewal neuron with the age-resolved hazard fprobs
+    (Q,): the stationary ISI density is hazard x survival, Phi(n) prod_{k<n}(1 - Phi(k)), at
+    ISI = (n+1)*dt (equations.n_abs_bins). The absorbing last bin contributes its exact
+    geometric tail, so the mean ISI is 1/equations.stationary_rate. Meaningful only where the
+    hazard is stationary -- an uncoupled population, or a settled fixed point. """
+    phi = fprobs.double()
+    Q = phi.shape[-1]
+    surv = torch.cat([phi.new_ones(1), torch.cumprod(1 - phi, dim=-1)[:-1]])
+    f, x = surv[:-1] * phi[:-1], torch.arange(1, Q, dtype=phi.dtype, device=phi.device) * dt
+    s, h = surv[-1], phi[-1]                  # the tail: ISI = (Q + k)*dt, k ~ Geometric(h)
+    m1 = (f * x).sum() + s * dt * (Q + (1 - h) / h)
+    m2 = (f * x**2).sum() + s * dt**2 * (Q**2 + 2 * Q * (1 - h) / h + (1 - h) * (2 - h) / h**2)
+    return float((m2 - m1**2).sqrt() / m1)
+
+
+def isi_cv_spikes(s: torch.Tensor, dt: float) -> float:
+    """ CV of the interspike intervals recorded in a spike raster s (T, N): every interval
+    between consecutive spikes of one neuron, pooled over neurons. """
+    neuron, t = s.bool().T.nonzero(as_tuple=True)          # sorted by neuron, then time
+    isi = t.diff()[neuron[1:] == neuron[:-1]].double() * dt
+    return float(isi.std() / isi.mean())
+
+
 # The dt -> 0 limit
 # ~~~~~~~~~~~~~~~~~
 

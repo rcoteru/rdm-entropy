@@ -63,22 +63,45 @@ def compute_total_input(
 
 
 def update_synaptic_term(
-    S: torch.Tensor,                # (Q,) or (B, Q) synaptic term
+    S: torch.Tensor,                # (..., Q) synaptic term
     alpha: float | torch.Tensor,    # synaptic decay factor
     I: float | torch.Tensor,        # total input to the population
+    blocked: torch.Tensor,          # (..., Q) bool, the absolute window (n < n_abs)
     inplace: bool = False,
 ) -> torch.Tensor:
-    """Synaptic-term update: S_new(n+1) = alpha*I + (1-alpha)*S(n), with S_new(0) = 0."""
+    """Synaptic-term update: S_new(n+1) = alpha*I + (1-alpha)*S(n), with S_new(0) = 0, and
+    S_new(n+1) = 0 where bin n is blocked.
+
+    The clamp. S resets to 0 at the spike and stays there through the absolute refractory
+    window; it starts integrating the input only when the window ends, as the GIF model
+    clamps its voltage at u_r for t_ref (Schwalger, Deger & Gerstner 2017, PLoS Comput Biol
+    13(4): e1005507, Methods: "After each spike the voltage is reset to the potential u_r,
+    where it is clamped for an absolute refractory period t_ref"; u_r = 0 here). On the grid
+    that is S(n) = 0 for n <= n_abs: the window's bins and the first eligible one, which,
+    like R's -K there, has had zero time since the window ended. The filter runs from n_abs
+    on, so S(n) has integrated (n - n_abs) bins of input: for t_abs > 0 the same clock R
+    decays on, (n+1)*dt - t_abs (with t_abs = 0, R keeps its one-bin lead, as before).
+
+    t_abs = 0 (and t_abs = dt) blocks nothing, and this is the plain update bit for bit."""
+    gate = blocked[..., :-1]
     if inplace:
         shifted = S[..., :-1].mul(1 - alpha)
-        shifted.add_(alpha * I)
+        shifted.add_(alpha * I).masked_fill_(gate, 0.0)
         S[..., 1:] = shifted
         S[..., 0] = 0
         return S
     else:
         S_new = torch.zeros_like(S)
-        S_new[..., 1:] = alpha * I + (1 - alpha) * S[..., :-1]
+        S_new[..., 1:] = torch.where(gate, 0.0, alpha * I + (1 - alpha) * S[..., :-1])
         return S_new
+
+
+def integration_age(blocked: torch.Tensor) -> torch.Tensor:
+    """ (..., Q) long: the number of bins of input the synaptic term at age n has integrated,
+    max(n - n_abs, 0) -- see update_synaptic_term. The clamp is a pure shift on this clock,
+    in either direction of time: S at age n is the unclamped S at age integration_age(n). """
+    n = torch.arange(blocked.shape[-1], device=blocked.device)
+    return (n - blocked.sum(dim=-1, keepdim=True)).clamp_min(0)
 
 
 def compute_firing_rate(P: torch.Tensor, fprobs: torch.Tensor) -> torch.Tensor:
@@ -308,9 +331,12 @@ def tau2alpha(tau: torch.Tensor, dt: float = 1.0) -> torch.Tensor:
 # u >= U >= t_abs that field error is bounded, term by term:
 #
 #   refractory   |R(u) - R(U)| <= K_ref e^{-(U-t_abs)/tau_ref}         (R rises monotonically to 0)
-#   synaptic     |S(u) - S(U)| <= A e^{-U/tau_int}                      (drive_bound below)
+#   synaptic     |S(u) - S(U)| <= A e^{-(U-t_abs)/tau_int}              (drive_bound below)
 #
-# so |h(u) - h(U)| <= Delta(U) = K_ref e^{-(U-t_abs)/tau_ref} + A e^{-U/tau_int}. Every hazard obeys
+# so |h(u) - h(U)| <= Delta(U) = K_ref e^{-(U-t_abs)/tau_ref} + A e^{-(U-t_abs)/tau_int}. The
+# synaptic term is clamped at 0 through the window (update_synaptic_term), so it has
+# integrated only the time since the window ended -- (U - t_abs)/dt + 1 bins on the grid, at
+# least the continuum's U - t_abs, which is what keeps the bound free of dt. Every hazard obeys
 # Phi(h + d)/Phi(h) in [e^{-beta|d|}, e^{beta|d|}] -- exactly for "poisson", by concavity of
 # 1 - e^{-x} for "poisson_exact", and by sigma(x + d)/sigma(x) <= e^{|d|} for "bernoulli" -- and
 # the boundary bin's share of the firing is at most 1. Hence, at every step and for every
@@ -328,17 +354,22 @@ def tau2alpha(tau: torch.Tensor, dt: float = 1.0) -> torch.Tensor:
 
 def drive_bound(w: torch.Tensor, E: torch.Tensor, t_abs: torch.Tensor,
                 tau_int: torch.Tensor) -> torch.Tensor:
-    """ A^a, (..., M): |S(u) - S(U)| <= A^a e^{-U/tau_int^a} for every pair of cohorts u >= U.
+    """ A^a, (..., M): |S(u) - S(U)| <= A^a e^{-(U - t_abs^a)/tau_int^a} for every pair of
+    cohorts u >= U >= t_abs^a.
 
-    The two synaptic terms share their first U/dt filter taps, so the gap is the filter's tail,
-    sum_{k >= Q} alpha (1-alpha)^{k-1} I(t-k). The drive splits as I = E + sum_b w^{ab} r^b. E
-    contributes |E| e^{-U/tau}. A rate has no instantaneous bound (a synchronous burst puts the
-    whole population into one step), but the dead time caps it on average: no neuron of b fires
-    twice within t_abs^b, so any window of t_abs^b holds at most one spike per neuron. Taking
-    the tail window by window at its largest weight,
+    S is clamped at 0 through the target's own window and integrates only from its end (see
+    update_synaptic_term), so a cohort of age U has integrated V = U - t_abs^a of input,
+    V/dt + 1 bins on the grid. Two cohorts u >= U share those taps, and the gap is the
+    filter's tail past them, sum_{k > V/dt} alpha (1-alpha)^{k-1} I(t-k): V plays the part U
+    played before the clamp, and t_abs^a = 0 is exactly that case. The drive splits as
+    I = E + sum_b w^{ab} r^b. E contributes |E| e^{-V/tau}. A rate has no instantaneous bound
+    (a synchronous burst puts the whole population into one step), but the dead time caps it
+    on average: no neuron of b fires twice within t_abs^b (the SOURCE's window), so any window
+    of t_abs^b holds at most one spike per neuron. Taking the tail window by window at its
+    largest weight,
 
-        sum_{k >= Q} alpha (1-alpha)^{k-1} r_{t-k} <= e^{-U/tau} (alpha/dt) / (1 - e^{-t_abs/tau})
-                                                   <= e^{-U/tau} / (tau (1 - e^{-t_abs/tau})),
+        sum_{k > V/dt} alpha (1-alpha)^{k-1} r_{t-k} <= e^{-V/tau} (alpha/dt) / (1 - e^{-t_abs^b/tau})
+                                                     <= e^{-V/tau} / (tau (1 - e^{-t_abs^b/tau})),
 
     using alpha/dt <= 1/tau. No dt survives, so the bound holds at every step size. A source
     with no dead time has no ceiling, and a population it drives, either sign, gets A = inf. """
@@ -350,13 +381,15 @@ def drive_bound(w: torch.Tensor, E: torch.Tensor, t_abs: torch.Tensor,
 
 def field_tail(U, K_ref: torch.Tensor, tau_ref: torch.Tensor, t_abs: torch.Tensor,
                tau_int: torch.Tensor, drive: torch.Tensor) -> torch.Tensor:
-    """ Delta(U) = K_ref e^{-(U-t_abs)/tau_ref} + A e^{-U/tau_int}, (..., M): the largest field
-    error the absorbing bin can commit on a cohort older than U (U >= t_abs, in ms). The
-    refractory term is 0 when K_ref = 0 or tau_ref = 0 (no relative term). """
+    """ Delta(U) = K_ref e^{-(U-t_abs)/tau_ref} + A e^{-(U-t_abs)/tau_int}, (..., M): the
+    largest field error the absorbing bin can commit on a cohort older than U (U >= t_abs, in
+    ms). Both terms run on the time since the window ended, R because it decays from there
+    and S because it is clamped until then. The refractory term is 0 when K_ref = 0 or
+    tau_ref = 0 (no relative term). """
     on = (K_ref != 0) & (tau_ref > 0)
     x = torch.as_tensor(U - t_abs).clamp_min(0.0)
     ref = torch.where(on, K_ref * torch.exp(-x / torch.where(on, tau_ref, 1.0)), 0.0)
-    return ref + drive * torch.exp(-U / tau_int)
+    return ref + drive * torch.exp(-x / tau_int)
 
 
 def age_window(beta: torch.Tensor, K_ref: torch.Tensor, tau_ref: torch.Tensor,
@@ -374,7 +407,7 @@ def age_window(beta: torch.Tensor, K_ref: torch.Tensor, tau_ref: torch.Tensor,
     target = math.log1p(tol) / beta
     on = (K_ref != 0) & (tau_ref > 0)
     hi_ref = torch.where(on, t_abs + tau_ref * torch.log(2 * K_ref / target), 0.0)
-    hi = torch.maximum(hi_ref, tau_int * torch.log(2 * drive / target)).clamp_min(0.0)
+    hi = torch.maximum(hi_ref, t_abs + tau_int * torch.log(2 * drive / target)).clamp_min(0.0)
     lo = torch.zeros_like(hi)
     for _ in range(60):
         mid = (lo + hi) / 2
@@ -449,11 +482,12 @@ def stationary_rate(fprobs: torch.Tensor, dt: float) -> torch.Tensor:
 # ~~~~~~~~
 
 def advance(p: torch.Tensor, S: torch.Tensor, I: torch.Tensor, fprobs: torch.Tensor,
-            alpha: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            alpha: torch.Tensor, blocked: torch.Tensor
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """ One step along the characteristics, given the input I (..., M) and hazards fprobs
-    (..., M, Q) of the CURRENT state. Returns (m, p, S) of the next one; nothing is modified
-    in place. """
+    (..., M, Q) of the CURRENT state, and the absolute window blocked (..., M, Q). Returns
+    (m, p, S) of the next one; nothing is modified in place. """
     m = compute_firing_rate(p, fprobs)
     p_new = update_age_distribution(p, fprobs)
-    S_new = update_synaptic_term(S, alpha[..., None], I[..., None])
+    S_new = update_synaptic_term(S, alpha[..., None], I[..., None], blocked)
     return m, p_new, S_new
