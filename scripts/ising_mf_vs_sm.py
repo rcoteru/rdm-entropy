@@ -30,11 +30,38 @@ POINTS = {
     "fig3-E15": dict(J=0.0, E=15.0, beta=0.5, theta=15.0, 
                     tau_int=20.0, tau_ref=1.0, K_ref=0.0,
                     nu0=0.01, t_abs=4.0),
-    "fig3-E30": dict(J=0.0, E=30.0, beta=0.5, theta=15.0, 
+    "fig3-E30": dict(J=0.0, E=30.0, beta=0.5, theta=15.0,
+                    tau_int=20.0, tau_ref=1.0, K_ref=0.0,
+                    nu0=0.01, t_abs=4.0),
+    # Single excitatory population. Base neuron = Schwalger 2017 Table 1 / Fig. 3 (above);
+    # only J (mV ms, on the rate in 1/ms) and E change. J is set from the mean field's Hopf
+    # point J_H (leading complex pair on the unit circle, poisson_exact, dt = 0.1); no fold
+    # below the half-ceiling r t_abs = 0.5 at either drive. No resolved cycle preset: at 1.25,
+    # 1.5 and 1.75 J_H the mean field's sigma moves by 9-21 % from dt = 0.1 to 0.05.
+    # E = 15 mV: J_H = 276.64
+    "E1-15-async": dict(J=138.32, E=15.0, beta=0.5, theta=15.0,      # 0.5 J_H
+                    tau_int=20.0, tau_ref=1.0, K_ref=0.0,
+                    nu0=0.01, t_abs=4.0),
+    "E1-15-onset": dict(J=304.31, E=15.0, beta=0.5, theta=15.0,      # 1.1 J_H
+                    tau_int=20.0, tau_ref=1.0, K_ref=0.0,
+                    nu0=0.01, t_abs=4.0),
+    "E1-15-strong": dict(J=553.29, E=15.0, beta=0.5, theta=15.0,     # 2 J_H; burst
+                    # unresolved at dt = 0.1
+                    tau_int=20.0, tau_ref=1.0, K_ref=0.0,
+                    nu0=0.01, t_abs=4.0),
+    # E = 30 mV: J_H = 139.34
+    "E1-30-async": dict(J=69.67, E=30.0, beta=0.5, theta=15.0,       # 0.5 J_H
+                    tau_int=20.0, tau_ref=1.0, K_ref=0.0,
+                    nu0=0.01, t_abs=4.0),
+    "E1-30-onset": dict(J=153.27, E=30.0, beta=0.5, theta=15.0,      # 1.1 J_H
+                    tau_int=20.0, tau_ref=1.0, K_ref=0.0,
+                    nu0=0.01, t_abs=4.0),
+    "E1-30-strong": dict(J=278.68, E=30.0, beta=0.5, theta=15.0,     # 2 J_H; burst
+                    # unresolved at dt = 0.1
                     tau_int=20.0, tau_ref=1.0, K_ref=0.0,
                     nu0=0.01, t_abs=4.0),
 }
-POINT = POINTS["default"]  # choose one of the above points
+POINT = POINTS["E1-15-onset"]  # choose one of the above points
 
 hazard  = "poisson_exact"   # "poisson_exact" | "poisson" | "bernoulli"
 IC      = "silent"          # "silent" | "random", the same start for both models
@@ -45,9 +72,10 @@ dt     = 0.1       # ms, solver step; must divide t_abs
 TOL    = 1e-2      # truncation tolerance: sets the mean field's Q and the spin EPR's lookahead
 DEVICE = 'cpu'     # 'cuda' if torch.cuda.is_available() else 'cpu'
 
-T_EQUI, T_MEAS = 5000.0, 2500.0   # ms: equilibration, then entropy recording
+T_EQUI, T_MEAS = 5000.0, 3000.0  # ms: equilibration, then entropy recording; T_MEAS holds
+                                 # >= 30 periods on the oscillating presets (~70 ms at E = 15)
 STORE_SPIKES = False   # keep the spin raster of the recording, for the spin ISI CV;
-                       # int8 (T_MEAS/dt, N): 500 MB at the defaults
+                       # int8 (T_MEAS/dt, N): 600 MB at the defaults
 
 run_sim   = True
 run_plot  = True
@@ -164,19 +192,28 @@ if run_plot:
             ax.grid()
         fig.tight_layout()
 
-        # ISI CV: the mean field's from the stationary ISI density of its final hazard (exact
-        # for an uncoupled or settled population, not on a cycle); the spins' from recorded
-        # ISIs, only if the spikes were stored
+        # ISI CV: the mean field's from the stationary ISI density of its final hazard, only
+        # when settled (on a cycle or while ringing that hazard is not an ISI distribution);
+        # the spins' from recorded ISIs, only if the spikes were stored
+        mf_settled = out["Mean Field"]["state"] == "settled"
         cv = {"Spin Model": an.isi_cv_spikes(sm_traj2["s"], dt) if "s" in sm_traj2 else None,
-              "Mean Field": an.isi_cv(d["phi_mf"], dt) if "phi_mf" in d else None}
+              "Mean Field": an.isi_cv(d["phi_mf"], dt) if mf_settled and "phi_mf" in d
+                            else None}
 
-        print(f"\n{'model':<11} {'r (Hz)':>9} {'r_max':>9} {'σ (nats/s)':>12} "
-              f"{'σ/r (nats/spike)':>17} {'r_max·t_abs':>12} {'ISI CV':>7} {'cycles':>7}")
+        def cycles_col(o):
+            if o["state"] is None:
+                return "n/a"
+            if o["state"] == "settling":
+                return f"settling ({o['amp_ratio']:.3f})"
+            return str(o["n_cycles"])
+
+        print(f"\n{'model':<11} {'r (Hz)':>9} {'r range (Hz)':>20} {'σ (nats/s)':>12} "
+              f"{'σ/r (nats/spike)':>17} {'r·t_abs':>8} {'ISI CV':>7} {'cycles':>7}")
         for k, o in out.items():
-            print(f"{k:<11} {o['r_mean']:9.3f} {o['r_max']:9.3f} "
-                  f"{o['sigma_mean']:12.6g} {o['sigma_per_spike']:17.6g} {o['dead_frac']:12.4f} "
-                  f"{'n/a' if cv[k] is None else f'{cv[k]:.4f}':>7} "
-                  f"{'n/a' if o['n_cycles'] is None else o['n_cycles']:>7}")
+            rng = f"[{o['r_min']:.3f}, {o['r_max']:.3f}]"
+            print(f"{k:<11} {o['r_mean']:9.3f} {rng:>20} "
+                  f"{o['sigma_mean']:12.6g} {o['sigma_per_spike']:17.6g} {o['dead_frac']:8.4f} "
+                  f"{'n/a' if cv[k] is None else f'{cv[k]:.4f}':>7} {cycles_col(o):>7}")
 
     if True:  # fixed-point objective G(m) = m - F(m)
         m_grid, G, roots, rho = d["m_grid"], d["G"], d["roots"], d["rho"]

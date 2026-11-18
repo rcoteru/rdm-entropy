@@ -35,42 +35,73 @@ def cycle_window(x: torch.Tensor, rel_tol: float = 1e-9) -> tuple[int, int, int]
     settled. """
     if float(x.max() - x.min()) < rel_tol * float(x.mean().abs()):
         return 0, len(x), 0
-    y  = x - x.mean()
-    up = ((y[:-1] <= 0) & (y[1:] > 0)).nonzero().flatten()
+    up = _up_crossings(x)
     if len(up) < 2:
         return 0, len(x), 0
     return int(up[0]), int(up[-1]), len(up) - 1
 
 
+def _up_crossings(x: torch.Tensor) -> torch.Tensor:
+    """ Indices of the upward crossings of the mean of `x`, the cycle boundaries. """
+    y = x - x.mean()
+    return ((y[:-1] <= 0) & (y[1:] > 0)).nonzero().flatten()
+
+
+def cycle_amplitude_ratio(x: torch.Tensor) -> float:
+    """ Peak-to-peak of the last whole cycle of `x` over that of the first, the cycles as
+    cycle_window delimits them: 1 on a limit cycle, below 1 on a decaying oscillation (ringing
+    onto a fixed point), above 1 on a growing one. With a single cycle the two are the same
+    cycle and the ratio is 1; nan with none. """
+    up = _up_crossings(x)
+    if len(up) < 2:
+        return float("nan")
+    first, last = x[up[0]:up[1]], x[up[-2]:up[-1]]
+    return float((last.max() - last.min()) / (first.max() - first.min()))
+
+
 # Standard outputs
 # ~~~~~~~~~~~~~~~~
 
-def rate_and_epr(traj: dict, dt: float, t_abs: float, *, cycles: bool = False) -> dict:
+def rate_and_epr(traj: dict, dt: float, t_abs: float, *, cycles: bool = False,
+                 amp_tol: float = 0.05) -> dict:
     """ Rate and entropy production of one trajectory, in physical units.
 
     `traj` is an entropy_trajectory dict: m_tot is the fraction of neurons spiking per bin,
     sigma_tot the entropy production in nats per neuron per bin. `dt` and `t_abs` are in ms.
     The average runs over the whole trajectory, or with `cycles` over a whole number of
     periods of r (cycle_window): for the mean field only, since on a finite-N trace it counts
-    noise crossings as cycles.
+    noise crossings as cycles. With `cycles`, an oscillation counts as a cycle only if the
+    peak-to-peak of its last and first recorded cycles agree within `amp_tol`
+    (cycle_amplitude_ratio); otherwise it is still settling -- ringing onto a fixed point, or
+    growing towards a cycle -- and is reported as such.
 
     Returns
       r, sigma           traces: Hz, nats per neuron per s
-      r_mean, r_max      over the averaging window, Hz
+      r_mean, r_min, r_max   over the averaging window, Hz
       sigma_mean         nats per neuron per s; the EPR
       sigma_per_spike    sigma_mean / r_mean, nats per spike; nan at r_mean = 0
-      dead_frac          r_max * t_abs, dimensionless: how close the peak rate comes to the
-                         dead-time ceiling 1/t_abs; on a finite-N trace r_max is a single noisy
-                         bin, so this overstates it
-      n_cycles           periods averaged over (0 if settled); None without `cycles` """
+      dead_frac          r_mean * t_abs, dimensionless: the fraction of time a neuron spends
+                         in the absolute window, against the dead-time ceiling 1/t_abs. The
+                         mean, not the peak: a burst can briefly exceed 1/t_abs
+      n_cycles           periods averaged over; None without `cycles`
+      state              "settled" (no oscillation, n_cycles = 0), "cycle" or "settling";
+                         None without `cycles`
+      amp_ratio          cycle_amplitude_ratio of r; None unless oscillating """
     r     = traj["m_tot"] / dt * 1e3        # spikes per neuron per s
     sigma = traj["sigma_tot"] / dt * 1e3    # nats per neuron per s
     a, b, n = cycle_window(r) if cycles else (0, len(r), None)
+    state, ratio = None, None
+    if cycles:
+        if n == 0:
+            state = "settled"
+        else:
+            ratio = cycle_amplitude_ratio(r)
+            state = "cycle" if abs(ratio - 1) <= amp_tol else "settling"
     r_mean, sigma_mean = r[a:b].mean().item(), sigma[a:b].mean().item()
-    r_max = r[a:b].max().item()
-    return dict(r=r, sigma=sigma, r_mean=r_mean, r_max=r_max, sigma_mean=sigma_mean,
+    return dict(r=r, sigma=sigma, r_mean=r_mean, r_min=r[a:b].min().item(),
+                r_max=r[a:b].max().item(), sigma_mean=sigma_mean,
                 sigma_per_spike=sigma_mean / r_mean if r_mean > 0 else float("nan"),
-                dead_frac=r_max * t_abs * 1e-3, n_cycles=n)
+                dead_frac=r_mean * t_abs * 1e-3, n_cycles=n, state=state, amp_ratio=ratio)
 
 
 def isi_cv(fprobs: torch.Tensor, dt: float) -> float:
