@@ -31,7 +31,7 @@ except ImportError:
 PRESET = "S1"
 HAZARD = "poisson_exact"
 
-# S1-2Dscan_betaJ.py's grid, built the same way (before the float64 default is set, as there)
+# S1-2Dscan_betaJ.py's grid, built the same way (in torch's float32 default, as there)
 PARAMS: dict = pre.params(
     PRESET, hazard=HAZARD,
     J    = torch.linspace(0, 60.0, 81),
@@ -65,7 +65,6 @@ CACHE = hlp.cache_path(Path(__file__).stem,
                        dict(PARAMS, preset=PRESET, t_equi=T_EQUI, t_meas=T_MEAS, Qm=QM,
                             slice=SLICE, code=VERSION),
                        tag=f"{VERSION}_{SLICE}", root=Path(__file__).parents[1] / "cache")
-torch.set_default_dtype(torch.float64)
 
 
 def acf1_of(traj: torch.Tensor) -> torch.Tensor:

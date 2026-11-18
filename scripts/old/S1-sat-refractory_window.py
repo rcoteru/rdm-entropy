@@ -6,12 +6,12 @@ windowed rate there is bit-identical at t_abs = 0 vs t_abs = 1 ms (S1-api_checks
 so it is not re-run here.
 
 S1-sat is the rate-ceiling point -- strong drive, deep own kernel (K_ref = 25, tau_ref = 25),
-J = 40 -- and CLAUDE.md names it as the one where "the realised rate should sit at 1/t_abs".
+J = 40 -- and it is the one where "the realised rate should sit at 1/t_abs".
 That is the opposite end from S1's "the window never gets close enough to matter", so it is
 where t_abs ought to show up in the rate if it shows up anywhere in this one-population system.
 
 Method: hold dt fixed at a step that divides every t_abs in the ladder, sweep t_abs from 0 (the
-explicit "no dead time" case CLAUDE.md says has to be asked for) up through and past the
+explicit "no dead time" case, which has to be asked for) up through and past the
 preset's own t_abs = 1 ms, and read the stationary rate and entropy production at each. The
 closed-form ceiling this is read against is route B's own: r <= 1/t_abs for t_abs > 0, with no
 cap at all for t_abs = 0 (the hazard itself is unbounded; only the dead time bounds the rate
@@ -44,7 +44,6 @@ T_ABS_LADDER = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)   # 1.0 is the preset's own value
 TOL = 1e-2
 
 DEVICE = 'cpu'
-torch.set_default_dtype(torch.float64)
 
 
 def run(t_abs: float) -> dict:
@@ -91,12 +90,12 @@ rel = abs(r1 - r0) / abs(r0)
 print(f"\nrate at t_abs=1 vs t_abs=0: {r1:.8f} vs {r0:.8f}, relative difference {rel:.4e}")
 if rel > 1e-3:
     print("LOAD-BEARING at S1-sat: the window measurably changes the rate here, unlike at S1")
-    print("(bit-identical there, S1-api_checks.py check 3). This is CLAUDE.md's stated")
+    print("(bit-identical there, S1-api_checks.py check 3). This is the stated")
     print("expectation -- t_abs is 'load-bearing at strong drive, which is... what S1-sat is")
     print("for' -- now with a number rather than a claim.")
 else:
     print("The window is STILL inert here to 1e-3 relative, which contradicts the expectation")
-    print("recorded in CLAUDE.md and S1-api_checks.py check 3's closing note. Stop-and-flag:")
+    print("recorded in S1-api_checks.py check 3's closing note. Stop-and-flag:")
     print("this is a surprise, not a result to file quietly -- check that S1-sat's own rate")
     print("(0.008 /ms at dt=0.5 per S1-sat-age_grid.py) is actually close enough to 1/t_abs")
     print("for the window to have anything to do, since a rate far below the ceiling would")

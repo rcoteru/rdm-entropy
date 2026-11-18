@@ -94,7 +94,6 @@ U_MAX = 200.0                       # ms of age grid, as fitted for S1 in S1-cyc
 EQUI_MS = 4000.0                    # these are uncoupled or settled; this is ample
 
 DEVICE = 'cpu'
-torch.set_default_dtype(torch.float64)
 
 
 def stripped(E: float, hazard: str, *, t_abs: float, dt: float = DT, nu0: float = NU0):
@@ -140,7 +139,7 @@ print("=" * 78)
 print("    prediction: r = (1/t_abs) * sigma(beta*(E - theta)), exact at nu0*t_abs = 1")
 print(f"    quoted as a dt -> 0 limit, Richardson from {DT_PAIR} at first order\n")
 
-E_SWEEP = torch.linspace(0.0, 2.5, 26)
+E_SWEEP = torch.linspace(0.0, 2.5, 26, dtype=torch.float64)
 print(f"    {'E':>6}{'beta*h':>9}{'r(dt)':>13}{'r(dt/2)':>13}{'r limit':>13}"
       f"{'prediction':>13}{'err(dt/2)':>11}{'err(limit)':>11}{'r*dt/2':>10}")
 rows = []
@@ -177,7 +176,7 @@ print("=" * 78)
 
 KERNELS = ("bernoulli", "poisson", "poisson_exact")
 T_ABS_SWEEP = (0.5, 1.0, 2.0)       # 1/nu0 = 1.0 is the middle one; all divide into dt-grids
-E_SHORT = torch.linspace(0.0, 2.0, 9)
+E_SHORT = torch.linspace(0.0, 2.0, 9, dtype=torch.float64)
 print(f"    rates are dt -> 0 limits, Richardson from {DT_PAIR} at first order")
 
 
@@ -267,7 +266,7 @@ for name in POINTS:
           f"({a[0]:.8f} -> {b[0]:.8f})")
     if rel > 1e-3:
         MOVED = True
-        print(f"      *** the window is NOT inert here. CLAUDE.md: S1 is the preset every")
+        print(f"      *** the window is NOT inert here. S1 is the preset every")
         print(f"      *** paper figure uses, so a shift at S1 is a DECISION, not a")
         print(f"      *** measurement. Stop and flag it; nothing in this script resolves it.")
 if not MOVED:
@@ -308,7 +307,7 @@ for E in E_LADDER:
           f"{['%.2f' % q for q in ratios]}  (-> 2 means the gap is O(dt))")
 
     for h in ("poisson", "poisson_exact"):
-        v = torch.tensor(vals[h])
+        v = torch.tensor(vals[h], dtype=torch.float64)
         lim, pord = richardson(v)
         o = ['%.2f' % q for q in orders(v).tolist()]
         rel = abs(lim - pred) / pred
@@ -319,7 +318,7 @@ print("\n    The two limits coincide, and both land on the closed form -- but NO
 print("    well from a coarse ladder: poisson_exact shows a clean order 1 and lands within")
 print("    1e-5, while poisson's observed order is still drifting down toward 1 at dt = 1/32")
 print("    and its extrapolated limit is three orders worse. This is the quantitative form of")
-print("    CLAUDE.md's rule that the dt -> 0 limit is taken with poisson_exact: not because")
+print("    the rule that the dt -> 0 limit is taken with poisson_exact: not because")
 print("    poisson has a different limit, but because it is not yet in its asymptotic regime")
 print("    at any step a scan can afford. Note too that poisson is 87% high at dt = 0.5 for a")
 print("    neuron firing at 0.05 /ms: its error tracks c = nu0*dt, not lam*dt, so a slow")
@@ -341,7 +340,7 @@ print("[5] Section 11 re-run: bernoulli at its own bin (dt = t_abs = 1, no extra
 print("    against the route-B kernels as a dt -> 0 limit, both at t_abs = 1/nu0.")
 print("=" * 78)
 
-E_S11 = torch.linspace(0.0, 2.0, 9)
+E_S11 = torch.linspace(0.0, 2.0, 9, dtype=torch.float64)
 print(f"    {'E':>6}{'beta*h':>9}{'bernoulli @ dt=1':>18}"
       + "".join(f"{k + ' limit':>18}" for k in ("poisson", "poisson_exact"))
       + f"{'|A-B|/B':>11}")

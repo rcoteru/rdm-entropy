@@ -5,10 +5,15 @@ import math
 import pytest
 import torch
 
-import rdme.fixed_points as fpts
 import rdme.equations as eq
+import rdme.fixed_points as fpts
 from conftest import SETTLED, WC
-from rdme.mean_field import RDMIsingModel, RDMNetwork, RDMWilsonCowan, RDMWilsonCowanPoints
+from rdme.mean_field import (
+    RDMIsingModel,
+    RDMNetwork,
+    RDMWilsonCowan,
+    RDMWilsonCowanPoints,
+)
 
 
 def test_stationary_field_is_the_geometric_sum():
@@ -138,8 +143,8 @@ def test_each_population_has_its_own_dead_time():
     with t_abs = 0 has none. """
     net = _two_populations([2.0, 0.0], [[0.5, -1.0], [1.0, -1.0]])
     assert net.n_abs.tolist() == [7, 0]
-    assert bool((net.R[0, :7] == -net.R_abs[0]).all()) and net.R[0, 7] > -net.K_ref[0]
-    assert torch.equal(net.R[1], -net.K_ref[1] * torch.exp(-torch.arange(60) * 0.25 / 3.0))
+    assert bool((net.R[0, :7] == -net.R_abs[0]).all()) and net.R[0, 7] == -net.K_ref[0]
+    assert torch.equal(net.R[1], -net.K_ref[1] * torch.exp(-((torch.arange(60) + 1) * 0.25) / 3.0))
     net.forward(200)
 
 

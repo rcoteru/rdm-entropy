@@ -95,7 +95,6 @@ DT_FIT  = 0.25        # the window is fitted here once and held in ms across the
 
 DEVICE = 'cpu'        # one system on a few thousand age bins is launch-latency bound, and the
                       # memory column is only meaningful on the path that allocates in RAM
-torch.set_default_dtype(torch.float64)
 
 COLS = ("r", "sigma", "period", "ptp", "Q", "phi_max", "lam_max", "acf1",
         "secs", "rss_bytes")
@@ -196,7 +195,7 @@ if run_sim:
                   f"sigma/dt = {d['sigma']:11.4e}  {d['secs']:7.1f}s  "
                   f"rss {d['rss_bytes'] / 2**30:6.3f} GiB", flush=True)
 
-        res[name] = torch.tensor(rows)
+        res[name] = torch.tensor(rows, dtype=torch.float64)
         CACHE_DIR.mkdir(exist_ok=True)
         tmp = CACHE.with_suffix(".tmp"); torch.save(res, tmp); tmp.replace(CACHE)
 

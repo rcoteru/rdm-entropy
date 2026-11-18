@@ -60,8 +60,8 @@ and never with theta.
 
 E IS TUNED ONCE AT dt = 0.25 AND HELD DOWN THE LADDER (decision carried into this script, not
 taken by it). A dt -> 0 limit is taken at fixed model parameters: re-tuning E per rung would
-change the model at every rung and make Richardson meaningless, and CLAUDE.md is explicit that
-model parameters do not move when dt does. The realised r therefore drifts along the ladder --
+change the model at every rung and make Richardson meaningless, and model parameters do
+not move when dt does. The realised r therefore drifts along the ladder --
 so does S1's own at fixed J, which is what makes the comparison like for like, and both drifts
 are reported.
 """
@@ -137,7 +137,7 @@ E_BISECT = 20          # halvings of one 0.1-wide scan cell -> 1e-7 in E
 # (J_c = 11.534, so J = 17 sits 5.466 past onset) is a distance in J, and a distance past onset
 # is only comparable if it is measured along the same axis.
 J_ONSET_BRACKET, N_BISECT_J = (4.0, 17.0), 20
-J_C_S1   = 11.534      # S1's Hopf under poisson_exact, as a dt -> 0 limit (CLAUDE.md)
+J_C_S1   = 11.534      # S1's Hopf under poisson_exact, as a dt -> 0 limit (S1-cycle_point.py)
 DELTA_S1 = J_CYCLE - J_C_S1
 
 T_EQUI, T_MEAS = 8000.0, 4000.0   # ms
@@ -145,7 +145,6 @@ TOL     = 1e-5        # age-grid accuracy
 TOL_FIT = TOL / 100   # fitted two decades tighter than it is asserted -- see S1-dt_conv.py
 
 DEVICE = 'cpu'
-torch.set_default_dtype(torch.float64)
 
 COLS = ("r", "sigma", "period", "ptp", "Q", "phi_max", "lam_max", "acf1")
 
@@ -240,7 +239,7 @@ def measure(P: dict, J: float, dt: float, Q: int, *, ic_m: float | None = None) 
     the default initial condition and "which attractor" is itself the question. """
     net = build(P, J, dt, Q)
     if ic_m is not None:
-        net.set_state(torch.tensor([ic_m], device=DEVICE))
+        net.set_state(torch.tensor([ic_m], device=DEVICE, dtype=torch.float64))
     net.forward(hlp.n_steps(T_EQUI, dt))
     traj = net.entropy_trajectory(hlp.n_steps(T_MEAS, dt), pb=False)
 
@@ -309,7 +308,7 @@ def branches(J: float, dt: float, Q: int) -> torch.Tensor:
     the fold where the active branch is born. """
     net = build(PARAMS_NU0, J, dt, Q)
     roots = net.fixed_points(n_grid=N_GRID, lo=0.0, hi=R_SCAN_MAX * dt)
-    return torch.tensor(sorted(float(x) / dt for x in roots))
+    return torch.tensor(sorted(float(x) / dt for x in roots), dtype=torch.float64)
 
 
 def spectral_radius(J: float, m: float, dt: float, Q: int) -> float:
@@ -320,7 +319,7 @@ def spectral_radius(J: float, m: float, dt: float, Q: int) -> float:
     structure is bistable and the unstable middle branch would pin the max above 1 at every J,
     which would say nothing about the branch being classified. """
     net = build(PARAMS_NU0, J, dt, Q)
-    return float(net.fp_eigenvalues(torch.tensor([m], device=DEVICE)).abs().max())
+    return float(net.fp_eigenvalues(torch.tensor([m], device=DEVICE, dtype=torch.float64)).abs().max())
 
 
 def n_active(J: float, dt: float, Q: int) -> int:
@@ -336,7 +335,7 @@ def active_root(J: float, m0: float, dt: float, Q: int) -> float:
     which a root find in J would pay forty times over for no extra information. """
     net = build(PARAMS_NU0, J, dt, Q)
     roots = net.fixed_points(method='newton',
-                             guesses=torch.tensor([[m0]], device=DEVICE))
+                             guesses=torch.tensor([[m0]], device=DEVICE, dtype=torch.float64))
     return float(roots[-1]) / dt if roots.numel() else float('nan')
 
 
@@ -434,7 +433,7 @@ def fp_rho(P: dict, J: float, dt: float, Q: int) -> tuple[float, float, int]:
     if rts.numel() == 0:
         return float('nan'), float('nan'), 0
     m = float(sorted(float(x) for x in rts)[0])
-    rho = float(net.fp_eigenvalues(torch.tensor([m], device=DEVICE)).abs().max())
+    rho = float(net.fp_eigenvalues(torch.tensor([m], device=DEVICE, dtype=torch.float64)).abs().max())
     return rho, m / dt, len(rts)
 
 
@@ -467,7 +466,7 @@ if run_erest and (overwrite or not CACHE_EREST.exists()):
             t0 = time.time()
             rs.append(r_of(E, J, Q))
             print(f"    E = {E:5.2f}  r = {rs[-1]:.8f}  ({time.time() - t0:.0f}s)", flush=True)
-        rs_t = torch.tensor(rs)
+        rs_t = torch.tensor(rs, dtype=torch.float64)
         EO["scan"][name] = rs_t
 
         # every crossing of the target on the scan, so a second root is seen and not stepped over
@@ -535,7 +534,7 @@ if run_erest and (overwrite or not CACHE_EREST.exists()):
               f"phi_max = {dm['phi_max']:.6g}", flush=True)
 
     # the rho(J) profile at the tuned E, for the figure and for reading the onset off a curve
-    J_PROF = torch.arange(4.0, 20.1, 1.0)
+    J_PROF = torch.arange(4.0, 20.1, 1.0, dtype=torch.float64)
     EO["onset"]["J_prof"] = J_PROF
     EO["onset"]["rho_prof"] = [fp_rho(P_E(E_c), float(j), DT_EIG, Q_on)[0]
                                for j in J_PROF]
@@ -549,7 +548,7 @@ if run_erest and (overwrite or not CACHE_EREST.exists()):
 #
 # E IS TUNED ONCE AT DT_REF = 0.25 AND HELD ACROSS THE WHOLE LADDER. A dt -> 0 limit is taken
 # at FIXED model parameters: re-tuning E at every rung would change the model at every rung
-# and make Richardson meaningless, and CLAUDE.md is explicit that model parameters do not move
+# and make Richardson meaningless, and model parameters do not move
 # when dt does. The price is that the realised r drifts along the ladder -- so does S1's own,
 # which is the like-for-like comparison, and both drifts are reported.
 #
@@ -632,7 +631,7 @@ if run_ladder and (overwrite or not CACHE_LADDER.exists()):
                       f"sigma = {d['sigma']:.6e}  ptp = {d['ptp']:.6f}  "
                       f"maxPhi = {d['phi_max']:.4f}  lam = {d['lam_max']:.4f}  "
                       f"({d['secs']:.0f}s)", flush=True)
-            L[(side, name)] = torch.tensor(rows)
+            L[(side, name)] = torch.tensor(rows, dtype=torch.float64)
             CACHE_DIR.mkdir(exist_ok=True)
             tmp = CACHE_LADDER.with_suffix(".tmp"); torch.save(L, tmp); tmp.replace(CACHE_LADDER)
     print(f"  saved {CACHE_LADDER}")
@@ -648,8 +647,8 @@ if run_ladder and (overwrite or not CACHE_LADDER.exists()):
 
 def power_fit(x: list[float], y: list[float]) -> tuple[float, float]:
     """ (C, p) of y = C x^p by least squares in logs. Two points give the line through them. """
-    lx = torch.tensor([math.log(v) for v in x])
-    ly = torch.tensor([math.log(v) for v in y])
+    lx = torch.tensor([math.log(v) for v in x], dtype=torch.float64)
+    ly = torch.tensor([math.log(v) for v in y], dtype=torch.float64)
     n  = len(x)
     p  = float(((lx * ly).mean() - lx.mean() * ly.mean())
                / ((lx * lx).mean() - lx.mean() ** 2))
@@ -815,7 +814,7 @@ if run_report:
     for name, J in REGIMES.items():
         tgt = targets[name]
         # (i) can the ATTRACTOR be brought to the target by J alone?
-        att = torch.tensor([dict(zip(COLS, R["attractor"][j]))["r"] for j in Js])
+        att = torch.tensor([dict(zip(COLS, R["attractor"][j]))["r"] for j in Js], dtype=torch.float64)
         bracketed = bool(((att - tgt)[:-1] * (att - tgt)[1:] < 0).any())
         # (ii) the J at which the ACTIVE BRANCH's own fixed-point rate equals the target --
         #      well defined whatever that branch's stability, by linear interpolation on the

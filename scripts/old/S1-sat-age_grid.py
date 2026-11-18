@@ -1,11 +1,11 @@
 """
 Age-grid sizing at S1-sat: does holding U_max FIXED IN MS, fitted from the tolerance, actually
-behave the way CLAUDE.md's sizing rule says it should -- and how much does the tolerance every
+behave the way the sizing rule says it should -- and how much does the tolerance every
 other script asserts (TOL = 1e-2) actually cost against a grid fitted two decades tighter?
 
 Never run as a committed script before ([[P1 age-grid]] cites no dump). S1-sat rather than S1
 because it is the rate-ceiling point: E = 0, beta = 8, tau_ref = 25, K_ref = 25, J = 40, the
-deepest kernel and the point CLAUDE.md names as the one where t_abs is load-bearing -- which
+deepest kernel and the point where t_abs is expected to be load-bearing -- which
 makes it the binding case for the age window too, not the mild one S1 itself would be.
 
 Two things are checked, both closed forms of the sizing rule rather than guesses about it:
@@ -21,7 +21,7 @@ Two things are checked, both closed forms of the sizing rule rather than guesses
   2. THE SAME TOLERANCE AT TWO dt. If U_max in ms, not Q in bins, is the sizing-invariant
      quantity, fitting the SAME tol at two different dt should return very different Q (because
      Q = U_max/dt) but very nearly the same U_max. Fitting a fixed Q across dt -- the rule
-     CLAUDE.md explicitly rejects -- would instead hold Q fixed and let U_max drift with dt,
+     that is explicitly rejected -- would instead hold Q fixed and let U_max drift with dt,
      which is the failure mode this check is built to catch.
 
 Exploration-grade, per the 2026-11-08 brief: this validates the RULE, not a production number.
@@ -44,10 +44,9 @@ DT = 0.5                    # the dt S1-mf_vs_sm.py already runs S1-sat at
 PARAMS: dict = pre.params(PRESET, hazard=HAZARD, dt=DT)
 
 EQUI_MS, MEAS_MS = 6000.0, 4000.0     # ample for a fixed point this strongly driven
-EQUI = hlp.n_steps(EQUI_MS + MEAS_MS, DT)   # fit_age_grid's equi must cover equi+meas (CLAUDE.md)
+EQUI = hlp.n_steps(EQUI_MS + MEAS_MS, DT)   # fit_age_grid's equi must cover equi+meas
 
 DEVICE = 'cpu'
-torch.set_default_dtype(torch.float64)
 
 
 def settle_and_measure(Q: int, dt: float) -> tuple[float, float, float]:
@@ -77,7 +76,7 @@ print(f"[1] {PRESET}, dt = {DT:g}: tolerance ladder, Q and U_max it buys")
 print("=" * 78)
 
 TOL_LADDER = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]   # TOL=1e-2 is what every production script
-                                                     # asserts; 1e-4 is CLAUDE.md's "100x tighter"
+                                                     # asserts; 1e-4 is the "100x tighter" check
 rows = []
 t0 = time.time()
 for tol in TOL_LADDER:

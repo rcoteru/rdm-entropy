@@ -38,8 +38,8 @@ def test_poisson_phi_is_gauge_invariant_in_the_log_odds(delta):
 
 
 def _pair(delta, beta=6.0):
-    P = dict(J=10.0, E=0.0, beta=beta, tau_int=15.0, tau_ref=15.0, K_ref=15.0,
-             dt=0.25, t_abs=1.0, hazard="poisson_exact")
+    P = {"J": 10.0, "E": 0.0, "beta": beta, "tau_int": 15.0, "tau_ref": 15.0, "K_ref": 15.0,
+             "dt": 0.25, "t_abs": 1.0, "hazard": "poisson_exact"}
     return (RDMIsingModel(**P, theta=0.5, nu0=1.0),
             RDMIsingModel(**P, theta=0.5 + delta, nu0=math.exp(beta * delta)))
 

@@ -7,7 +7,7 @@ no extra compute:
   1. J_c, the Hopf, as a dt -> 0 LIMIT. rho(J) is the spectral radius of the one-step Jacobian
      at the fixed point, so the bifurcation is rho = 1 and is located by bisection. Done at a
      (dt, dt/2) pair plus one coarser step, so the pair's own order can be read off a triple
-     rather than assumed -- which is what CLAUDE.md's reporting rule asks for.
+     rather than assumed -- which is what the reporting rule asks for.
 
   2. The cycle point. The amplitude of a Hopf cycle goes like sqrt(J - J_c), so a point chosen
      just past onset is read in the sensitive neighbourhood of a bifurcation that is itself
@@ -118,7 +118,6 @@ T_EQUI_ONSET = 60000.0            # ms per stage; the second measurement is at 2
 SETTLE_TOL   = 0.01               # |amp(2x) / amp(1x) - 1| a point must be inside to be fitted
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-torch.set_default_dtype(torch.float64)
 
 
 # ── Paths & switches ──────────────────────────────────────────────────────────
@@ -227,9 +226,9 @@ def occupancy(mf, n_probe: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tenso
     mf.p, not mf.age_density(): the latter is the density p/dt, and what is wanted here is the
     MASS fraction sitting in the mf.n_abs bins the dead time blocks. At the ceiling the whole
     population is inside that window and r = 1/t_abs. """
-    occ  = torch.zeros(mf.B, device=mf.device)
-    rmax = torch.zeros(mf.B, device=mf.device)
-    lmax = torch.zeros(mf.B, device=mf.device)
+    occ  = torch.zeros(mf.B, device=mf.device, dtype=torch.float64)
+    rmax = torch.zeros(mf.B, device=mf.device, dtype=torch.float64)
+    lmax = torch.zeros(mf.B, device=mf.device, dtype=torch.float64)
     phi  = 0.0
     blocked = torch.arange(mf.Q, device=mf.device) < mf.n_abs[:, 0, None]   # (B, Q), per cell
     for _ in range(n_probe):
@@ -324,7 +323,7 @@ def scan(dt: float, u_max: float, J_SCAN: torch.Tensor,
         del t2, r2
     del mf, traj
     if DEVICE == 'cuda': torch.cuda.empty_cache()
-    return torch.tensor(blk)
+    return torch.tensor(blk, dtype=torch.float64)
 
 
 if run_scan and (overwrite or not CACHE_SCAN.exists()):
@@ -374,7 +373,7 @@ if run_mono and (overwrite or not CACHE_MONO.exists()):
               f"({time.time() - t0:.0f}s)", flush=True)
     CACHE_DIR.mkdir(exist_ok=True)
     torch.save({"J": CAND_J, "dts": list(DT_MONO), "cols": ("r", "sigma", "period", "ptp"),
-                "rows": torch.tensor(rows), "u_max": u_max}, CACHE_MONO)
+                "rows": torch.tensor(rows, dtype=torch.float64), "u_max": u_max}, CACHE_MONO)
     print(f"  saved {CACHE_MONO}")
 
 
@@ -392,7 +391,7 @@ if run_plot:
     dt1, dt2 = DT_PAIR
 
     # 1. the Hopf, extrapolated
-    jc = torch.tensor([H["J_c"][dt] for dt in DTS])
+    jc = torch.tensor([H["J_c"][dt] for dt in DTS], dtype=torch.float64)
     jc_lim, p = richardson(jc)
     print(f"\n[1] Hopf, rho(J) = 1 at S1 under {HAZARD}")
     for dt, v in zip(DTS, jc): print(f"    dt = {dt:6.4f}   J_c = {float(v):.6f}")
@@ -615,7 +614,7 @@ if run_plot:
         axL.loglog(x[m], lim["sigma"][m].clamp_min(1e-300), 's', markersize=3.5, color='C1',
                    markerfacecolor='none', label='far field (J = 12-20)')
     k = float(lim_o["sigma"][-1]) / float(xo[-1])
-    xs = torch.tensor([float(xo[0]), 10.0])
+    xs = torch.tensor([float(xo[0]), 10.0], dtype=torch.float64)
     axL.loglog(xs, k * xs, 'k--', linewidth=0.8, label=r'slope 1 ($\propto J - J_c$)')
     axL.set_xlabel(r'$J - J_c$'); axL.set_ylabel(r'$\sigma/\Delta_t$ [nats/ms]')
     axL.set_title('EPR past onset -- FIRST LOOK, not converged')

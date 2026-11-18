@@ -4,9 +4,9 @@ step, independent of dt. """
 import pytest
 import torch
 
-import rdme.epr as epr
 import rdme.hazards as hzd
 import rdme.presets as pre
+from rdme import epr
 from rdme.mean_field import RDMIsingModel
 
 TOL = 1e-2

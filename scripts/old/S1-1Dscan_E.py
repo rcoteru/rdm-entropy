@@ -23,7 +23,8 @@ HAZARD = "poisson_exact"   # stated per script: the hazard is its own axis, not 
 
 PARAMS: dict = pre.params(
     PRESET, hazard=HAZARD,
-    J       = torch.linspace(0.0, 80.0, 200),
+    J       = 17.0,
+    E       = torch.linspace(0, 1.0, 300),
     dt      = 0.5,
 )
 
@@ -33,8 +34,8 @@ PARAMS: dict = pre.params(
 # is what goes in the cache key -- Q is a solver setting, not a model parameter.
 TOL = 1e-2   # age-grid accuracy; Q is fitted to it
 
-AXIS = "J"                           # the swept parameter: the one PARAMS gives a vector
-LABEL = 'Recurrent coupling  J'
+AXIS = "E"                           # the swept parameter: the one PARAMS gives a vector
+LABEL = 'External input  E'
 
 # Equilibration and recording are set in MILLISECONDS; the step counts follow dt (see
 # helpers.n_steps). A step count says nothing about the system -- the same 20000 steps is a
@@ -50,7 +51,7 @@ EQUI  = hlp.n_steps(T_EQUI, PARAMS["dt"], name="T_EQUI")
 STEPS = hlp.n_steps(T_MEAS, PARAMS["dt"], name="T_MEAS")
 
 N_LEAD = 4      # leading eigenvalues kept per fixed point
-N_J_FP = 100    # J values to analyse; the cost is dominated by the eigendecomposition
+N_E_FP = 100    # E values to analyse; the cost is dominated by the eigendecomposition
 N_SCAN = 401    # resolution of the sign scan that brackets the roots
 
 # m_tot is cached whole and the rest only in time-average: the bifurcation scatter wants the
@@ -65,7 +66,7 @@ CACHE_DIR = Path(__file__).parents[1] / "cache"
 STEM      = Path(__file__).stem
 CACHE_SIM = hlp.cache_path(STEM, dict(PARAMS, preset=PRESET, t_equi=T_EQUI, t_meas=T_MEAS, tol=TOL),
                            tag="traj", root=CACHE_DIR)
-CACHE_FP  = hlp.cache_path(STEM, dict(PARAMS, preset=PRESET, n_lead=N_LEAD, n_J=N_J_FP, n_scan=N_SCAN, tol=TOL),
+CACHE_FP  = hlp.cache_path(STEM, dict(PARAMS, preset=PRESET, n_lead=N_LEAD, n_pts=N_E_FP, n_scan=N_SCAN, tol=TOL),
                            tag="fp", root=CACHE_DIR)
 
 @functools.cache
@@ -81,7 +82,6 @@ run_sim   = True
 run_fp    = True
 run_plot  = True
 overwrite = False  # the hash covers every parameter, so this is only for a change to the CODE
-torch.set_default_dtype(torch.float64)
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -123,7 +123,7 @@ if run_fp and (overwrite or not CACHE_FP.exists()):
     # on CPU: the fixed-point pass is tiny and LAPACK's eig has no GPU equivalent here
     Q_fp   = age_grid()
     mf_fp  = RDMIsingModelBatch(**PARAMS, Q=Q_fp, device="cpu")
-    stride = max(1, mf_fp.B // N_J_FP)
+    stride = max(1, mf_fp.B // N_E_FP)
     idx    = torch.arange(0, mf_fp.B, stride)
 
     print(f"Finding fixed points at {len(idx)} of {mf_fp.B} {AXIS} values (Q={mf_fp.Q})...")

@@ -13,21 +13,30 @@ import rdme.presets as pre
 from rdme.mean_field import RDMIsingModel
 from rdme.spin_model import SpinIsingModel
 
-
 DT = 0.25
 S1 = pre.params("S1", hazard="poisson_exact", dt=DT)
 J_FP, J_CYC = 10.0, 17.0
 
 
+@pytest.mark.parametrize("t_abs", [0.0, 1.0])
 @pytest.mark.parametrize("dt", [1.0, 0.5, 0.2, 0.05])
-def test_refractory_kernel_matches_spin_model(dt):
-    """ A spin of age n carries X = -K_ref (1 - alpha_ref)^n; R(n) must be the same. """
+def test_refractory_kernel_matches_spin_model(dt, t_abs):
+    """ The refractory term a spin's hazard sees at age n, simulated through update(), is the
+    mean field's R(n): same hold through the dead time, same decay after it. """
     tau_ref, K_ref, tau_int = 3.0, 2.0, 12.0
-    kw = dict(dt=dt, t_abs=0.0, hazard="poisson_exact")
-    sm = SpinIsingModel(1, 0.0, 0.0, 1.0, 0.0, tau_int, tau_ref, K_ref, ic="silent", **kw)
+    kw = {"dt": dt, "t_abs": t_abs, "hazard": "poisson_exact"}
+    torch.manual_seed(0)
+    sm = SpinIsingModel(200, 0.0, 0.0, 1.0, 0.0, tau_int, tau_ref, K_ref, ic="silent", **kw)
     mf = RDMIsingModel(0.0, 0.0, 1.0, 0.0, tau_int, tau_ref, K_ref, **kw)
-    n = torch.arange(mf.Q, dtype=mf.R.dtype)
-    assert torch.allclose(mf.R[0], -K_ref * (1.0 - sm.a_ref.item()) ** n, atol=1e-5)
+    ref = mf.R[0].float()
+    seen = torch.zeros(sm.N, dtype=torch.bool)
+    for _ in range(int(60 / dt)):
+        sm.update()
+        seen |= sm.s == 1                      # R is a function of age only after a spike
+        ok = seen & (sm.n < mf.Q)
+        got = sm.R_eff(sm.R, sm.n)[ok]
+        assert torch.allclose(got, ref[sm.n[ok]], rtol=1e-4, atol=1e-6)
+    assert seen.all()
 
 
 @pytest.mark.parametrize("dt", [0.5, 0.2, 0.1])
@@ -71,7 +80,7 @@ def test_spin_fluctuations_vanish_as_one_over_N():
         torch.manual_seed(0)
         sm = SpinIsingModel(N, J_FP, **S1, device="cpu", ic="random")
         sm.forward(int(2000 / DT))
-        r = sm.trajectory(int(8000 / DT))["m_tot"][:, 0].double() / DT
+        r = sm.trajectory(int(8000 / DT))["m_tot"].double() / DT
         assert float(r.mean()) == pytest.approx(r_mf, rel=2e-3), N
         varN.append(float(r.var()) * N)
     assert max(varN) / min(varN) < 1.05, varN

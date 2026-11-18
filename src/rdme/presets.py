@@ -1,18 +1,10 @@
-from __future__ import annotations
-
-import math
-from collections.abc import Mapping
-
-import rdme.hazards as hzd
-
 """ The named parameter sets every run starts from.
 
 A run is a PRESET plus explicit overrides, and nothing else. The point is not convenience --
 seven numbers are not hard to type -- but that a number quoted in a dump or a note can be
 traced back to a parameter set with a name, instead of to a dict that happened to be at the
 top of a script on the day. If a run differs from a preset in anything other than its swept
-axes and its listed overrides, it is a new preset and belongs in this file (and in the table
-in CLAUDE.md, which is the same table in prose).
+axes and its listed overrides, it is a new preset and belongs in this file.
 
 What a preset holds is the MODEL: the couplings, the kernels, the rate unit `nu0` and the
 absolute refractory window `t_abs`, both in physical units. What it deliberately does not
@@ -40,6 +32,12 @@ window overrides it explicitly; `t_abs = 0` (no ceiling) has to be asked for.
 Status: the two-population sets are not here yet, see PENDING. The Hopf points and the named
 cycle points move with the hazard and are recorded where they are known for a stated one. """
 
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping
+
+import rdme.hazards as hzd
 
 # The presets
 # ~~~~~~~~~~~
@@ -53,32 +51,32 @@ PRESETS: dict[str, dict] = {
     # The main one-population system (formerly "the Ising set"): no drive, self-sustained
     # activity. J is NOT part of it -- it is the axis this system is studied along, and a run
     # either sweeps it or names a point below.
-    "S1": dict(
-        E       = 0.0,
-        beta    = 6.0,
-        theta   = 0.5,
-        tau_int = 15.0,
-        tau_ref = 15.0,
-        K_ref   = 15.0,
-        nu0     = 1.0,
-        t_abs   = 1.0,
-    ),
+    "S1": {
+        "E":       0.0,
+        "beta":    6.0,
+        "theta":   0.5,
+        "tau_int": 15.0,
+        "tau_ref": 15.0,
+        "K_ref":   15.0,
+        "nu0":     1.0,
+        "t_abs":   1.0,
+    },
 
     # The rate-ceiling test (formerly "the low-beta point"): strong coupling into saturation,
     # where the legacy sigmoid kernel peaks at 100% of nu0. Under route B the ceiling is the
     # dead time instead -- the rate is unbounded and exponential -- so this is where the
     # realised rate should sit at 1/t_abs. J is part of this one: the point IS that state.
-    "S1-sat": dict(
-        E       = 0.0,
-        beta    = 8.0,
-        theta   = 0.5,
-        tau_int = 10.0,
-        tau_ref = 25.0,
-        K_ref   = 25.0,
-        J       = 40.0,
-        nu0     = 1.0,
-        t_abs   = 1.0,
-    ),
+    "S1-sat": {
+        "E":       0.0,
+        "beta":    8.0,
+        "theta":   0.5,
+        "tau_int": 10.0,
+        "tau_ref": 25.0,
+        "K_ref":   25.0,
+        "J":       40.0,
+        "nu0":     1.0,
+        "t_abs":   1.0,
+    },
 
     # Driven, no refractory kernel, strong gain: the fourth of the four parameter sets that
     # S1-mf_vs_sm.py carried inline (as "noref_driven_strong"). Named here because it matches
@@ -89,17 +87,17 @@ PRESETS: dict[str, dict] = {
     #
     # PROVISIONAL NAME. The parameters are the ones that were run; "D2" is this port's choice
     # and was never a vault decision. Rename freely -- only S1-mf_vs_sm.py refers to it.
-    "D2": dict(
-        E       = 1.0,
-        beta    = 40.0,
-        theta   = 0.5,
-        tau_int = 15.0,
-        tau_ref = 1.0,
-        K_ref   = 0.0,
-        J       = 6.0,
-        nu0     = 1.0,
-        t_abs   = 1.0,
-    ),
+    "D2": {
+        "E":       1.0,
+        "beta":    40.0,
+        "theta":   0.5,
+        "tau_int": 15.0,
+        "tau_ref": 1.0,
+        "K_ref":   0.0,
+        "J":       6.0,
+        "nu0":     1.0,
+        "t_abs":   1.0,
+    },
 
     # Legacy driven high-beta set. Here to reproduce old figures and for nothing else: no
     # refractory kernel (K_ref = 0), a drive that does the work instead. Its old runs were at
@@ -109,16 +107,16 @@ PRESETS: dict[str, dict] = {
     # LEGACY-ONLY, and deliberately kept with NO live caller (2026-11-07): the paper figures
     # that used it are frozen at 378bf2a^ and reproduce from their own commit. It stays here
     # because it is the record of those figures' parameters, not because anything runs it.
-    "D1": dict(
-        E       = 0.9,
-        beta    = 30.0,
-        theta   = 1.0,
-        tau_int = 20.0,
-        tau_ref = 3.0,
-        K_ref   = 0.0,
-        nu0     = 1.0,
-        t_abs   = 1.0,
-    ),
+    "D1": {
+        "E":       0.9,
+        "beta":    30.0,
+        "theta":   1.0,
+        "tau_int": 20.0,
+        "tau_ref": 3.0,
+        "K_ref":   0.0,
+        "nu0":     1.0,
+        "t_abs":   1.0,
+    },
 }
 
 # Named points on a preset's axis: a preset plus the one coupling that makes it a system
@@ -147,12 +145,12 @@ MODEL_KEYS: dict[int, frozenset[str]] = {
     1: frozenset({"J", "E", "beta", "theta", "tau_int", "tau_ref", "K_ref", "nu0", "t_abs"}),
 }
 
-# Two-population sets named in CLAUDE.md but NOT encoded yet, with what is missing. Asking for
+# Two-population sets named but NOT encoded yet, with what is missing. Asking for
 # one raises with this text rather than returning an invented parameter set: the EI row is
 # short of w_EE and w_EI and is marked "to be confirmed", and the Painchaud cell is built by a
 # mapping whose tau_m step may still change.
 PENDING: dict[str, str] = {
-    "EI":   "the CLAUDE.md row is incomplete (no w_EE, w_EI) and marked to be confirmed; "
+    "EI":   "the set is incomplete (no w_EE, w_EI) and marked to be confirmed; "
             "wc-mf_vs_sm.py carries two further E-I sets that have to be reconciled first",
     "EE-P": "built by the Painchaud et al. (2022) mapping in wc-painchaud.py, whose tau_m "
             "step is not settled; encode it here once the mapping is fixed",
@@ -227,8 +225,7 @@ def params(name: str, *, hazard: str | None = None, **overrides) -> dict:
         raise TypeError(f"{sorted(unknown)} is not a parameter of preset {name!r} "
                         f"(it takes {sorted(model_keys)}) nor a solver key "
                         f"({sorted(SOLVER_KEYS)}). "
-                        f"If the run really needs it, it is a NEW preset: add it here and to "
-                        f"the table in CLAUDE.md.")
+                        f"If the run really needs it, it is a NEW preset: add it here.")
 
     return p | {"hazard": hazard} | overrides
 
@@ -249,7 +246,7 @@ def diff(name: str, p: Mapping) -> dict:
 def banner(name: str, p: Mapping, *, keys: tuple[str, ...] | None = None) -> str:
     """ The one-line parameter string for a figure title: preset, hazard, dt, parameters.
 
-    CLAUDE.md asks every figure to state its preset, hazard and dt, and this is that line, so
+    Every figure states its preset, hazard and dt, and this is that line, so
     a figure cannot claim a set it was not run at -- it is built from the dict that built the
     model. """
     head = f'{name}  ·  hazard={p.get("hazard", "?")}'
@@ -308,6 +305,44 @@ def invariants_line(p: Mapping | str, *, lam_op: float | None = None) -> str:
     return (f'β·θ={inv["beta_theta"]:g}  ·  ν₀e^(−βθ)={inv["nu0_exp"]:.4g}/ms  ·  '
             f'K_ref/θ={inv["Kref_theta"]:g}  ·  ν₀·t_abs={inv["nu0_tabs"]:g}  ·  '
             f'λ_op/ν₀=' + ("n/a (needs a run)" if lam is None else f"{lam:.4g}"))
+
+
+# The dimensionless parameters
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# With K_ref = 0 and no synaptic reset the stationary rate solves x = sigma(G x + b), x = r t_abs,
+# so (G, b) are the coordinates a regime map is drawn in. REPORTING ONLY.
+
+def dimensionless(p: Mapping | str, *, r_star: float | None = None) -> dict:
+    """ The dimensionless parameters of a preset name or parameter dict (tau_int is tau_m).
+
+        G        beta*J/t_abs                      loop gain at the rate ceiling 1/t_abs
+        L        ln(nu0 t_abs) - beta*theta        log hazard*t_abs at zero input
+        betaE    beta*E
+        b        beta*(E - theta) + ln(nu0 t_abs)  = betaE + L
+        taum_tabs, tauref_taum, betaK
+
+    and, given the stationary rate r_star (1/ms) of a run, x_star = r_star*t_abs and the
+    feedback beta*J*r_star = G*x_star. """
+    p = resolve(p) if isinstance(p, str) else p
+    beta, t_abs = p["beta"], p["t_abs"]
+    L = math.log(p["nu0"] * t_abs) - beta * p["theta"]
+    d = {"G": beta * p["J"] / t_abs, "L": L, "betaE": beta * p["E"], "b": beta * p["E"] + L,
+         "taum_tabs": p["tau_int"] / t_abs, "tauref_taum": p["tau_ref"] / p["tau_int"],
+         "betaK": beta * p["K_ref"], "x_star": None, "feedback": None}
+    if r_star is not None:
+        d["x_star"], d["feedback"] = r_star * t_abs, beta * p["J"] * r_star
+    return d
+
+
+def dimensionless_line(p: Mapping | str, *, r_star: float | None = None) -> str:
+    """ `dimensionless` as one line. """
+    d = dimensionless(p, r_star=r_star)
+    run = ("x*=n/a  βJr*=n/a" if d["x_star"] is None
+           else f'x*={d["x_star"]:.4g}  βJr*={d["feedback"]:.4g}')
+    return (f'G={d["G"]:.4g}  L={d["L"]:.4g}  βE={d["betaE"]:.4g}  b={d["b"]:.4g}  '
+            f'τm/t_abs={d["taum_tabs"]:.4g}  τref/τm={d["tauref_taum"]:.4g}  '
+            f'βK={d["betaK"]:.4g}  {run}')
 
 
 def summary() -> str:

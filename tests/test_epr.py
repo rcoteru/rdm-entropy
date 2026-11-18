@@ -6,6 +6,7 @@ import math
 import pytest
 import torch
 
+import rdme.presets as pre
 from conftest import HAZ_DT, SETTLED, WC
 from rdme.epr import anchor_reverse_synaptic_term, poisson_reference_entropy
 from rdme.mean_field import RDMIsingModel, RDMWilsonCowan, RDMWilsonCowanPoints
@@ -35,7 +36,7 @@ def test_reverse_field_is_anchored_at_t_plus_one():
     assert S[0] == 0
     for n in range(1, K - 1):
         want = sum(alpha * (1 - alpha) ** (tau - 1) * I[1 + tau] for tau in range(1, n + 1))
-        assert S[n].item() == pytest.approx(want.item(), abs=1e-15)
+        assert S[n].item() == pytest.approx(float(want), abs=1e-15)
     assert S[K - 1] == S[K - 2]
 
 
@@ -61,6 +62,21 @@ def test_batch_matches_single_systems(hazard, dt):
             30, pb=False)
         for k in ("m", "sigma", "H_fwd", "H_rev"):
             assert (tb[k][i] - ts[k]).abs().max().item() < 1e-14, (k, i)
+
+
+def test_saturated_sigma_does_not_depend_on_the_dtype():
+    """ On S1's bursting cell the reverse hazard saturates, and H_rev is made of ln(1 - Phi)
+    there. Read off Phi, that log is a floor set by a dtype-dependent clamp, and float32 gave a
+    sigma 40% below float64's (both far below the spins'); off the kernel's exact branch the
+    two agree. """
+    P = pre.params("S1", hazard="poisson_exact", dt=0.5)
+    sig = []
+    for dtype in (torch.float32, torch.float64):
+        net = RDMIsingModel(60.0, **P, dtype=dtype)
+        net.forward(3000)
+        sig.append(float(net.entropy_trajectory(400, pb=False)["sigma_tot"].double().mean()))
+    assert sig[1] > 100, "the cell must be saturating, where the clamp used to set sigma"
+    assert sig[0] == pytest.approx(sig[1], rel=1e-3), sig
 
 
 def test_the_poisson_reference_carries_the_dt_divergence():

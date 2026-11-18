@@ -34,7 +34,6 @@ from rdme.spin_model import SpinWilsonCowan
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 device = 'cpu'
 
-torch.set_default_dtype(torch.float64)
 
 N = 50000
 
@@ -109,7 +108,6 @@ hazard="poisson_exact"
 
 # Model initialization
 # ~~~~~~~~~~~~~~~~~~~~
-torch.set_default_dtype(torch.float64)
 
 sm = SpinWilsonCowan(N, E_ratio, w_EE, w_EI, w_IE, w_II, 
                     E_exc, E_inh, beta_E, beta_I, theta_E, theta_I, 
@@ -154,7 +152,7 @@ if True: # visualize final p(n) distribution
     plt.title("Firing age distribution (mean-field vs spin model)")
 
 
-    fdists = sm.fdists(mf.Q).cpu().numpy()
+    fdists = sm.fdist(mf.Q).cpu().numpy()
     plt.plot(fdists[0], label='Spin Model [E]', linewidth=2)
     plt.plot(fdists[1], label='Spin Model [I]', linewidth=2)
 
@@ -234,7 +232,7 @@ if True: # fixed-point objective |G(m)| over the (m_E, m_I) square
     n_grid = 201
 
     roots = mf.fixed_points(method='newton', guesses=fpts.fp_guess_lattice(2, 15, device=device))
-    rho   = torch.tensor([fpts.spectral_radius(mf.fp_eigenvalues(r)) for r in roots])
+    rho   = torch.tensor([fpts.spectral_radius(mf.fp_eigenvalues(r)) for r in roots], dtype=torch.float64)
     orbit = mf_traj2["m"]                                                   # (T, 2)
 
     # everything interesting sits within a few percent of the origin, so the second panel
@@ -247,7 +245,7 @@ if True: # fixed-point objective |G(m)| over the (m_E, m_I) square
     fig.suptitle('Fixed-point objective  |G(m)| = |m - F(m)|')
 
     for ax, ((lo, up), title) in zip(axes, windows):
-        axis   = torch.linspace(lo, up, n_grid, device=device)
+        axis   = torch.linspace(lo, up, n_grid, device=device, dtype=torch.float64)
         mE, mI = torch.meshgrid(axis, axis, indexing='ij')
         pts    = torch.stack([mE.reshape(-1), mI.reshape(-1)], dim=-1)      # (K, 2)
         # chunked: each residual evaluation materialises a (chunk, Q) field per population

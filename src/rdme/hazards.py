@@ -1,10 +1,3 @@
-from __future__ import annotations
-
-from typing import Callable, NamedTuple
-import math
-
-import torch
-
 """ Per-bin firing kernels and the rates they represent.
 
 Model-independent: everything here is a pure function of the field h, the gain beta, the rate
@@ -15,6 +8,13 @@ locate.
 The kernels and their relationships are documented below; rdme is what applies them.
 """
 
+from __future__ import annotations
+
+import math
+from collections.abc import Callable
+from typing import NamedTuple, overload
+
+import torch
 
 # Hazards
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -121,18 +121,26 @@ def bernoulli_logphi(h, beta, nu0, dt, inplace: bool = False):
 
 
 def bernoulli_log1m_phi(h, beta, nu0, dt, inplace: bool = False):
-    """ ln(1 - nu0*dt*sigma(beta*h)), written as ln(1 + (1-c)e^x) - softplus(x) with
-    c = nu0*dt.
+    """ ln(1 - nu0*dt*sigma(beta*h)), with c = nu0*dt: log1p of the hazard at c < 1, and the
+    limit -softplus(x) at c = 1.
 
-    The algebraic rearrangement, rather than log1p of the hazard: at c < 1 this is bounded
-    below by ln(1 - c) -- a thinned neuron cannot fire with probability one -- but at c = 1 the
-    silent branch does close, and the naive form reaches it as log1p(-1) = -inf several digits
-    before the exact -softplus(x) does. Taking the limit here instead keeps the nu0*dt = 1
-    edge, where bernoulli coincides with the synchronous sigmoid kernel, agreeing with it to
-    the last bit rather than collapsing. That edge is the legacy discrete model, and is what
-    test_hazards pins against the closed form. """
+    At c < 1 the hazard is bounded by c -- a thinned neuron cannot fire with probability one --
+    so log1p(-Phi) never reaches log1p(-1), and it is the accurate form there. The rearrangement
+    ln(1 + (1-c)e^x) - softplus(x) is exact on paper but cancels two terms of size |x|, losing
+    eps*|x| absolute; at beta = 30 that is 1e-11 summed over an age grid, enough to break the
+    telescoping the EPR's joint oracle relies on.
+
+    At c = 1 the silent branch does close, and the naive form reaches it as log1p(-1) = -inf
+    several digits before the exact -softplus(x) does. Taking the limit here instead keeps the
+    nu0*dt = 1 edge, where bernoulli coincides with the synchronous sigmoid kernel, agreeing
+    with it to the last bit rather than collapsing. That edge is the legacy discrete model, and
+    is what test_hazards pins against the closed form. """
     c = nu0 * dt
-    log1mc = math.log1p(-c) if c < 1.0 else -math.inf
+    if c < 1.0:
+        if inplace:
+            return bernoulli_hazard(h, beta, nu0, dt, inplace=True).neg_().log1p_()
+        return torch.log1p(-bernoulli_hazard(h, beta, nu0, dt))
+    log1mc = -math.inf
     if inplace:
         x = h.mul_(beta)
         sp = torch.nn.functional.softplus(x)
@@ -452,6 +460,12 @@ def check_step(hazard: str, nu0: float, dt: float) -> None:
 # The (dt, t_abs, nu0) convention
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+@overload
+def resolve_timesteps(dt: float, t_abs: torch.Tensor, nu0: float,
+                      hazard: str) -> tuple[float, torch.Tensor, float]: ...
+@overload
+def resolve_timesteps(dt: float, t_abs: float, nu0: float,
+                      hazard: str) -> tuple[float, float, float]: ...
 def resolve_timesteps(dt: float, t_abs: float | torch.Tensor, nu0: float,
                       hazard: str) -> tuple[float, float | torch.Tensor, float]:
     """ Settle (dt, t_abs, nu0) for a model. Shared by RDMNetwork, RDMNetworkBatch and

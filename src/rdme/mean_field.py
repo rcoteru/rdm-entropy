@@ -1,18 +1,3 @@
-from __future__ import annotations
-
-import copy
-import math
-from collections.abc import Callable, Sequence
-
-import torch
-import tqdm
-
-import rdme.epr as epr
-import rdme.equations as eq
-import rdme.fixed_points as fpts
-import rdme.hazards as hzd
-import rdme.lyapunov as lyap
-
 """ The RDM driver: one class for one system and for a batch of them.
 
 RDMNetwork holds state, parameters and the EPR observer's feed, and orchestrates; it writes no
@@ -31,6 +16,20 @@ Weights are in physical units and NOT divided by dt -- pass J, never J/dt. The i
 from the rate r = m/dt, which is what makes a coupling independent of the step; see
 equations.compute_total_input, which states the convention once. """
 
+from __future__ import annotations
+
+import copy
+import math
+from collections.abc import Callable, Sequence
+
+import torch
+import tqdm
+
+import rdme.equations as eq
+import rdme.fixed_points as fpts
+import rdme.hazards as hzd
+import rdme.lyapunov as lyap
+from rdme import epr
 
 # Parameter grids
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -40,7 +39,7 @@ equations.compute_total_input, which states the convention once. """
 def flatten_param_grid(
         param_grid: dict[str, float | Sequence[float] | torch.Tensor],
         device: str = 'cpu',
-        dtype: torch.dtype | None = None,
+        dtype: torch.dtype = torch.float64,
         ) -> tuple[dict[str, torch.Tensor], tuple[int, ...], dict[str, torch.Tensor]]:
     """ Build the outer product of a named parameter grid and flatten it into a batch axis.
 
@@ -54,7 +53,6 @@ def flatten_param_grid(
       axes       -- ordered dict of the swept (length > 1) input vectors only, so its values
                     line up with the leading axes of a tensor passed through `unflatten_batch`
     """
-    dtype = dtype if dtype is not None else torch.get_default_dtype()
     vecs = {name: torch.as_tensor(v, dtype=dtype, device=device).reshape(-1)
             for name, v in param_grid.items()}
     grid_shape = tuple(v.numel() for v in vecs.values())
@@ -148,10 +146,17 @@ class RDMNetwork:
                  tol: float = 1e-2,
                  grid_shape: tuple[int, ...] | None = None,
                  grid_axes: dict[str, torch.Tensor] | None = None,
-                 device: str = 'cpu') -> None:
+                 device: str = 'cpu',
+                 dtype: torch.dtype = torch.float64) -> None:
         """ w is (M, M) for one system or (B, M, M) for a batch; E, beta, theta, tau_int,
         tau_ref, K_ref are then (M,) (a length-M list will do) or (B, M). N is a plain length-M
         list shared by the batch: population sizes are structural, not swept.
+
+        dtype is the model's precision, float64 unless asked otherwise, and independent of
+        torch's global default: every parameter and state tensor is cast to it on the way in.
+        float64 because sigma is a difference of two entropies of order 1e-2, so float32's
+        resolution puts a floor of a few 1e-9 per bin under it -- above the sigma of a cell
+        near its fixed point or near onset.
 
         dt is the SOLVER step and is required: under route B there is no time quantum to
         default to. hazard is required for the same reason. dt and nu0 are scalars shared by a
@@ -178,14 +183,13 @@ class RDMNetwork:
         assert w.ndim in (2, 3) and w.shape[-2:] == (M, M), f"w must be ({M},{M}) or (B,{M},{M})"
         lead = tuple(w.shape[:-2])
         assert len(N) == M and all(isinstance(n, int) for n in N), "N must be M integers"
-        dtype = torch.get_default_dtype()
         t_abs = torch.as_tensor(t_abs, dtype=dtype, device=device)
         dt, t_abs, nu0 = hzd.resolve_timesteps(dt, t_abs, nu0, hazard)
         self.nu0 = nu0
         self.t_abs = t_abs.expand(lead + (M,)).clone() if t_abs.ndim == 0 else t_abs
         assert self.t_abs.shape == lead + (M,), f"t_abs must be a scalar or {lead + (M,)}"
 
-        self.M, self.dt, self.device = M, dt, device
+        self.M, self.dt, self.device, self.dtype = M, dt, device, dtype
         self.hazard = hazard
         self.N = N
         self.w = w.to(device=device, dtype=dtype)
@@ -210,7 +214,8 @@ class RDMNetwork:
         self.tol = tol
         self.drive = eq.drive_bound(self.w, self.E, self.t_abs, self.tau_int)
         if Q is None:
-            U = eq.age_window(self.beta, self.K_ref, self.tau_ref, self.tau_int, self.drive, tol)
+            U = eq.age_window(self.beta, self.K_ref, self.tau_ref, self.t_abs, self.tau_int,
+                              self.drive, tol)
             Q = max(math.ceil(U.max().item() / dt) + 1, int(self.n_abs.max()) + 1, 2)
         assert isinstance(Q, int) and Q > 0, f"Q must be a positive int, got {Q!r}"
         self.Q = Q
@@ -219,10 +224,10 @@ class RDMNetwork:
                                       device=device)
 
         # all age mass in the oldest bin, zero integrated field
-        self.p = torch.zeros(lead + (M, Q), device=device)
+        self.p = torch.zeros(lead + (M, Q), device=device, dtype=dtype)
         self.p[..., -1] = 1.0
-        self.S = torch.zeros(lead + (M, Q), device=device)
-        self.m = torch.zeros(lead + (M,), device=device)
+        self.S = torch.zeros(lead + (M, Q), device=device, dtype=dtype)
+        self.m = torch.zeros(lead + (M,), device=device, dtype=dtype)
 
     def _abs_window(self) -> None:
         """ n_abs and R_abs, each (*b, M), from t_abs: how many leading bins each population's
@@ -339,8 +344,8 @@ class RDMNetwork:
         worst case. At or below tol whenever Q came from tol; with an explicit Q it is what that
         grid costs. It bounds the error made per step, not its consequence for a long-time
         statistic. """
-        delta = eq.field_tail((self.Q - 1) * self.dt, self.K_ref, self.tau_ref, self.tau_int,
-                              self.drive)
+        delta = eq.field_tail((self.Q - 1) * self.dt, self.K_ref, self.tau_ref, self.t_abs,
+                              self.tau_int, self.drive)
         return eq.truncation_error(self.p, self.firing_prob(), self.beta, delta)
 
     @torch.inference_mode()
@@ -405,7 +410,7 @@ class RDMNetwork:
         """ Place every system on the stationary state implied by its overlaps m (*b, M). """
         p, S = self.fp_state(m)
         self.p, self.S = p.clone(), S.clone()
-        self.m = torch.as_tensor(m, device=self.device).clone().reshape(self.batch_shape
+        self.m = torch.as_tensor(m, device=self.device, dtype=self.dtype).clone().reshape(self.batch_shape
                                                                         + (self.M,))
 
     def fixed_points(self,
@@ -433,12 +438,13 @@ class RDMNetwork:
 
         if method == 'bracket':
             assert self.M == 1, "bracketing is a scalar method; use method='newton' for M > 1"
-            return fpts.bracket_roots(self.fp_residual, n_grid=n_grid,
-                                      merge_tol=merge_tol, device=self.device, **kwargs)
+            return fpts.bracket_roots(self.fp_residual, n_grid=n_grid, merge_tol=merge_tol,
+                                      device=self.device, dtype=self.dtype, **kwargs)
         if method == 'newton':
             if guesses is None:
-                guesses = fpts.fp_guess_lattice(self.M, n_per_axis=5, device=self.device)
-            return fpts.newton_roots(self.fp_residual, guesses, tol=tol,
+                guesses = fpts.fp_guess_lattice(self.M, n_per_axis=5, device=self.device,
+                                                dtype=self.dtype)
+            return fpts.newton_roots(self.fp_residual, guesses.to(self.dtype), tol=tol,
                                      merge_tol=merge_tol, **kwargs)
         raise ValueError(f"unknown method {method!r}, expected 'auto', 'bracket' or 'newton'")
 
@@ -446,7 +452,8 @@ class RDMNetwork:
         """ G(m) for a *single* system, with that system's parameters passed in rather than
         read off self: the form torch.vmap needs to give every Newton trajectory its own
         parameters. Argument order matches fp_sweep's params tuple. """
-        return fpts.fp_residual(m, *params, hzd.HAZARDS[self.hazard], self.nu0, self.dt)
+        return fpts.fp_residual(m, *params, hazard=hzd.HAZARDS[self.hazard], nu0=self.nu0,
+                                dt=self.dt)
 
     def fp_sweep(self,
                  guesses: torch.Tensor | None = None,
@@ -465,7 +472,9 @@ class RDMNetwork:
         worth inspecting. The default lattice spans overlaps in [0, 1] -- pass `guesses`
         explicitly when refining. """
         if guesses is None:
-            guesses = fpts.fp_guess_lattice(self.M, n_per_axis, device=self.device)
+            guesses = fpts.fp_guess_lattice(self.M, n_per_axis, device=self.device,
+                                            dtype=self.dtype)
+        guesses = guesses.to(self.dtype)
         K, lead = guesses.shape[0], self.batch_shape
         B = math.prod(lead)
 
@@ -522,7 +531,7 @@ class RDMNetwork:
                      ) -> torch.Tensor:      # (*b, k, M*2*Q)
         """ A random orthonormal, sum-zero tangent basis for every system. """
         return lyap.init_tangent(self.M, self.Q, k, prefix=self.batch_shape,
-                                 device=self.device, generator=generator)
+                                 device=self.device, dtype=self.dtype, generator=generator)
 
     @torch.no_grad()
     def step_tangent(self, V: torch.Tensor) -> None:
@@ -576,8 +585,8 @@ class RDMNetwork:
         T, so on a GPU they are pinned in CPU memory and each step is streamed in with a
         non_blocking copy, which keeps that growth off the card. """
         if torch.device(self.device).type == 'cuda':
-            return dict(device='cpu', pin_memory=True, dtype=torch.float64)
-        return dict(device=self.device, dtype=torch.float64)
+            return {'device': 'cpu', 'pin_memory': True, 'dtype': torch.float64}
+        return {'device': self.device, 'dtype': torch.float64}
 
     def _unflatten_out(self, out: dict) -> dict:
         return {k: self.unflatten(v) for k, v in out.items()}
@@ -668,7 +677,8 @@ class RDMNetwork:
             else:
                 if state is None:
                     state = init(p0, S0, torch.stack(I_hist, dim=-1), *prm, inplace=inplace)
-                    p0 = S0 = I_hist = None         # the observer holds them from here on
+                    p0 = S0 = None                  # the observer holds them from here on
+                    I_hist.clear()
                 # read the activity before the observer advances the marginal, so m_t is
                 # reported against the sigma of the t -> t+1 transition rather than m_{t+1}
                 out["m"][..., t, :].copy_(state[0][..., 0], non_blocking=True)
@@ -683,6 +693,7 @@ class RDMNetwork:
         out["r_tot"] = out["m_tot"] / self.dt
 
         # rewind the live state to the last reported step, discarding the look-ahead
+        assert state is not None
         self.p, self.S = state[:2]
         self.m = self.p[..., 0]
 
@@ -700,19 +711,20 @@ class RDMNetwork:
 def RDMIsingModel(J: float, E: float, beta: float, theta: float, tau_int: float,
                   tau_ref: float, K_ref: float, *, dt: float, hazard: str,
                   nu0: float = 1.0, t_abs: float = 1.0, Q: int | None = None,
-                  tol: float = 1e-2, device: str = 'cpu') -> RDMNetwork:
+                  tol: float = 1e-2, device: str = 'cpu',
+                  dtype: torch.dtype = torch.float64) -> RDMNetwork:
     """ One single-population (M=1) network. """
-    return RDMNetwork(M=1, w=torch.tensor([[J]]), N=[1000], E=[E], beta=[beta], theta=[theta],
+    return RDMNetwork(M=1, w=torch.tensor([[J]], dtype=dtype), N=[1000], E=[E], beta=[beta], theta=[theta],
                       tau_int=[tau_int], tau_ref=[tau_ref], K_ref=[K_ref],
                       dt=dt, nu0=nu0, hazard=hazard, t_abs=[t_abs], Q=Q, tol=tol,
-                      device=device)
+                      device=device, dtype=dtype)
 
 
 def RDMIsingModelBatch(J, E, beta, theta, tau_int, tau_ref, K_ref,
                        *, dt: float, hazard: str, nu0: float = 1.0,
-                       t_abs=1.0,
+                       t_abs: float | torch.Tensor = 1.0,
                        Q: int | None = None, tol: float = 1e-2,
-                       device: str = 'cpu') -> RDMNetwork:
+                       device: str = 'cpu', dtype: torch.dtype = torch.float64) -> RDMNetwork:
     """ A batch of single-population (M=1) networks. Each parameter may be a scalar or a 1D
     tensor, and the batch is the **outer product** of them all, so passing two vectors gives
     the full 2D sweep with no meshgrid at the call site. Scalars contribute a singleton axis
@@ -720,13 +732,13 @@ def RDMIsingModelBatch(J, E, beta, theta, tau_int, tau_ref, K_ref,
     t_abs is a model parameter like the others and may be swept too. """
     flat, grid_shape, axes = flatten_param_grid(
         {"J": J, "E": E, "beta": beta, "theta": theta, "tau_int": tau_int,
-         "tau_ref": tau_ref, "K_ref": K_ref, "t_abs": t_abs}, device=device)
+         "tau_ref": tau_ref, "K_ref": K_ref, "t_abs": t_abs}, device=device, dtype=dtype)
     col = lambda k: flat[k].unsqueeze(-1)                         # (B, 1)
     return RDMNetwork(
         M=1, w=flat["J"].reshape(-1, 1, 1), N=[1000], E=col("E"), beta=col("beta"),
         theta=col("theta"), tau_int=col("tau_int"), tau_ref=col("tau_ref"),
         K_ref=col("K_ref"), dt=dt, nu0=nu0, hazard=hazard, t_abs=col("t_abs"), Q=Q, tol=tol,
-        grid_shape=grid_shape, grid_axes=axes, device=device)
+        grid_shape=grid_shape, grid_axes=axes, device=device, dtype=dtype)
 
 
 def RDMWilsonCowan(E_ratio: float, w_EE: float, w_EI: float, w_IE: float, w_II: float,
@@ -735,18 +747,18 @@ def RDMWilsonCowan(E_ratio: float, w_EE: float, w_EI: float, w_IE: float, w_II: 
                    tau_ref_E: float, tau_ref_I: float, K_ref_E: float, K_ref_I: float,
                    *, dt: float, hazard: str, nu0: float = 1.0, t_abs: float = 1.0,
                    Q: int | None = None, tol: float = 1e-2,
-                   device: str = 'cpu') -> RDMNetwork:
+                   device: str = 'cpu', dtype: torch.dtype = torch.float64) -> RDMNetwork:
     """ One Wilson-Cowan-like two-population (M=2, order [E, I]) network. t_abs is the dead
     time of both populations; build an RDMNetwork directly to give them different ones. """
     N_E = int(E_ratio * 1000)
     # row = target, column = source, matching w^{ab} ("from b onto a")
     w = torch.tensor([[w_EE, w_IE],
-                      [w_EI, w_II]])
+                      [w_EI, w_II]], dtype=dtype)
     return RDMNetwork(M=2, w=w, N=[N_E, 1000 - N_E], E=[E_exc, E_inh], beta=[beta_E, beta_I],
                       theta=[theta_E, theta_I], tau_int=[tau_int_E, tau_int_I],
                       tau_ref=[tau_ref_E, tau_ref_I], K_ref=[K_ref_E, K_ref_I],
                       dt=dt, nu0=nu0, hazard=hazard, t_abs=[t_abs, t_abs], Q=Q, tol=tol,
-                      device=device)
+                      device=device, dtype=dtype)
 
 
 def _wilson_cowan_from_flat(flat: dict[str, torch.Tensor], E_ratio: float, dt: float,
@@ -768,7 +780,7 @@ def _wilson_cowan_from_flat(flat: dict[str, torch.Tensor], E_ratio: float, dt: f
         theta=two("theta_E", "theta_I"), tau_int=two("tau_int_E", "tau_int_I"),
         tau_ref=two("tau_ref_E", "tau_ref_I"), K_ref=two("K_ref_E", "K_ref_I"),
         dt=dt, nu0=nu0, hazard=hazard, t_abs=two("t_abs", "t_abs"), Q=Q, tol=tol,
-        grid_shape=grid_shape, grid_axes=grid_axes, device=device)
+        grid_shape=grid_shape, grid_axes=grid_axes, device=device, dtype=w.dtype)
 
 
 _WC_NAMES = ["w_EE", "w_EI", "w_IE", "w_II", "E_exc", "E_inh", "beta_E", "beta_I",
@@ -779,9 +791,9 @@ _WC_NAMES = ["w_EE", "w_EI", "w_IE", "w_II", "E_exc", "E_inh", "beta_E", "beta_I
 def RDMWilsonCowanBatch(E_ratio, w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, beta_I,
                         theta_E, theta_I, tau_int_E, tau_int_I, tau_ref_E, tau_ref_I,
                         K_ref_E, K_ref_I, *, dt: float, hazard: str,
-                        nu0: float = 1.0, t_abs=1.0,
-                        Q: int | None = None,
-                        tol: float = 1e-2, device: str = 'cpu') -> RDMNetwork:
+                        nu0: float = 1.0, t_abs: float | torch.Tensor = 1.0,
+                        Q: int | None = None, tol: float = 1e-2, device: str = 'cpu',
+                        dtype: torch.dtype = torch.float64) -> RDMNetwork:
     """ A batch of two-population (M=2, order [E, I]) networks, the batch being the **outer
     product** of every argument. Scalars contribute a singleton axis that is dropped again on
     output. E_ratio is structural (it sets the population sizes) and stays a scalar. t_abs,
@@ -789,7 +801,7 @@ def RDMWilsonCowanBatch(E_ratio, w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, b
     vals = dict(zip(_WC_NAMES, [w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, beta_I,
                                 theta_E, theta_I, tau_int_E, tau_int_I, tau_ref_E, tau_ref_I,
                                 K_ref_E, K_ref_I])) | {"t_abs": t_abs}
-    flat, grid_shape, axes = flatten_param_grid(vals, device=device)
+    flat, grid_shape, axes = flatten_param_grid(vals, device=device, dtype=dtype)
     return _wilson_cowan_from_flat(flat, E_ratio, dt, nu0, hazard, Q, tol,
                                    grid_shape, axes, device)
 
@@ -797,10 +809,10 @@ def RDMWilsonCowanBatch(E_ratio, w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, b
 def RDMWilsonCowanPoints(E_ratio, w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, beta_I,
                          theta_E, theta_I, tau_int_E, tau_int_I, tau_ref_E, tau_ref_I,
                          K_ref_E, K_ref_I, *, dt: float, hazard: str,
-                         nu0: float = 1.0, t_abs=1.0,
+                         nu0: float = 1.0, t_abs: float | torch.Tensor = 1.0,
                          Q: int | None = None,
                          tol: float = 1e-2, grid_shape=None, grid_axes=None,
-                         device: str = 'cpu') -> RDMNetwork:
+                         device: str = 'cpu', dtype: torch.dtype = torch.float64) -> RDMNetwork:
     """ One parameter point per batch element -- the **elementwise** counterpart of
     RDMWilsonCowanBatch, for search axes that drive two parameters at once (a loop gain g with
     w_EI = g*rho and w_IE = -g/rho would come back from the outer product as the n**2 cross
@@ -810,7 +822,6 @@ def RDMWilsonCowanPoints(E_ratio, w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, 
     against the longest, and B is that length. Mismatched lengths are an error rather than a
     broadcast. grid_shape/grid_axes are passed straight through: only the caller knows which
     search axes the flat batch came from. """
-    dtype = torch.get_default_dtype()
     vals = dict(zip(_WC_NAMES, [w_EE, w_EI, w_IE, w_II, E_exc, E_inh, beta_E, beta_I,
                                 theta_E, theta_I, tau_int_E, tau_int_I, tau_ref_E, tau_ref_I,
                                 K_ref_E, K_ref_I])) | {"t_abs": t_abs}

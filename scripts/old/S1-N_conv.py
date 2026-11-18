@@ -109,7 +109,6 @@ CACHE     = hlp.cache_path(STEM, dict(PARAMS, preset=PRESET, regimes=REGIMES, ns
 run_sim   = True
 run_plot  = True
 overwrite = False  # the hash covers every parameter, so this is only for a change to the CODE
-torch.set_default_dtype(torch.float64)
 
 
 # ── Signal measures ───────────────────────────────────────────────────────────
@@ -265,7 +264,7 @@ if run_sim:
             c, d, _ = hlp.cycle_window(mf_ep["r_tot"])
             mf_sigma = float(mf_ep["sigma_tot"][c:d].mean()) / dt
 
-            res[(name, "mf")] = torch.tensor(mf_row)
+            res[(name, "mf")] = torch.tensor(mf_row, dtype=torch.float64)
             res[(name, "mf_sigma")] = mf_sigma
             res[(name, "mf_traj")] = mf_r.float().clone()
             res[(name, "mf_psd")] = torch.stack(psd(mf_r, dt, SEG_MS))
@@ -284,7 +283,7 @@ if run_sim:
                 torch.manual_seed(seed)
                 sm = SpinIsingModel(N, J, **PARAMS, device=DEVICE, ic="random")
                 sm.forward(int(EQUI_MS / dt))
-                r = sm.trajectory(int(REC_MS / dt))["m_tot"][:, 0].double() / dt
+                r = sm.trajectory(int(REC_MS / dt))["m_tot"].double() / dt
                 rows.append(summarize(r, dt))
                 psds.append(torch.stack(psd(r, dt, SEG_MS)))
                 # The WHOLE trace, in float32, not the slice the figures need. Today's lesson:
@@ -295,10 +294,10 @@ if run_sim:
                     res[(name, N, "traj")] = r.float().clone()
                 del sm
                 if DEVICE == 'cuda': torch.cuda.empty_cache()
-            res[(name, N)] = torch.tensor(rows)                     # (seeds, COLS)
+            res[(name, N)] = torch.tensor(rows, dtype=torch.float64)                     # (seeds, COLS)
             res[(name, N, "psd")] = torch.stack(psds).mean(dim=0)   # (2, F)
             hlp.save_atomic(res, CACHE)
-            m = torch.tensor(rows).mean(dim=0)
+            m = torch.tensor(rows, dtype=torch.float64).mean(dim=0)
             print(f"  N={N:8d}  r={m[0]:.6f}  sd={m[1] ** 0.5:.6f}  "
                   f"excess sd={max(m[1] - mf_row[1], 0) ** 0.5:.2e}  "
                   f"decay={m[3]:.2e}/ms  ({time.time() - t0:.0f}s/seed)")
@@ -322,7 +321,7 @@ if run_sim:
             nb = 40
             blk = sg[:len(sg) // nb * nb].reshape(nb, -1).mean(dim=1)
             res[(name, N, "sigma")] = torch.tensor([float(sg.mean()),
-                                                    float(blk.std() / nb ** 0.5)])
+                                                    float(blk.std() / nb ** 0.5)], dtype=torch.float64)
             res[(name, N, "H_fwd")] = float(ep["H_fwd_tot"].double().mean()) / dt
             hlp.save_atomic(res, CACHE)
             print(f"  N={N:8d}  sigma/dt={float(sg.mean()):+.4e} "
@@ -352,7 +351,7 @@ def power_fit(ns: list[int], y: torch.Tensor,
         ok = ok & mask
     if int(ok.sum()) < 2:
         return float('nan'), float('nan')
-    x = torch.log(torch.tensor([float(n) for n in ns])[ok])
+    x = torch.log(torch.tensor([float(n) for n in ns], dtype=torch.float64)[ok])
     A = torch.stack([x, torch.ones_like(x)], dim=1)
     sol = torch.linalg.lstsq(A, torch.log(y[ok]).unsqueeze(-1)).solution
     return float(sol[0]), float(torch.exp(sol[1]))
@@ -388,7 +387,7 @@ if run_plot:
         p = float(res[(name, "mf")][col["period"]])
         if p == p:
             return p
-        f0 = torch.tensor([float(res[(name, N)][:, col["f0"]].mean()) for N in ns])
+        f0 = torch.tensor([float(res[(name, N)][:, col["f0"]].mean()) for N in ns], dtype=torch.float64)
         return 1.0 / float(f0.median())
 
     def stat(name, key):     # (mean, sem) over seeds, per N
@@ -518,7 +517,7 @@ if run_plot:
         ax_t, ax_p = axs[i]
         period = PERIOD[name]
         lag = max(1, int(round(period / 4 / dt)))          # a quarter period, so a circle
-        t_ms = torch.arange(int(30 * period / dt)) * dt
+        t_ms = torch.arange(int(30 * period / dt), dtype=torch.float64) * dt
 
         n_t, n_p = int(6 * period / dt), int(60 * period / dt)   # 6 periods, 60 for the cloud
         mfx = res[(name, "mf_traj")].double()
@@ -569,7 +568,7 @@ if run_plot:
         ex = (v - var_mf).clamp_min(0)
         p, a = power_fit(ns, ex)
         ax_e.plot(ns, ex, mk, markersize=6, label=f'{name}:  $N^{{{p:+.2f}}}$')
-        ax_e.plot(ns, a * torch.tensor([float(n) for n in ns]) ** p, '-', lw=1,
+        ax_e.plot(ns, a * torch.tensor([float(n) for n in ns], dtype=torch.float64) ** p, '-', lw=1,
                   color=ax_e.lines[-1].get_color())
     ax_v.set_yscale('log'); ax_v.set_ylabel(r'$\mathrm{Var}[r]$  [(1/ms)$^2$]')
     ax_v.set_title('Variance, against the mean-field value (dotted)')
@@ -623,7 +622,7 @@ if run_plot:
         v_n = torch.stack([res[(name, N)][:, col["var"]] for N in ns]).mean(dim=1)
         ok_a = (torch.isfinite(m) & (m > 0) & (var_mf > (v_n - var_mf).clamp_min(0)))
         ok_p = torch.isfinite(dp) & (dp > 2 * floor_psd)
-        nsT = torch.tensor([float(n) for n in ns])
+        nsT = torch.tensor([float(n) for n in ns], dtype=torch.float64)
         if int(ok_a.sum()):
             p, a = power_fit(ns, m, ok_a)
             axs[2].errorbar(nsT[ok_a], m[ok_a], yerr=se[ok_a], fmt=mk, markersize=6,

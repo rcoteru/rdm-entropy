@@ -1,10 +1,3 @@
-from __future__ import annotations
-
-from collections.abc import Callable
-from typing import NamedTuple
-
-import torch
-
 """ Lyapunov exponents by the Benettin algorithm, for discrete-time maps.
 
 Organised by topic rather than by how model-specific each piece is, so everything about the
@@ -37,6 +30,12 @@ reading would file it as quasiperiodic. Pass `continuous=` to classify_spectrum 
 the model answers it as `mf.is_flow`, which is True for every route-B model and False only for
 the legacy discrete one ("bernoulli" at nu0*dt = 1). """
 
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import NamedTuple
+
+import torch
 
 # Tangent dynamics
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -92,6 +91,7 @@ def init_tangent(M: int,
                  prefix: tuple[int, ...] = (),   # leading axes, e.g. (B,) for a batch
                  device: str | torch.device = 'cpu',
                  generator: torch.Generator | None = None,
+                 dtype: torch.dtype = torch.float64,
                  ) -> torch.Tensor:              # (*prefix, k, M*2*Q)
     """ A random orthonormal tangent basis, laid out as the state is: per population a delta-p
     and a delta-S, [dp_0, dS_0, dp_1, dS_1, ...] to match RDMNetwork.flatten_state.
@@ -105,7 +105,6 @@ def init_tangent(M: int,
     basis the former per-population block list did. """
     if k < 1:
         raise ValueError(f"k must be at least 1, got {k}")
-    dtype = torch.get_default_dtype()
     draw = lambda: torch.randn(*prefix, k, Q, device=device, dtype=dtype, generator=generator)
     V = torch.stack([torch.stack([draw(), draw()], dim=-2) for _ in range(M)], dim=-3)
     V[..., 0, :] -= V[..., 0, :].mean(dim=-1, keepdim=True)          # onto sum(dp) = 0

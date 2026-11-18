@@ -35,7 +35,6 @@ os.environ.setdefault("OMP_NUM_THREADS", str(N_THREADS))
 import torch
 
 torch.set_num_threads(N_THREADS)
-torch.set_default_dtype(torch.float64)
 
 PRESET = "S1"
 HAZARD = "poisson_exact"

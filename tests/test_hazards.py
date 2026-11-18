@@ -8,7 +8,6 @@ import torch
 
 import rdme.hazards as hzd
 
-
 ALL = ("bernoulli", "poisson", "poisson_exact")
 ROUTE_B = ("poisson", "poisson_exact")
 

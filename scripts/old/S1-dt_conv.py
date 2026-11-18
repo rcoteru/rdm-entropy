@@ -39,7 +39,7 @@ margin also buys stiffness. Under route A, peak max(rate)*dt at dt = 1/4 ran 0.0
 where the exponential rate takes over is a separate experiment.
 
 Converging: r = m/dt [1/ms], sigma/dt [nats/ms], the period, the amplitude. Diverging, and kept
-as the control: H_fwd/dt and H_rev/dt, which grow as -r ln dt at the predicted rate. CLAUDE.md
+as the control: H_fwd/dt and H_rev/dt, which grow as -r ln dt at the predicted rate. The EPR rule
 asks for the Poisson-REFERENCED entropies as the finite quantity; this script reports the raw
 pair as the control, which is the other half of the same rule.
 
@@ -177,7 +177,7 @@ DEVICE = 'cpu'     # one system stepping a few thousand age bins is launch-laten
                    # there is little for a GPU to do here; the batched scans are where it pays
 
 # Column layout of the per-(hazard, regime) result tensor, (len(DTS), len(COLS)).
-# H is carried TWICE, raw and relative to the Poisson reference, as CLAUDE.md's EPR rule
+# H is carried TWICE, raw and relative to the Poisson reference, as the EPR rule
 # asks: the raw pair diverges as r ln(1/dt) and is the control (its increment per halving
 # must come out at r ln 2), while the referenced pair is the finite one and is what is
 # comparable across steps. sigma is identical either way -- both halves subtract the same
@@ -215,7 +215,6 @@ CACHE     = hlp.cache_path(STEM, dict(PARAMS, preset=PRESET, regimes=REGIMES, ha
 run_sim   = True
 run_plot  = True
 overwrite = False  # the hash covers every parameter, so this is only for a change to the CODE
-torch.set_default_dtype(torch.float64)
 
 
 # ── Measurement ───────────────────────────────────────────────────────────────
@@ -329,7 +328,7 @@ if run_sim:
                     f"truncation_error = {d['trunc']:.2e} at dt = {dt}, Q = {int(d['Q'])}: the "
                     f"age window fitted at dt = {DT_FIT} does not hold at this step.")
 
-            res[(hazard, name)] = torch.tensor(rows)
+            res[(hazard, name)] = torch.tensor(rows, dtype=torch.float64)
             hlp.save_atomic(res, CACHE)
 
     hlp.save_atomic(res, CACHE)
@@ -420,7 +419,7 @@ if run_plot:
 
     # The other half of the same rule: relative to the Poisson reference, H is FINITE and has
     # a dt -> 0 limit like any other reported quantity. Printed beside the raw pair so the
-    # dump carries both, which is what CLAUDE.md's EPR rule asks for.
+    # dump carries both, which is what the EPR rule asks for.
     print(f"\n[referenced] H - H_ref, per ms, with its dt -> 0 limit:")
     for name in REGIMES:
         for h in HAZARDS:
@@ -480,7 +479,7 @@ if run_plot:
 
 if run_plot:
 
-    # The figure line CLAUDE.md asks for. pre.banner would print "hazard=?" here: the hazard
+    # The figure line (preset, hazard, dt). pre.banner would print "hazard=?" here: the hazard
     # is this script's second swept axis, so it is absent from MODEL by construction. A
     # figure that compares three kernels states three, and dt is the x axis so it is named as
     # a range rather than a value.
@@ -582,7 +581,7 @@ if run_plot:
             # anchored on the coarsest error actually plotted, so the guide sits next to the
             # curves rather than at an offset of its own choosing
             anchor = max(float(errs[h][0]) for h in HAZARDS)
-            ax_e.plot(dts, anchor * torch.tensor(dts) / dts[0], 'k--', linewidth=0.8,
+            ax_e.plot(dts, anchor * torch.tensor(dts, dtype=torch.float64) / dts[0], 'k--', linewidth=0.8,
                       label=r'slope 1 ($\propto \Delta_t$)')
             for t in THRESHS:
                 ax_e.axhline(t, color='0.4', linewidth=0.8)
@@ -622,14 +621,14 @@ if run_plot:
 
             # the prediction, anchored on the coarsest point: nothing is fitted, the offset is
             # the one measured value and the slope is the converged rate
-            pred = float(v[0]) + r_lim * torch.log(torch.tensor(dts[0]) / torch.tensor(dts))
+            pred = float(v[0]) + r_lim * torch.log(torch.tensor(dts[0], dtype=torch.float64) / torch.tensor(dts, dtype=torch.float64))
             ax_h.plot(dts, pred, '-', color='0.35', linewidth=0.8, zorder=0)
 
             # increments against r ln 2, which is the same statement with the offset divided
             # out: every curve should sit on 1, and the finest steps are where it gets there
             for ckey, fill in (("H_fwd", True), ("H_rev", False)):
                 ratio = res[(h, name)][:, col[ckey]].diff() / (r_lim * float(torch.log(
-                    torch.tensor(2.0))))
+                    torch.tensor(2.0, dtype=torch.float64))))
                 ax_q.plot(dts[1:], ratio, ls, marker=mk, color=COLORS[h], markersize=5,
                           markerfacecolor=COLORS[h] if fill else 'none',
                           label=f'{h} / {name}' if fill else None)

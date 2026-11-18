@@ -38,7 +38,6 @@ run_sim   = True
 run_plot  = True
 overwrite = True
 
-torch.set_default_dtype(torch.float64)
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -48,8 +47,8 @@ if run_sim:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # swept parameters
-    w_EE = torch.linspace(1, 5, 51)
-    w_II = torch.linspace(-4, 0, 51)
+    w_EE = torch.linspace(1, 5, 51, dtype=torch.float64)
+    w_II = torch.linspace(-4, 0, 51, dtype=torch.float64)
 
     # fixed parameters, kept as in wc-mf_vs_sm.py
     E_ratio = 0.8
@@ -89,7 +88,7 @@ if run_sim:
         traj = mf.entropy_trajectory(steps, pb=True)
         print(f"Done in {time.time() - t0:.2f}s")
 
-        traj["dt"] = torch.tensor(dt)
+        traj["dt"] = torch.tensor(dt, dtype=torch.float64)
         traj["axes"] = mf.grid_axes
 
         CACHE_DIR.mkdir(exist_ok=True)

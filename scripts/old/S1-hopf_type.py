@@ -133,7 +133,6 @@ CACHE     = hlp.cache_path(STEM, dict(PARAMS, preset=PRESET, j=[J_LO, J_HI, J_ST
 run_sim   = True
 run_plot  = True
 overwrite = False  # the hash covers every parameter, so this is only for a change to the CODE
-torch.set_default_dtype(torch.float64)
 
 
 # ── Measurement ───────────────────────────────────────────────────────────────
@@ -206,7 +205,7 @@ def sweep(Js: torch.Tensor, Q: int, settle_ms: float, label: str) -> torch.Tenso
             f"truncation_error = {d['trunc']:.2e} at J = {float(J):g}: the age window fitted "
             f"at J = {J_FIT} does not hold here.")
     print(f"  [{label}] {len(Js)} points in {time.time() - t0:.0f}s")
-    return torch.tensor(rows)
+    return torch.tensor(rows, dtype=torch.float64)
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────

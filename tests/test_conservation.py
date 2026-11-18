@@ -1,7 +1,6 @@
 """ The age distribution is a probability: the transport conserves its mass exactly. """
 
 import pytest
-import torch
 
 from conftest import HAZ_DT, WC
 from rdme.mean_field import RDMWilsonCowan

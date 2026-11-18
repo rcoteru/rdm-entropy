@@ -23,7 +23,7 @@ from rdme.mean_field import RDMIsingModelBatch
 #
 # The preset is S1 (2026-11-08 brief), not S1-sat. The pre-port dict here was E = 0, beta = 8,
 # theta = 0.5, tau_int = 10, J = 40, which is S1-sat exactly -- that was the RIGHT call at the
-# port (CLAUDE.md's "Ported 2026-11-07" note), since the pre-port dict is what it was. But the
+# port (2026-11-07), since the pre-port dict is what it was. But the
 # paper's figures all sit at S1, so this plane needs to as well, and the preset is now a
 # variable rather than a literal: PRESET = "S1-sat" reproduces the original port's plane; this
 # script runs it at S1.
@@ -95,7 +95,6 @@ PARTIAL = CACHE.with_suffix(".partial.pt")
 run_sim   = True
 run_plot  = True
 overwrite = False  # the hash covers every parameter, so this is only for a change to the CODE
-torch.set_default_dtype(torch.float64)
 
 
 def acf1_of(traj: torch.Tensor) -> torch.Tensor:

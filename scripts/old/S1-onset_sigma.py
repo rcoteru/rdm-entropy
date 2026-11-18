@@ -11,7 +11,7 @@ silently stops being ample as the ladder approaches it.
 J_c = 11.5318 under poisson_exact, the dt -> 0 limit measured in S1-cycle_point.py / dump
 P1_2026-11-07_S1-cycle_point_hopf-and-cycle-point.md. Not re-measured here -- taken as given.
 
-dt is coarse here and should be: CLAUDE.md's own reasoning is that near onset the burst is
+dt is coarse here and should be: near onset the burst is
 mild (ceiling occupancy 0.033 at J=12 against 0.31 at J=20, per the B1 cost table), so
 lambda*dt/2 -- the local error of the exact-survival solver at the peak rate -- is small
 relative to the cycle point's own working dt = 1/4. This run is wall-clock limited (long
@@ -19,13 +19,13 @@ equilibration near onset), not memory limited, which is the opposite constraint 
 in S1-2Dscan_*.py, so a (dt, dt/2) Richardson pair is affordable here where it is not there:
 (1/2, 1/4), B1's own standing pair, is used throughout.
 
-TWO-READING SETTLING TEST (CLAUDE.md, decided 2026-11-08): sigma is measured once, then
+TWO-READING SETTLING TEST (decided 2026-11-08): sigma is measured once, then
 re-measured after equilibrating for the SAME window again (i.e. twice the total equilibration),
 and a J is accepted only if the two readings agree to better than 1%. Points that fail are
 EXCLUDED and reported as excluded, with their distance to J_c -- not silently dropped from the
 printed ladder.
 
-2026-11-08 decision, also CLAUDE.md: ptp has NO dt -> 0 limit near a Hopf (it is still
+2026-11-08 decision: ptp has NO dt -> 0 limit near a Hopf (it is still
 increasing in order at dt = 1/64 on the working cycle point) and is reported at its own dt and
 nowhere else in this script -- no amplitude exponent is fitted here, by design, not by omission.
 """
@@ -43,7 +43,7 @@ from rdme.mean_field import RDMIsingModel
 
 PRESET = "S1"
 HAZARD = "poisson_exact"   # the default hazard and the only one with a dt -> 0 limit near a
-                           # threshold-crossing attractor (CLAUDE.md; S1-dt_conv.py measures
+                           # threshold-crossing attractor (S1-dt_conv.py measures
                            # Richardson's refusal on `poisson` here directly)
 
 J_C = 11.5318   # S1-cycle_point.py's dt -> 0 limit under poisson_exact; not re-measured here
@@ -66,7 +66,6 @@ TOL_AGE      = 1e-3
 SETTLE_TOL   = 0.01          # 1%: the two-reading agreement bar
 
 DEVICE = 'cpu'
-torch.set_default_dtype(torch.float64)
 
 
 def build(J: float, dt: float, Q):
@@ -168,8 +167,8 @@ print(f"\n{len(excluded)}/{len(DELTAS)} points excluded by the settling test: "
 # ── the power law, from the ACCEPTED points' dt2 (finer) reading ─────────────
 
 if len(accepted) >= 3:
-    d = torch.tensor([r["Delta"] for r in accepted])
-    s = torch.tensor([r["sigma2"] for r in accepted])
+    d = torch.tensor([r["Delta"] for r in accepted], dtype=torch.float64)
+    s = torch.tensor([r["sigma2"] for r in accepted], dtype=torch.float64)
     x, y = torch.log(d), torch.log(s)
     A = torch.stack([x, torch.ones_like(x)], dim=1)
     sol, res, *_ = torch.linalg.lstsq(A, y.unsqueeze(-1), driver='gelsd'), None, None

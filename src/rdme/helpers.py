@@ -1,3 +1,7 @@
+""" Small utilities for the scripts -- run durations, cache naming, cycle windows, device
+memory -- rather than for the model. The file exists so that an array utility or a path rule does not
+have to live in a physics module to be shared between scripts. """
+
 from __future__ import annotations
 
 import hashlib
@@ -5,10 +9,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import torch
-
-""" Small utilities for the scripts -- run durations, cache naming, cycle windows, device
-memory -- rather than for the model. The file exists so that an array utility or a path rule does not
-have to live in a physics module to be shared between scripts. """
 
 
 def grab_closest_idxs(vector: torch.Tensor, values: Sequence[float]) -> list[int]:
@@ -61,7 +61,7 @@ def n_steps(ms: float, dt: float, *, name: str = "duration") -> int:
     in ms and given in steps, or a dt that is coarser than the window. """
     if not ms > 0 or not dt > 0:
         raise ValueError(f"{name} and dt must be positive, got {name}={ms}, dt={dt}")
-    n = int(round(ms / dt))
+    n = round(ms / dt)
     if n < 1:
         raise ValueError(f"{name}={ms} ms is shorter than one step of dt={dt} ms")
     return n

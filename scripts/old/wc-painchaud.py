@@ -210,7 +210,6 @@ run_lyap  = True    # stage 2: Benettin spectra of the flagged candidates, at se
 run_plot  = True
 overwrite = False
 
-torch.set_default_dtype(torch.float64)
 
 
 # ── The paper's parameters ────────────────────────────────────────────────────
@@ -409,11 +408,11 @@ def streaming_stats(mf, steps: int) -> dict[str, torch.Tensor]:
     the same difference of large numbers made small. """
     half = steps // 2
     n1, n2 = half, steps - half
-    zeros = lambda: torch.zeros(mf.B, device=mf.device)
+    zeros = lambda: torch.zeros(mf.B, device=mf.device, dtype=torch.float64)
 
     s1, q1, s2, q2, c1 = zeros(), zeros(), zeros(), zeros(), zeros()
-    lo = torch.full((mf.B,), float('inf'),  device=mf.device)
-    hi = torch.full((mf.B,), float('-inf'), device=mf.device)
+    lo = torch.full((mf.B,), float('inf'),  device=mf.device, dtype=torch.float64)
+    hi = torch.full((mf.B,), float('-inf'), device=mf.device, dtype=torch.float64)
     shift = mf.m[:, 0].clone()
     prev = None
 
@@ -461,12 +460,12 @@ def streaming_peaks(mf, steps: int, thr: torch.Tensor) -> dict[str, torch.Tensor
     A peak is attributed to the half in which it CLOSES, and the first peak of the run
     contributes a height but no interval, there being nothing before it. """
     half = steps // 2
-    zeros = lambda: torch.zeros(mf.B, device=mf.device)
+    zeros = lambda: torch.zeros(mf.B, device=mf.device, dtype=torch.float64)
     b = lambda: torch.zeros(mf.B, dtype=torch.bool, device=mf.device)
 
     armed  = b()
     curmax = zeros()
-    last   = torch.full((mf.B,), -1.0, device=mf.device)
+    last   = torch.full((mf.B,), -1.0, device=mf.device, dtype=torch.float64)
     n  = [zeros(), zeros()]                       # peak counts, per half
     hs = [zeros(), zeros()]; hq = [zeros(), zeros()]   # height sums, sums of squares
     isn = [zeros(), zeros()]
@@ -536,8 +535,8 @@ if run_probe:
     # section 4.1 answers, and the prerequisite for 4.2 -- two populations that do not oscillate
     # on their own are not going to be coupled into chaos.
     nk, nK = 9, 7
-    kap = torch.linspace(0.4, 2.8, nk)
-    Kr  = torch.logspace(math.log10(2.0), math.log10(30.0), nK)
+    kap = torch.linspace(0.4, 2.8, nk, dtype=torch.float64)
+    Kr  = torch.logspace(math.log10(2.0), math.log10(30.0), nK, dtype=torch.float64)
     for j in (0, 1):
         bg, th = 1.0 / P_S[j], P_THETA[j]
         T_u = P_ALPHA[0] * DT0_ANCHOR
@@ -554,7 +553,7 @@ if run_probe:
         # pilot, and U_MAX_PILOT is already past where these cells converge
         Q = max(eq.q_from_tau(max(tr.max().item(), TAU_INT), dt, 0.01),
                 math.ceil(U_MAX_PILOT / dt))
-        col = lambda t: torch.as_tensor(t).reshape(-1, 1).expand(kk.numel(), 1).clone()
+        col = lambda t: torch.as_tensor(t, dtype=torch.float64).reshape(-1, 1).expand(kk.numel(), 1).clone()
         mf = RDMNetwork(
             M=1, w=(kk * w0).reshape(-1, 1, 1), N=[1000], E=col(0.0), beta=col(bg),
             theta=col(th), tau_int=col(TAU_INT), tau_ref=tr.reshape(-1, 1),
@@ -585,10 +584,10 @@ if run_sim:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     n = 9   # per axis; cost is n**4
-    kappa     = torch.linspace(0.4, 2.8, n)
-    K_ref     = torch.logspace(math.log10(2.0), math.log10(30.0), n)
-    tau_scale = torch.linspace(0.3, 2.7, n)
-    cross     = torch.logspace(math.log10(0.2), math.log10(5.0), n)
+    kappa     = torch.linspace(0.4, 2.8, n, dtype=torch.float64)
+    K_ref     = torch.logspace(math.log10(2.0), math.log10(30.0), n, dtype=torch.float64)
+    tau_scale = torch.linspace(0.3, 2.7, n, dtype=torch.float64)
+    cross     = torch.logspace(math.log10(0.2), math.log10(5.0), n, dtype=torch.float64)
 
     # In MILLISECONDS, converted to steps below: a step count held fixed across dt would be a
     # different physical window at each resolution, which is the one thing a convergence check
@@ -635,14 +634,14 @@ if run_sim:
         # rather than correctness.
         Qp = math.ceil(U_MAX_PILOT / dt)
         pilot_chunk = max(1, min(n ** 3, int(STATE_BUDGET / (8 * 4 * Qp))))
-        rates = torch.empty(B, 2)
+        rates = torch.empty(B, 2, dtype=torch.float64)
         print(f"Pilot: {B} cells at Q = {Qp} (U_max = {U_MAX_PILOT:g} ms), "
               f"{PILOT_MS:g} + {PILOT_WIN:g} ms each.")
         for lo in tqdm.tqdm(range(0, B, pilot_chunk), desc="pilot"):
             idx = torch.arange(lo, min(lo + pilot_chunk, B))
             mf = build(idx, Qp)
             mf.forward(int(PILOT_MS / dt), pb=False)
-            acc, T = torch.zeros(len(idx), 2, device=device), int(PILOT_WIN / dt)
+            acc, T = torch.zeros(len(idx), 2, device=device, dtype=torch.float64), int(PILOT_WIN / dt)
             for _ in range(T):
                 acc += mf.rates()
                 mf.update()

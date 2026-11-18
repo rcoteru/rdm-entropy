@@ -36,7 +36,7 @@ from rdme.spin_model import SpinIsingModel
 HAZARD = "poisson_exact"   # stated per script: the hazard is its own axis, not part of a
                            # preset. The pre-port dicts carried a MIXTURE -- two "async"
                            # (route A, = "bernoulli" here) and two "poisson" -- which is the
-                           # one thing CLAUDE.md forbids inside a comparison. One key for all
+                           # one thing forbidden inside a comparison. One key for all
                            # four, and it is the solver.
 
 REGIMES: dict[str, dict] = {
@@ -105,7 +105,6 @@ CACHE = hlp.cache_path(Path(__file__).stem, dict(PARAMS, preset=PRESET, N=N, t_e
 run_sim   = True
 run_plot  = True
 overwrite = False  # the hash covers every parameter, so this is only for a change to the CODE
-torch.set_default_dtype(torch.float64)
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -139,7 +138,7 @@ if run_sim and (overwrite or not CACHE.exists()):
     # G is the self-consistency residual: every zero crossing is a stationary state of the
     # mean field, and its slope there is what the bracketing solver keys on. Evaluated here
     # rather than at plot time because it needs the live model, which the cache does not hold.
-    m_grid = torch.linspace(0, 1, 2001, device=DEVICE).unsqueeze(-1)     # (K, 1)
+    m_grid = torch.linspace(0, 1, 2001, device=DEVICE, dtype=torch.float64).unsqueeze(-1)     # (K, 1)
     roots  = mf.fixed_points(method='bracket', n_grid=2001)
 
     out = {
@@ -149,11 +148,11 @@ if run_sim and (overwrite or not CACHE.exists()):
         "sm_traj1": sm_traj1, "sm_traj2": sm_traj2,
         # the two age distributions, on the mean field's grid
         "p_mf": mf.p[0].cpu(),
-        "p_sm": sm.fdist(mf.Q).cpu(),
+        "p_sm": sm.fdist(mf.Q)[0].cpu(),
         "m_grid": m_grid.squeeze(-1).cpu(),
         "G": mf.fp_residual(m_grid).squeeze(-1).cpu(),
         "roots": roots.cpu(),
-        "rho": torch.tensor([fpts.spectral_radius(mf.fp_eigenvalues(r)) for r in roots]),
+        "rho": torch.tensor([fpts.spectral_radius(mf.fp_eigenvalues(r)) for r in roots], dtype=torch.float64),
     }
 
     CACHE.parent.mkdir(exist_ok=True)
@@ -183,7 +182,7 @@ if run_plot:
         # the age axis in ms (u = n*dt), not in bins: the bin index is a property of the
         # solver, and the two models are only comparable on the physical age
         rp.curves({'Spin Model': d["p_sm"], 'Mean Field': d["p_mf"]},
-                  x=torch.arange(len(d["p_mf"])) * dt,
+                  x=torch.arange(len(d["p_mf"]), dtype=torch.float64) * dt,
                   title="Firing age distribution (mean-field vs spin model)",
                   xlabel='age u (ms)', ylabel='p(u)')
 

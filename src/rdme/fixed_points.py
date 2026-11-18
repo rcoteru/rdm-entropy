@@ -1,13 +1,3 @@
-from __future__ import annotations
-
-import math
-from typing import Callable
-
-import torch
-
-from rdme.hazards import Hazard
-import rdme.equations as eq
-
 """ Fixed points: the closed forms at stationarity, the model's overlap map, and the generic
 root finders that locate its roots.
 
@@ -20,6 +10,15 @@ The closed forms are themselves kernel-independent and take the hazard as data: 
 sees it, and the survival and the age distribution take fprobs as an argument. Only the two maps
 take a Hazard. """
 
+from __future__ import annotations
+
+import math
+from collections.abc import Callable
+
+import torch
+
+import rdme.equations as eq
+from rdme.hazards import Hazard
 
 # Closed forms at stationarity
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -98,6 +97,7 @@ def fp_guess_lattice(M: int,
                      lo: float = 0.0,
                      hi: float = 1.0,
                      device: str | torch.device = 'cpu',
+                     dtype: torch.dtype = torch.float64,
                      ) -> torch.Tensor:    # (n_per_axis**M, M) starting points
     """ A regular lattice of Newton starting points covering the overlap box [lo, hi]^M.
 
@@ -106,7 +106,7 @@ def fp_guess_lattice(M: int,
     exactly there tends to be thrown straight back out by the clamp. n_per_axis**M grows
     fast, but M is one or two for every model in this module. """
     step = (hi - lo) / (2 * n_per_axis)
-    axis = torch.linspace(lo + step, hi - step, n_per_axis, device=device)
+    axis = torch.linspace(lo + step, hi - step, n_per_axis, device=device, dtype=dtype)
     return torch.stack(torch.meshgrid(*([axis] * M), indexing='ij'), dim=-1).reshape(-1, M)
 
 
@@ -314,6 +314,7 @@ def bracket_roots(residual: Callable[[torch.Tensor], torch.Tensor],  # single, u
                   max_iter: int = 60,
                   merge_tol: float = 1e-6,
                   device: str | torch.device = 'cpu',
+                  dtype: torch.dtype = torch.float64,
                   ) -> torch.Tensor:     # (R, 1) roots, sorted
     """ All sign changes of a scalar residual on [lo, hi], refined by bisection.
 
@@ -325,7 +326,7 @@ def bracket_roots(residual: Callable[[torch.Tensor], torch.Tensor],  # single, u
 
     `residual` follows the same (M,) -> (M,) convention as the Newton path, with M=1;
     it is evaluated on a whole grid at once via vmap. """
-    grid = torch.linspace(lo, hi, n_grid, device=device).unsqueeze(-1)   # (n_grid, 1)
+    grid = torch.linspace(lo, hi, n_grid, device=device, dtype=dtype).unsqueeze(-1)  # (n_grid, 1)
     vals = torch.vmap(residual)(grid).squeeze(-1)                        # (n_grid,)
     grid = grid.squeeze(-1)
 

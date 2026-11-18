@@ -1,3 +1,12 @@
+""" The three figures the exploration scripts in `scripts/` redraw every time: a set of
+labelled curves on one axes, a column of stacked time-series panels, and a row of scatter
+plots with one panel per model. Each takes the trajectory dicts the models already return,
+and each hands back the matplotlib objects it made, so anything these do not cover is a
+normal matplotlib call on the returned axes rather than a new keyword here.
+
+Deliberately not for the paper figures: those live in `paper/`, are drawn by hand against
+`pub_style` below, and should not inherit a default that a script changed. """
+
 from __future__ import annotations
 
 import datetime as _datetime
@@ -12,16 +21,6 @@ import numpy as np
 import torch
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
-
-""" The three figures the exploration scripts in `scripts/` redraw every time: a set of
-labelled curves on one axes, a column of stacked time-series panels, and a row of scatter
-plots with one panel per model. Each takes the trajectory dicts the models already return,
-and each hands back the matplotlib objects it made, so anything these do not cover is a
-normal matplotlib call on the returned axes rather than a new keyword here.
-
-Deliberately not for the paper figures: those live in `paper/`, are drawn by hand against
-`pub_style` below, and should not inherit a default that a script changed. """
-
 
 # Axis labels for the keys the trajectory dicts carry, so the quantity's units are written
 # down once rather than in every script. Unknown keys fall back to the key itself.
@@ -55,9 +54,8 @@ TITLES = {
 def _np(x) -> np.ndarray:
     """ Tensor or array to a plottable array, with a trailing singleton axis dropped.
 
-    The squeeze is not cosmetic: SpinModel.trajectory returns "m_tot" as (T, n_obs) while the
-    mean field returns it as (T,), so the same key plotted from the two models would otherwise
-    need a different call. """
+    The squeeze is not cosmetic: a single-population "m" or "r" is (T, 1), and plotting it
+    next to an aggregate (T,) series would otherwise need a different call. """
     if torch.is_tensor(x):
         x = x.detach().cpu().numpy()
     x = np.asarray(x)
@@ -146,7 +144,7 @@ def panels(series: Mapping[str, Mapping[str, object]],
             ax = axes[i, c]
             for label, d in data.items():
                 y = d[key][:, c] if d[key].ndim == 2 else d[key]
-                xs, xlabel = _time_axis(len(y), dt)
+                xs, _ = _time_axis(len(y), dt)
                 ax.plot(xs, y, label=label, linewidth=2)
 
             title = (titles or {}).get(key, TITLES.get(key, key))
@@ -158,7 +156,7 @@ def panels(series: Mapping[str, Mapping[str, object]],
             if i == 0 and len(series) > 1:
                 ax.legend()
             if i == len(keys) - 1:
-                ax.set_xlabel(xlabel)
+                ax.set_xlabel(_time_axis(0, dt)[1])
 
     if suptitle:
         fig.suptitle(suptitle)
@@ -263,8 +261,8 @@ def return_maps(ms: Mapping[str, object], **kw) -> tuple[Figure, np.ndarray]:
 # specific, unlike everything above, and here rather than in a script because ising-E_sweep
 # and ising-J_sweep differ only in which parameter is on the x axis.
 
-def sweep_figures(axis: torch.Tensor,            # (B,) the swept parameter
-                  m_tot: torch.Tensor,           # (B, T) activity, full in time
+def sweep_figures(axis: torch.Tensor | np.ndarray,    # (B,) the swept parameter
+                  m_tot: torch.Tensor | np.ndarray,   # (B, T) activity, full in time
                   *,
                   dt: float,
                   label: str,                    # x-axis label, e.g. 'Recurrent coupling  J'
@@ -299,7 +297,7 @@ def sweep_figures(axis: torch.Tensor,            # (B,) the swept parameter
     # destabilize as they grow, theta and beta restabilize -- and a one-sided rule silently
     # marks the far end of the axis for half of them.
     crits = []
-    if stable is not None and stable.any() and not stable.all():
+    if fp is not None and stable is not None and stable.any() and not stable.all():
         order = np.argsort(_np(fp["x"]))
         xs, ss = _np(fp["x"])[order], stable[order]
         crits = [0.5 * (xs[i] + xs[i + 1]) for i in np.nonzero(ss[1:] != ss[:-1])[0]]
@@ -325,7 +323,7 @@ def sweep_figures(axis: torch.Tensor,            # (B,) the swept parameter
 
     figs["bifurcation"], (ax_scatter, ax_branch) = new_figure('Bifurcation', 2, 8)
 
-    n_points = max(1, min(m_tot.shape[1], int(round(tail_ms / dt))))
+    n_points = max(1, min(m_tot.shape[1], round(tail_ms / dt)))
     ax_scatter.set_title(f'Simulated activity (last {n_points * dt:g} ms per cell, '
                          f'{n_points} points at dt={dt:g})')
     tail = m_tot[:, -n_points:]
@@ -336,11 +334,11 @@ def sweep_figures(axis: torch.Tensor,            # (B,) the swept parameter
     ax_scatter.legend()
 
     ax_branch.set_title('Mean-field fixed points  (filled = stable, open = unstable)')
-    if fp is not None:
+    if fp is not None and stable is not None:
         ax_branch.plot(axis, m_avg/dt, color='C1', linewidth=1, label='simulated time average')
         for mask, style, lab in [
-                (stable,  dict(marker='o', color='C0'), 'stable'),
-                (~stable, dict(marker='o', facecolors='none', edgecolors='C3'), 'unstable')]:
+                (stable,  {"marker": 'o', "color": 'C0'}, 'stable'),
+                (~stable, {"marker": 'o', "facecolors": 'none', "edgecolors": 'C3'}, 'unstable')]:
             if mask.any():
                 ax_branch.scatter(_np(fp["x"])[mask], _np(fp["m_star"])[mask]/dt, s=22,
                                   label=lab, **style)
@@ -357,7 +355,7 @@ def sweep_figures(axis: torch.Tensor,            # (B,) the swept parameter
     figs["stability"], (ax_mod, ax_spec) = new_figure('Stability', 2, 8)
 
     ax_mod.set_title('Leading eigenvalues of the one-step Jacobian at each fixed point')
-    if fp is not None:
+    if fp is not None and stable is not None:
         lead = _np(fp["lead"])
         # the subleading moduli give the margin: a gap means the leading pair really is the
         # mode that goes unstable, no gap means the crossing is not a clean Hopf
@@ -469,17 +467,15 @@ def _slugify(text: str, *, max_len: int = 48) -> str:
 
 
 def _suptitle(fig: Figure) -> str:
-    """ The figure's suptitle, across matplotlib versions (`get_suptitle` is 3.8 and up). """
-    if hasattr(fig, "get_suptitle"):
-        return fig.get_suptitle() or ""
-    return fig._suptitle.get_text() if getattr(fig, "_suptitle", None) else ""
+    """ The figure's suptitle, or "" if it has none. """
+    return fig.get_suptitle() or ""
 
 
 def _auto_slug(fig: Figure) -> str:
     """ A figure's own name for itself: its label, else its suptitle, else a single axes'
     title, else its number. Labelling a figure (`fig.set_label("...")`) is how a script
     chooses the filename without passing names to `save`. """
-    candidates = (fig.get_label(), _suptitle(fig),
+    candidates = (str(fig.get_label() or ""), _suptitle(fig),
                   fig.axes[0].get_title() if len(fig.axes) == 1 else "")
     return next((slug for slug in map(_slugify, candidates) if slug), f"fig{fig.number}")
 
@@ -506,7 +502,8 @@ def save(figs: Mapping[str, Figure] | Sequence[Figure] | Figure | None = None,
     items = (list(figs.items()) if isinstance(figs, Mapping)
              else [(_auto_slug(f), f) for f in figs])
 
-    script = script or (_running_script().stem if _running_script() else "session")
+    running = _running_script()
+    script = script or (running.stem if running else "session")
     date = date or _datetime.date.today().isoformat()
     out = figure_dir(dir=dir)
     out.mkdir(parents=True, exist_ok=True)

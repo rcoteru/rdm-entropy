@@ -85,7 +85,6 @@ DTS     = (1.0, 0.5, 0.25, 0.125)
 CACHE_DIR = Path(__file__).parents[1] / "cache"
 
 DEVICE = 'cpu'
-torch.set_default_dtype(torch.float64)
 
 
 def spectral_radius(J: float, hazard: str, dt: float) -> float:
@@ -181,7 +180,7 @@ if __name__ == '__main__':
         vals = [res[("Jc", h, dt)] for dt in DTS if ("Jc", h, dt) in res]
         if len(vals) < 2:
             print(f"    {h:>14}: too few steps to extrapolate"); continue
-        v = torch.tensor(vals)
+        v = torch.tensor(vals, dtype=torch.float64)
         lim, pord = richardson(v)
         o = ['%.2f' % q for q in orders(v).tolist()] if len(v) > 2 else ['--']
         print(f"    {h:>14}: limit {lim:.6f} (order {pord:.2f}, orders {o})"

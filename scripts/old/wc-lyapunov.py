@@ -89,7 +89,6 @@ run_sim   = True
 run_plot  = True
 overwrite = False
 
-torch.set_default_dtype(torch.float64)
 
 # Half-width of the band around zero that counts as "not distinguishable from zero", in /ms.
 # Clears both the finite-window statistical floor and the dt-dependent lattice bias; see the
@@ -112,10 +111,10 @@ if run_sim:
 
     # The grid is stage 1's, verbatim -- the whole point is to overlay the two.
     n = 13
-    E_ext = torch.linspace(0.70, 1.20, n)
-    w_EE  = torch.linspace(0.0,   4.0, n)
-    g     = torch.linspace(0.0,  15.0, n)
-    w_II  = torch.linspace(-10.0, 0.0, n)
+    E_ext = torch.linspace(0.70, 1.20, n, dtype=torch.float64)
+    w_EE  = torch.linspace(0.0,   4.0, n, dtype=torch.float64)
+    g     = torch.linspace(0.0,  15.0, n, dtype=torch.float64)
+    w_II  = torch.linspace(-10.0, 0.0, n, dtype=torch.float64)
     rho   = 2.0 ** 0.5
 
     E_ratio = 0.8

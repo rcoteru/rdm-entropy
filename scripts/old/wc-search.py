@@ -102,7 +102,6 @@ run_sim   = True
 run_plot  = True
 overwrite = False   # overwrite existing cache file if True
 
-torch.set_default_dtype(torch.float64)
 
 
 # ── Classification thresholds ─────────────────────────────────────────────────
@@ -144,11 +143,11 @@ def streaming_stats(mf, steps: int) -> dict[str, torch.Tensor]:
     Shifting makes the cancellation exact instead of catastrophic. """
     half = steps // 2
     n1, n2 = half, steps - half
-    zeros = lambda: torch.zeros(mf.B, device=mf.device)
+    zeros = lambda: torch.zeros(mf.B, device=mf.device, dtype=torch.float64)
 
     s1, q1, s2, q2 = zeros(), zeros(), zeros(), zeros()
-    lo = torch.full((mf.B,), float('inf'),  device=mf.device)
-    hi = torch.full((mf.B,), float('-inf'), device=mf.device)
+    lo = torch.full((mf.B,), float('inf'),  device=mf.device, dtype=torch.float64)
+    hi = torch.full((mf.B,), float('-inf'), device=mf.device, dtype=torch.float64)
     shift = mf.m[:, 0].clone()
 
     for t in tqdm.tqdm(range(steps), desc="recording", leave=False):
@@ -198,10 +197,10 @@ if run_sim:
     #   w_II  -- a real axis once inhibition participates: the sustained fraction
     #            runs from ~0.55 at w_II = 0 to ~0.2 at w_II = -10.
     n = 13   # per axis; cost is n**4
-    E_ext = torch.linspace(0.70, 1.20, n)
-    w_EE  = torch.linspace(0.0,   4.0, n)
-    g     = torch.linspace(0.0,  15.0, n)
-    w_II  = torch.linspace(-10.0, 0.0, n)
+    E_ext = torch.linspace(0.70, 1.20, n, dtype=torch.float64)
+    w_EE  = torch.linspace(0.0,   4.0, n, dtype=torch.float64)
+    g     = torch.linspace(0.0,  15.0, n, dtype=torch.float64)
+    w_II  = torch.linspace(-10.0, 0.0, n, dtype=torch.float64)
 
     # Loop asymmetry, held fixed: w_EI = g*rho, w_IE = -g/rho. sqrt(2) reproduces
     # the nominal (w_EI, w_IE) = (2, -1) of the other wc- scripts at g = sqrt(2).

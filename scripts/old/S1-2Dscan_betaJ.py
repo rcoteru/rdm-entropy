@@ -76,7 +76,6 @@ PARTIAL = CACHE.with_suffix(".partial.pt")
 run_sim   = True
 run_plot  = True
 overwrite = False  # the hash covers every parameter, so this is only for a change to the CODE
-torch.set_default_dtype(torch.float64)
 
 
 def acf1_of(traj: torch.Tensor) -> torch.Tensor:

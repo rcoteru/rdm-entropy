@@ -35,7 +35,8 @@ The continuum equations are the transport pair
     d_t q^a + d_u q^a = -lambda(h^a(u,t)) q^a(u,t),      q^a(0,t) = r^a(t),
     d_t S^a + d_u S^a = (I^a(t) - S^a(u,t)) / tau_int^a, S^a(0,t) = 0,
 
-with R^a(u) = -K^a exp(-u/tau_ref^a) floored to -R_abs over the dead time, the input
+with R^a(u) = -K^a exp(-(u - t_abs^a)/tau_ref^a) after the dead time and -R_abs during it
+(Gerstner's SRM_0 kernel, so K^a is the amplitude when the window ends), the input
 I^a(t) = sum_b w^{ab} r^b(t) + E^a, and the closure r^a(t) = int lambda(h^a(u,t)) q^a(u,t) du.
 
 Scheme. Age and time are advanced together on a single grid, du = dt, so cohorts move along
@@ -60,7 +61,8 @@ Call-site conventions:
 
 Entropy production is a functional of Phi alone, so it is computed once for every hazard:
 epr.epr_from_parts writes the plain Bernoulli entropy rather than the softplus/logit form, which
-is an identity of the logistic kernel only. sigma is the reported quantity; the forward and
+is an identity of the logistic kernel only, with ln Phi and ln(1 - Phi) taken from each kernel's
+exact branches rather than from Phi, which rounds to one at strong drive. sigma is the reported quantity; the forward and
 reverse terms H and H_rev each diverge as rate*ln(1/dt) against a counting measure, and are
 reported RELATIVE TO THE POISSON REFERENCE, which is finite as dt -> 0 and is the model's own
 reference measure under route B. The raw values are kept as a control (increment per halving

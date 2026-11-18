@@ -1,10 +1,3 @@
-from __future__ import annotations
-
-import math
-from typing import Callable
-
-import torch
-
 """ The mean field's equations: one timestep, the kernels it is built from, and the observables
 read off it, as pure functions.
 
@@ -24,10 +17,17 @@ The arithmetic is the batch class's (decided 2026-11-13): out-of-place updates, 
 rate as a (1, Q) @ (Q, 1) product, which reproduces the batch's einsum bit for bit on every
 shape including 1-D (see compute_firing_rate).
 
-hazard_clamp lives here rather than with the entropy production that motivated it, because the
-stationary survival in rdme.fixed_points needs it too, and it is really a dtype-dependent
-numerical bound. """
+hazard_clamp is a dtype-dependent numerical bound for the stationary survival in
+rdme.fixed_points. The entropy production no longer uses it: it reads ln Phi and ln(1 - Phi)
+off the kernels' exact branches, because a clamped log is what a saturated H_rev is made of. """
 
+from __future__ import annotations
+
+import math
+from collections.abc import Callable
+from typing import overload
+
+import torch
 
 # Per-step updates
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -133,7 +133,7 @@ def hazard_clamp(dtype: torch.dtype) -> float:
     """Upper bound to clamp a hazard to before taking log1p(-phi).
 
     1 - 1e-12 is below float32's resolution -- it rounds to exactly 1, so a saturated hazard
-    turns the survival into -inf and every EPR downstream into NaN. The bound therefore
+    turns the survival into -inf and everything downstream into NaN. The bound therefore
     follows the dtype's own resolution, while float64 keeps its historical 1 - 1e-12."""
     return 1.0 - max(1e-12, torch.finfo(dtype).eps)
 
@@ -154,6 +154,10 @@ def synaptic_kernel(Q, tau_m, delta):
     return torch.exp(-t*delta/tau_m)/tau_m*delta
 
 
+@overload
+def n_abs_bins(t_abs: torch.Tensor, dt: float) -> torch.Tensor: ...
+@overload
+def n_abs_bins(t_abs: float, dt: float) -> int: ...
 def n_abs_bins(t_abs: float | torch.Tensor, dt: float) -> int | torch.Tensor:
     """ Number of leading age bins an absolute refractory period of t_abs blocks. A tensor
     t_abs gives a long tensor of the same shape, each distinct value checked as below.
@@ -197,7 +201,7 @@ def n_abs_bins(t_abs: float | torch.Tensor, dt: float) -> int | torch.Tensor:
             f"t_abs={t_abs:g} ms is not an integer number of dt={dt:g} ms bins "
             f"(t_abs/dt = {ratio:.12g}): the window would round, and a dead time that rounds "
             "moves with the solver step. Pick dt as a divisor of t_abs.")
-    return max(int(round(ratio)) - 1, 0)
+    return max(round(ratio) - 1, 0)
 
 
 def abs_refractory_floor(w: torch.Tensor,        # (M, M) weights, row = target
@@ -252,15 +256,27 @@ def abs_refractory_floor(w: torch.Tensor,        # (M, M) weights, row = target
 
 
 def refractory_kernel(Q: int, K, tau_r, dt: float = 1.0,
-                      t_abs=0.0, R_abs=None, device='cpu') -> torch.Tensor:
-    """ The refractory kernel: an exponential relative term, optionally floored by a hard
-    absolute window on the first n_abs_bins(t_abs, dt) age bins.
+                      t_abs: float | torch.Tensor = 0.0, R_abs=None, device='cpu') -> torch.Tensor:
+    """ The refractory kernel: Gerstner's SRM_0 kernel (Neuronal Dynamics, Eq. 9.24), a hard
+    absolute window on the first n_abs_bins(t_abs, dt) age bins followed by an exponential
+    relative term that starts decaying when the window ENDS, not at the spike:
 
-        R(u) = -K exp(-u/tau_r),          u >= t_abs
-             = -R_abs,                    u <  t_abs
+        R(u) = -K exp(-(u - t_abs)/tau_r),   u >= t_abs
+             = -R_abs,                       u <  t_abs
 
-    t_abs = 0 is the plain exponential kernel, the pre-window behaviour, and an explicit
-    choice to run with no rate ceiling at all; the model classes default to 1 ms instead.
+    K is therefore the amplitude at the first instant the neuron can fire again, and -R_abs is
+    the finite stand-in for Gerstner's -infinity.
+
+    Discretization: bin n is evaluated at u = (n+1)*dt, the interspike interval a spike fired
+    from that bin produces (see n_abs_bins). The first eligible bin, n_abs = t_abs/dt - 1,
+    then carries exactly -K at every dt, and R at a fixed u >= t_abs does not depend on dt.
+    The spin model's R state follows the same convention.
+
+    K = 0 or tau_r = 0 means no relative term (R = 0 past the window): pure dead time.
+
+    t_abs = 0 is the plain exponential kernel, R = -K exp(-(n+1)*dt/tau_r) on every bin, and
+    an explicit choice to run with no rate ceiling at all; the model classes default to 1 ms
+    instead.
 
     Why the window exists at all, in two independent senses:
 
@@ -298,9 +314,14 @@ def refractory_kernel(Q: int, K, tau_r, dt: float = 1.0,
     the age axis: RDMNetwork passes (*b, M, 1) and gets every population's kernel, (*b, M, Q),
     in one call, each with its own window.
     """
-    n = torch.arange(Q, device=device)
     K, tau_r = torch.as_tensor(K, device=device), torch.as_tensor(tau_r, device=device)
-    R = -K * torch.exp(-n * dt / tau_r)
+    # in K's dtype: an integer n would put n * dt in torch's global default instead
+    n = torch.arange(Q, device=device, dtype=K.dtype)
+    # time since the end of the window, at the ISI (n+1)*dt each bin stands for; clamped so
+    # the blocked bins (overwritten by the floor below) stay finite
+    x = ((n + 1) * dt - torch.as_tensor(t_abs, device=device, dtype=K.dtype)).clamp_min(0.0)
+    on = (K != 0) & (tau_r > 0)
+    R = torch.where(on, -K * torch.exp(-x / torch.where(on, tau_r, 1.0)), 0.0).to(K.dtype)
     n_abs = torch.as_tensor(n_abs_bins(t_abs, dt), device=device)
     if not bool((n_abs > 0).any()):
         return R
@@ -323,10 +344,10 @@ def tau2alpha(tau: torch.Tensor, dt: float = 1.0) -> torch.Tensor:
 # older than U = (Q-1)*dt fires at the field of age U, h(U), instead of its own h(u). For
 # u >= U >= t_abs that field error is bounded, term by term:
 #
-#   refractory   |R(u) - R(U)| <= K_ref e^{-U/tau_ref}                 (R rises monotonically to 0)
+#   refractory   |R(u) - R(U)| <= K_ref e^{-(U-t_abs)/tau_ref}         (R rises monotonically to 0)
 #   synaptic     |S(u) - S(U)| <= A e^{-U/tau_int}                      (drive_bound below)
 #
-# so |h(u) - h(U)| <= Delta(U) = K_ref e^{-U/tau_ref} + A e^{-U/tau_int}. Every hazard obeys
+# so |h(u) - h(U)| <= Delta(U) = K_ref e^{-(U-t_abs)/tau_ref} + A e^{-U/tau_int}. Every hazard obeys
 # Phi(h + d)/Phi(h) in [e^{-beta|d|}, e^{beta|d|}] -- exactly for "poisson", by concavity of
 # 1 - e^{-x} for "poisson_exact", and by sigma(x + d)/sigma(x) <= e^{|d|} for "bernoulli" -- and
 # the boundary bin's share of the firing is at most 1. Hence, at every step and for every
@@ -364,15 +385,20 @@ def drive_bound(w: torch.Tensor, E: torch.Tensor, t_abs: torch.Tensor,
     return E.abs() + torch.where(w != 0, w.abs() * per_spike, 0.0).sum(dim=-1)
 
 
-def field_tail(U, K_ref: torch.Tensor, tau_ref: torch.Tensor, tau_int: torch.Tensor,
-               drive: torch.Tensor) -> torch.Tensor:
-    """ Delta(U) = K_ref e^{-U/tau_ref} + A e^{-U/tau_int}, (..., M): the largest field error
-    the absorbing bin can commit on a cohort older than U (U >= t_abs, in ms). """
-    return K_ref * torch.exp(-U / tau_ref) + drive * torch.exp(-U / tau_int)
+def field_tail(U, K_ref: torch.Tensor, tau_ref: torch.Tensor, t_abs: torch.Tensor,
+               tau_int: torch.Tensor, drive: torch.Tensor) -> torch.Tensor:
+    """ Delta(U) = K_ref e^{-(U-t_abs)/tau_ref} + A e^{-U/tau_int}, (..., M): the largest field
+    error the absorbing bin can commit on a cohort older than U (U >= t_abs, in ms). The
+    refractory term is 0 when K_ref = 0 or tau_ref = 0 (no relative term). """
+    on = (K_ref != 0) & (tau_ref > 0)
+    x = torch.as_tensor(U - t_abs).clamp_min(0.0)
+    ref = torch.where(on, K_ref * torch.exp(-x / torch.where(on, tau_ref, 1.0)), 0.0)
+    return ref + drive * torch.exp(-U / tau_int)
 
 
 def age_window(beta: torch.Tensor, K_ref: torch.Tensor, tau_ref: torch.Tensor,
-               tau_int: torch.Tensor, drive: torch.Tensor, tol: float) -> torch.Tensor:
+               t_abs: torch.Tensor, tau_int: torch.Tensor, drive: torch.Tensor,
+               tol: float) -> torch.Tensor:
     """ The smallest U (ms), per population, with expm1(beta * Delta(U)) <= tol. See the
     section comment for the bound. Delta is decreasing in U, so the crossing is found by
     bisection from an upper bracket where each of its two terms is at most half the target. """
@@ -383,12 +409,13 @@ def age_window(beta: torch.Tensor, K_ref: torch.Tensor, tau_ref: torch.Tensor,
                          "rate has no ceiling, so no age window is bounded. Pass Q explicitly; "
                          "truncation_error() is then inf, honestly.")
     target = math.log1p(tol) / beta
-    hi = torch.maximum(tau_ref * torch.log(2 * K_ref / target),
-                       tau_int * torch.log(2 * drive / target)).clamp_min(0.0)
+    on = (K_ref != 0) & (tau_ref > 0)
+    hi_ref = torch.where(on, t_abs + tau_ref * torch.log(2 * K_ref / target), 0.0)
+    hi = torch.maximum(hi_ref, tau_int * torch.log(2 * drive / target)).clamp_min(0.0)
     lo = torch.zeros_like(hi)
     for _ in range(60):
         mid = (lo + hi) / 2
-        ok = field_tail(mid, K_ref, tau_ref, tau_int, drive) <= target
+        ok = field_tail(mid, K_ref, tau_ref, t_abs, tau_int, drive) <= target
         hi, lo = torch.where(ok, mid, hi), torch.where(ok, lo, mid)
     return hi
 

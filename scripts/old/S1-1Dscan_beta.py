@@ -83,7 +83,6 @@ run_sim   = True
 run_fp    = True
 run_plot  = True
 overwrite = False  # the hash covers every parameter, so this is only for a change to the CODE
-torch.set_default_dtype(torch.float64)
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────
