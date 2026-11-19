@@ -6,10 +6,11 @@ every reported number has to come with this one. """
 from __future__ import annotations
 
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import torch
+from scipy.sparse.linalg import ArpackNoConvergence, LinearOperator, eigs
 
 import rdme.helpers as hlp
 
@@ -314,3 +315,101 @@ def classify_bursts(amp: torch.Tensor, w0: torch.Tensor, dt: float, *,
     cls[w0.isnan().numpy()] = "unconverged"
     cls[(amp < OSC_MIN).numpy()] = "no_osc"
     return cls
+
+
+# Leading modes
+# ~~~~~~~~~~~~~
+#
+# fixed_points.jacobian_eigvals builds the dense Jacobian and its whole spectrum: O(D^3) in
+# D = 2*M*Q, 113 s for the E-I mean field at dt = 0.2 and 613 s at dt = 0.1 (2026-11-19). A
+# stability scan needs only the eigenvalues of largest modulus, which Arnoldi (ARPACK) gets
+# from Jacobian-vector products at about one model step each.
+#
+# Why k is small. Below the few isolated leading modes, the spectrum holds a ring of ~Q
+# near-degenerate eigenvalues (the roots of the discrete renewal polynomial): measured on the
+# E-I Fig. 5 point at dt = 0.2, two isolated pairs at |lambda| = 0.99272 and 0.99038, then
+# pairs at 0.980368 and 0.980348. ARPACK converges on the isolated ones and slows sharply when
+# k reaches into the ring (k = 4: 4.3k matvecs; k = 6: 240k).
+#
+# Why tol is not machine precision. On the E-I low state (r_E ~ 0.003 Hz, dt = 0.1) ARPACK's
+# default tolerance took 322k matvecs at k = 2; tol = 1e-6 took 7.3k, with the leading mu
+# unchanged to 7 digits.
+#
+# Where the leading modes are nearly degenerate in modulus (two pairs within ~1e-4 /ms, deep on
+# the stable side) ARPACK fails at any k, ncv or tol: leading_growth gets the rate there.
+#
+# Tried and dropped (2026-11-19): ARPACK on the propagator J^p (p composed JVPs per matvec),
+# to widen the gap to the ring, with the one-step eigenvalues recovered by Rayleigh-Ritz.
+# Slower at every p tried: on Fig. 5 at dt = 0.2, p = 20 had not converged after 9 min against
+# 1.1 s at p = 1; on the low state, p = 5 had not converged after 150 s.
+
+def leading_modes(state_map: Callable[[torch.Tensor], torch.Tensor], x: torch.Tensor,
+                  dt: float, k: int = 4, ncv: int = 40, tol: float = 1e-8,
+                  maxiter: int = 20000, v0: torch.Tensor | None = None) -> dict:
+    """ The k leading modes of the linearization of the one-step map `state_map` at `x` (D,),
+    e.g. leading_modes(mf.state_map, mf.flatten_state(*mf.fp_state(m)), mf.dt): the
+    matrix-free counterpart of fixed_points.jacobian_eigvals, for the eigenvalues of largest
+    modulus only. ARPACK on Jacobian-vector products; `tol` is its relative accuracy on the
+    eigenvalues. If it does not converge on k, retries with k = 2 (one leading pair, or two
+    real modes) before giving up with ArpackNoConvergence -- which says the modes were too
+    crowded to resolve, not that the point is stable.
+
+    `v0` (D,) starts the iteration, e.g. the `v` of a neighbouring point in a scan.
+
+    Returns
+      mu        (k,) growth rates ln|lambda| / dt, in 1/ms, decreasing; stable iff all < 0
+      omega     (k,) angular frequencies arg(lambda) / dt, in rad/ms; a conjugate pair carries
+                both signs, a real mode 0 (or pi/dt if negative)
+      v         (D,) real part of the leading eigenvector, a warm start for the next solve
+      n_matvec  Jacobian-vector products used, over every attempt """
+    _, jvp = torch.func.linearize(state_map, x)
+    D, n = x.numel(), [0]
+
+    def mv(v):
+        n[0] += 1
+        return jvp(torch.from_numpy(np.ascontiguousarray(v, dtype=np.float64))
+                   .to(x)).cpu().numpy()
+
+    A  = LinearOperator((D, D), matvec=mv, dtype=np.float64)
+    v0 = None if v0 is None else v0.detach().cpu().double().numpy()
+    for kk in dict.fromkeys((k, 2)):
+        try:
+            w, V = eigs(A, k=kk, ncv=min(ncv, D - 1), which="LM", tol=tol, maxiter=maxiter,
+                        v0=v0)
+        except ArpackNoConvergence:
+            continue
+        o = np.argsort(-np.abs(w))
+        w, V = torch.from_numpy(w[o]), torch.from_numpy(V[:, o])
+        return dict(mu=w.abs().log() / dt, omega=w.angle() / dt, v=V[:, 0].real.clone(),
+                    n_matvec=n[0])
+    raise ArpackNoConvergence(f"no convergence at k = {k} or 2 ({n[0]} matvecs)", [], [])
+
+
+def leading_growth(state_map: Callable[[torch.Tensor], torch.Tensor], x: torch.Tensor,
+                   dt: float, t_ms: float = 1000.0, seed: int = 0) -> float:
+    """ Leading growth rate mu (1/ms) of the linearization of `state_map` at `x`, by power
+    iteration: a renormalized tangent vector is pushed for t_ms of burn-in, then for t_ms
+    more, and mu is the least-squares slope of its cumulative log norm against time. The
+    slope, not (end - start)/T: a single vector's norm oscillates with a leading complex pair,
+    and the endpoints would carry that phase.
+
+    For where leading_modes cannot converge -- leading modes nearly degenerate in modulus --
+    since the growth RATE converges there even though no eigenvector does. It gives no
+    frequency. Measured on the E-I Fig. 5 cut at dt = 0.1, t_ms = 1000 (2026-11-19): within
+    2e-5 /ms of ARPACK where ARPACK converges, within 5e-4 of the dense spectrum at a
+    degenerate point, closing slowly with t_ms. """
+    _, jvp = torch.func.linearize(state_map, x)
+    v = torch.randn(x.shape, dtype=x.dtype, generator=torch.Generator().manual_seed(seed))
+    v = (v / v.norm()).to(x)
+    n = hlp.n_steps(t_ms, dt, name="t_ms")
+    logn, acc = torch.zeros(n, dtype=torch.float64), 0.0
+    for t in range(2 * n):
+        v = jvp(v)
+        s = v.norm()
+        v = v / s
+        if t >= n:
+            acc += float(s.log())
+            logn[t - n] = acc
+    tt = torch.arange(n, dtype=torch.float64) * dt
+    tt -= tt.mean()
+    return float((tt * (logn - logn.mean())).sum() / (tt * tt).sum())

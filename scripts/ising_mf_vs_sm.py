@@ -60,6 +60,12 @@ POINTS = {
                     # unresolved at dt = 0.1
                     tau_int=20.0, tau_ref=1.0, K_ref=0.0,
                     nu0=0.01, t_abs=4.0),
+    # Schwalger 2017 Fig. 5 (wc_mf_vs_sm.py, "EI-fig5") collapsed onto one population: its
+    # neuron (Delta_u = 2.5 mV) with J = w(E→E) + w(I→E) = 960 - 1200, which is what both
+    # populations receive there since the neurons are identical and the rows equal
+    "I1-fig5-collapsed": dict(J=-240.0, E=24.0, beta=0.4, theta=15.0,
+                    tau_int=20.0, tau_ref=1.0, K_ref=0.0,
+                    nu0=0.01, t_abs=4.0),
 }
 POINT = POINTS["E1-15-onset"]  # choose one of the above points
 
@@ -72,7 +78,7 @@ dt     = 0.1       # ms, solver step; must divide t_abs
 TOL    = 1e-2      # truncation tolerance: sets the mean field's Q and the spin EPR's lookahead
 DEVICE = 'cpu'     # 'cuda' if torch.cuda.is_available() else 'cpu'
 
-T_EQUI, T_MEAS = 5000.0, 3000.0  # ms: equilibration, then entropy recording; T_MEAS holds
+T_EQUI, T_MEAS = 1000.0, 2000.0  # ms: equilibration, then entropy recording; T_MEAS holds
                                  # >= 30 periods on the oscillating presets (~70 ms at E = 15)
 STORE_SPIKES = False   # keep the spin raster of the recording, for the spin ISI CV;
                        # int8 (T_MEAS/dt, N): 600 MB at the defaults

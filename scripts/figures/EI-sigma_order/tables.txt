@@ -1,0 +1,65 @@
+ei_sigma_order.py; mean field only; poisson_exact; silent start; T_equi 1000 ms, T_meas 2000 ms; averages over whole cycles of r_E (analysis.cycle_window); unresolved if the period's order is outside (0.5, 3.0) or the sign changes, or if a population's H_rev grows faster than r_mean ln 2 by more than 0.05 r_mean ln 2 at the finer halving (the resolved E1 points have small negative remainders; E1-30-strong +10 against r_mean ln 2 = 33)
+
+=== EI-onset   cycles of r_E [39, 39, 39]  amp ratio [1.0001, 0.9999, 1.0]  max|H_rev - H_fwd - sigma| 1.56e-13 nats/s
+  period (ms)  dt=0.2 50.0615  0.1 49.9949  0.05 49.9615   p = 1.000   (diffs +0.06667, +0.03333)
+  [E]
+    sigma (nats/s)  dt=0.2 4.28017  0.1 4.76678  0.05 5.03496   p = 0.860   (diffs -0.4866, -0.2682)
+    r_mean (Hz)     dt=0.2 21.8958  0.1 21.8548  0.05 21.8347   p = 1.029   (diffs +0.04104, +0.02011)
+    r_max (Hz)      dt=0.2 57.5966  0.1 62.2201  0.05 64.9523   p = 0.759   (diffs -4.623, -2.732)
+    H 0.2->0.1: dH_fwd +14.259  dH_rev +14.746  r_mean ln2 15.149  remainders fwd -0.88942  rev -0.40282
+    H 0.1->0.05: dH_fwd +14.638  dH_rev +14.907  r_mean ln2 15.135  remainders fwd -0.49633  rev -0.22814
+  [I]
+    sigma (nats/s)  dt=0.2 3.96305  0.1 4.381  0.05 4.60841   p = 0.878   (diffs -0.418, -0.2274)
+    r_mean (Hz)     dt=0.2 18.7296  0.1 18.7217  0.05 18.7186   p = 1.361   (diffs +0.007975, +0.003105)
+    r_max (Hz)      dt=0.2 40.5524  0.1 43.2398  0.05 44.8106   p = 0.775   (diffs -2.687, -1.571)
+    H 0.2->0.1: dH_fwd +12.664  dH_rev +13.082  r_mean ln2 12.977  remainders fwd -0.31292  rev +0.10504
+    H 0.1->0.05: dH_fwd +12.805  dH_rev +13.032  r_mean ln2 12.975  remainders fwd -0.16996  rev +0.05745
+  [tot]
+    sigma (nats/s)  dt=0.2 4.21675  0.1 4.68962  0.05 4.94965   p = 0.863   (diffs -0.4729, -0.26)
+    r_mean (Hz)     dt=0.2 21.2626  0.1 21.2282  0.05 21.2115   p = 1.043   (diffs +0.03442, +0.01671)
+    r_max (Hz)      dt=0.2 54.0993  0.1 58.3268  0.05 60.8233   p = 0.760   (diffs -4.228, -2.496)
+    H 0.2->0.1: dH_fwd +13.94  dH_rev +14.413  r_mean ln2 14.714  remainders fwd -0.77412  rev -0.30125
+    H 0.1->0.05: dH_fwd +14.272  dH_rev +14.532  r_mean ln2 14.703  remainders fwd -0.43105  rev -0.17102
+  verdict: resolved
+=== EI-cycle   cycles of r_E [39, 39, 39]  amp ratio [0.9992, 1.0001, 1.0]  max|H_rev - H_fwd - sigma| 2.56e-13 nats/s
+  period (ms)  dt=0.2 49.8308  0.1 49.7615  0.05 49.7244   p = 0.897   (diffs +0.06923, +0.03718)
+  [E]
+    sigma (nats/s)  dt=0.2 9.32309  0.1 10.2384  0.05 10.7745   p = 0.771   (diffs -0.9153, -0.5362)
+    r_mean (Hz)     dt=0.2 21.9988  0.1 21.9571  0.05 21.9385   p = 1.164   (diffs +0.04163, +0.01858)
+    r_max (Hz)      dt=0.2 86.9543  0.1 97.4358  0.05 104.324   p = 0.606   (diffs -10.48, -6.889)
+    H 0.2->0.1: dH_fwd +13.952  dH_rev +14.867  r_mean ln2 15.22  remainders fwd -1.2675  rev -0.35226
+    H 0.1->0.05: dH_fwd +14.481  dH_rev +15.017  r_mean ln2 15.207  remainders fwd -0.72572  rev -0.18954
+  [I]
+    sigma (nats/s)  dt=0.2 7.89058  0.1 8.57827  0.05 8.97535   p = 0.792   (diffs -0.6877, -0.3971)
+    r_mean (Hz)     dt=0.2 18.7385  0.1 18.7374  0.05 18.7394   p = nan sign change  (diffs +0.001095, -0.002016)
+    r_max (Hz)      dt=0.2 58.4429  0.1 64.3513  0.05 68.154   p = 0.636   (diffs -5.908, -3.803)
+    H 0.2->0.1: dH_fwd +12.561  dH_rev +13.249  r_mean ln2 12.988  remainders fwd -0.42626  rev +0.26143
+    H 0.1->0.05: dH_fwd +12.754  dH_rev +13.151  r_mean ln2 12.989  remainders fwd -0.23563  rev +0.16146
+  [tot]
+    sigma (nats/s)  dt=0.2 9.03659  0.1 9.90634  0.05 10.4147   p = 0.775   (diffs -0.8697, -0.5084)
+    r_mean (Hz)     dt=0.2 21.3467  0.1 21.3132  0.05 21.2987   p = 1.213   (diffs +0.03352, +0.01446)
+    r_max (Hz)      dt=0.2 80.9982  0.1 90.544  0.05 96.8048   p = 0.609   (diffs -9.546, -6.261)
+    H 0.2->0.1: dH_fwd +13.674  dH_rev +14.544  r_mean ln2 14.773  remainders fwd -1.0993  rev -0.22952
+    H 0.1->0.05: dH_fwd +14.135  dH_rev +14.644  r_mean ln2 14.763  remainders fwd -0.6277  rev -0.11934
+  verdict: resolved
+=== EI-burst   cycles of r_E [42, 42, 42]  amp ratio [1.0101, 0.9997, 1.005]  max|H_rev - H_fwd - sigma| 3.64e-12 nats/s
+  period (ms)  dt=0.2 46.9905  0.1 46.9714  0.05 46.9179   p = -1.492 out of range  (diffs +0.01905, +0.05357)
+  [E]
+    sigma (nats/s)  dt=0.2 46.4945  0.1 52.4229  0.05 57.1135   p = 0.338 out of range  (diffs -5.928, -4.691)
+    r_mean (Hz)     dt=0.2 23.3622  0.1 23.3078  0.05 23.3031   p = 3.548 out of range  (diffs +0.05442, +0.004654)
+    r_max (Hz)      dt=0.2 428.433  0.1 678.228  0.05 1021.47   p = -0.458 out of range  (diffs -249.8, -343.2)
+    H 0.2->0.1: dH_fwd +11.503  dH_rev +17.431  r_mean ln2 16.156  remainders fwd -4.6528  rev +1.2756
+    H 0.1->0.05: dH_fwd +12.517  dH_rev +17.208  r_mean ln2 16.152  remainders fwd -3.6351  rev +1.0555
+  [I]
+    sigma (nats/s)  dt=0.2 30.3719  0.1 33.9988  0.05 36.9178   p = 0.313 out of range  (diffs -3.627, -2.919)
+    r_mean (Hz)     dt=0.2 18.9885  0.1 18.9766  0.05 18.989   p = nan sign change  (diffs +0.01195, -0.01242)
+    r_max (Hz)      dt=0.2 336.823  0.1 508.008  0.05 711.711   p = -0.251 out of range  (diffs -171.2, -203.7)
+    H 0.2->0.1: dH_fwd +11.695  dH_rev +15.322  r_mean ln2 13.154  remainders fwd -1.4588  rev +2.1681
+    H 0.1->0.05: dH_fwd +12.145  dH_rev +15.064  r_mean ln2 13.162  remainders fwd -1.0174  rev +1.9016
+  [tot]
+    sigma (nats/s)  dt=0.2 43.27  0.1 48.7381  0.05 53.0744   p = 0.335 out of range  (diffs -5.468, -4.336)
+    r_mean (Hz)     dt=0.2 22.4875  0.1 22.4415  0.05 22.4403   p = 5.212 out of range  (diffs +0.04593, +0.001239)
+    r_max (Hz)      dt=0.2 390.566  0.1 615.402  0.05 922.529   p = -0.450 out of range  (diffs -224.8, -307.1)
+    H 0.2->0.1: dH_fwd +11.541  dH_rev +17.009  r_mean ln2 15.555  remainders fwd -4.014  rev +1.4541
+    H 0.1->0.05: dH_fwd +12.443  dH_rev +16.779  r_mean ln2 15.554  remainders fwd -3.1116  rev +1.2247
+  verdict: UNRESOLVED (period order out of range; E: dH_rev - r_mean ln 2 = +1.055 > 0.05 r_mean ln 2 (remainders +1.276, +1.055); I: dH_rev - r_mean ln 2 = +1.902 > 0.05 r_mean ln 2 (remainders +2.168, +1.902); tot: dH_rev - r_mean ln 2 = +1.225 > 0.05 r_mean ln 2 (remainders +1.454, +1.225))

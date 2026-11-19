@@ -7,6 +7,9 @@ import pytest
 import torch
 
 import rdme.analysis as an
+import rdme.fixed_points as fpts
+from conftest import SETTLED
+from rdme.mean_field import RDMWilsonCowan
 
 DT, T, PERIOD = 0.1, 3000.0, 25.0          # ms
 
@@ -87,3 +90,32 @@ def test_phase_profile_needs_a_cycle():
     r = torch.full((100,), 40.0, dtype=torch.float64)
     with pytest.raises(ValueError):
         an.phase_profile(r, r, 10)
+
+
+def test_leading_modes_match_the_dense_spectrum():
+    """ The matrix-free leading modes against the dense spectrum, on the E-I cell's fixed
+    point; and a warm start from the leading eigenvector converges in fewer matvecs. """
+    dt  = 0.2
+    net = RDMWilsonCowan(**SETTLED, dt=dt, hazard="poisson_exact")
+    m = net.fixed_points()[0]
+    x = net.flatten_state(*net.fp_state(m))
+    dense = fpts.jacobian_eigvals(net.state_map, x)
+    dense = dense[dense.abs().argsort(descending=True)][:2]
+    got = an.leading_modes(net.state_map, x, dt, k=2)
+    assert torch.allclose(got["mu"], dense.abs().log() / dt, rtol=0, atol=1e-7)
+    # a conjugate pair's order is arbitrary: compare |omega|
+    assert torch.allclose(got["omega"].abs().sort().values,
+                          (dense.angle() / dt).abs().sort().values, rtol=0, atol=1e-7)
+    warm = an.leading_modes(net.state_map, x, dt, k=2, v0=got["v"])
+    assert torch.allclose(warm["mu"], got["mu"], rtol=0, atol=1e-7)
+    assert warm["n_matvec"] < got["n_matvec"]
+
+
+def test_leading_growth_matches_the_leading_mode():
+    """ Power iteration's growth rate against ARPACK's leading mu, on the E-I cell's fixed
+    point. """
+    dt  = 0.2
+    net = RDMWilsonCowan(**SETTLED, dt=dt, hazard="poisson_exact")
+    x = net.flatten_state(*net.fp_state(net.fixed_points()[0]))
+    want = float(an.leading_modes(net.state_map, x, dt, k=2)["mu"][0])
+    assert an.leading_growth(net.state_map, x, dt, t_ms=1000.0) == pytest.approx(want, abs=1e-4)
