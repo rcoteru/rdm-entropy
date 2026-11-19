@@ -1,5 +1,5 @@
 """ rdme.stability: the matrix-free spectra against the dense oracle, the batched and chunked
-solvers against their one-shot forms, the fixed points a lattice alone misses, a landmark
+solvers against their one-shot forms, the fixed points a lattice alone misses, a bifurcation
 on a cut, and the attractor classes on signals with known answers. """
 
 import math
@@ -98,9 +98,8 @@ def test_a_hopf_on_the_fig5_cut():
                                    E_exc=24., E_inh=24., **FIG5, device=device)
     scan = stab.scan_cut(build, [840.0, 940.0], device="cpu", n_per_axis=6, t_ms=500.0)
     assert [len(s["m"]) for s in scan] == [1, 1]
-    lm = stab.find_landmarks(scan, build, tol=1.0)
-    assert len(lm) == 1 and lm[0]["kind"] == "crossing"
-    assert lm[0]["type"] == "Hopf (complex pair)" and lm[0]["side"] == "below"
+    lm = stab.find_bifurcations(scan, build, tol=1.0)
+    assert len(lm) == 1 and lm[0]["kind"] == "hopf" and lm[0]["side"] == "below"
     assert 860.0 < lm[0]["value"] < 912.0
     assert 15.0 < lm[0]["freq_hz"] < 25.0
     assert abs(lm[0]["mu"]) < 2e-3

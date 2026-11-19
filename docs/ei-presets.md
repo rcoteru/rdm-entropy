@@ -101,7 +101,7 @@ mean field must collapse onto one population with J = 960 − 1200 = −240 mV·
 1. **The originally specified family:** w(I→I) = 0, E_exc = E_inh = 24, w(E→I) from 0 to 3840.
    - There is no crossing. I, driven by E_inh alone (≈ 24.5 Hz), silences E (r_E ≈ 0.003 Hz),
      and that state is stable throughout.
-   - A saddle and an unstable focus exist only for w(E→I) < 10.1 and vanish in a fold.
+   - A saddle and an unstable focus exist only for w(E→I) < 10.1 and vanish in a saddle-node.
    - Same at E_inh = 22, 20 and 18.
 2. **E_inh lowered to 15** (w(I→I) = 0): one Hopf at J_H = 448.52 (20.01 Hz), unstable below.
    - Presets at 2·J_H, 0.9·J_H and 0.75·J_H all reached the **same large burst cycle**:
@@ -129,7 +129,7 @@ mean field must collapse onto one population with J = 960 − 1200 = −240 mV·
      Chosen, because it runs through the published point.
 3. **J_H by bisection on the leading growth rate**, then r_max, r̄ and the period at dt = 0.2 /
    0.1 / 0.05 for w(E→I) from 884 down to 770. The presets were picked from those.
-4. **Landmark scan** over the whole cut (`ei_landmarks.py`, w(E→I) from 0 to 3840, 81 points):
+4. **Bifurcation scan** over the whole cut (`ei_bifurcations.py`, w(E→I) from 0 to 3840, 81 points):
    - One fixed point everywhere.
    - One crossing: a Hopf at 885.970 (19.907 Hz), unstable below.
    - At w(E→I) = 0 the fixed point is an unstable focus (r_E = 112.0 Hz, μ = +0.271 /ms).
@@ -147,7 +147,7 @@ per question. The stationary closed forms and the overlap map F are in `rdme.equ
 | fixed points of a batch | `RDMNetwork.fp_sweep(chunk=...)`: Newton in chunks that halve on out-of-memory (`run_chunked`) | GPU |
 | leading modes: μ, frequency | `RDMNetwork.leading_modes(m)` / `stability.leading_modes`, ARPACK | CPU |
 | growth rate where ARPACK fails | `RDMNetwork.leading_growth(m)` / `stability.leading_growth`, power iteration, one system or a batch | GPU for batches |
-| landmarks along a cut | `scan_cut` (batched fixed points + growth rates) and `find_landmarks` (crossings bisected with ARPACK, folds on the count) | GPU, then CPU |
+| bifurcations along a cut | `scan_cut` (batched fixed points + growth rates) and `find_bifurcations` (Hopf, period-doubling and branch points bisected with ARPACK; saddle-nodes on the count) | GPU, then CPU |
 | branch diagram, M = 1 | `branch_scan` | CPU |
 | which attractor a run reaches | `classify_attractor`, `compare_starts` on batched runs | GPU (the runs) |
 | full spectrum | `jacobian_eigvals` / `RDMNetwork.fp_eigenvalues`: the dense oracle, for tests only | CPU |
@@ -160,7 +160,7 @@ per question. The stationary closed forms and the overlap map F are in `rdme.equ
 | batched JVP, 81 systems | 2.2 ms | 0.43 ms |
 | batched Newton, 81 × 36 starts | 78 s | ~1 s (27 × 36: 0.4 s, 0.66 GiB) |
 
-**Timings.** The whole landmark scan of the Fig. 5 cut (81 values, the bisection to 0.01) now
+**Timings.** The whole bifurcation scan of the Fig. 5 cut (81 values, the bisection to 0.01) now
 takes 49 s, against about 2 h with dense spectra.
 
 - **`leading_modes`** gives the leading eigenvalues of the linearized one-step map,
@@ -189,7 +189,7 @@ takes 49 s, against about 2 h with dense spectra.
 | script | what it does |
 |---|---|
 | `scripts/wc_mf_vs_sm.py` | one preset, mean field against spins: conventions table per population, rate and σ against time, the attractor in (r_E, r_I) with the fixed points, age distributions |
-| `scripts/ei_landmarks.py` | the landmarks along w(E→I), via `stability.scan_cut` and `find_landmarks` |
+| `scripts/ei_bifurcations.py` | the bifurcations along w(E→I), via `stability.scan_cut` and `find_bifurcations` |
 | `scripts/ei_sigma_order.py` | dt-order of the oscillating presets; tables and phase profiles in `scripts/figures/EI-sigma_order/` |
 | `scripts/ising_mf_vs_sm.py` | holds `I1-fig5-collapsed` for the collapse check |
 

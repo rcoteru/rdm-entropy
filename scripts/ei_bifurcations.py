@@ -1,11 +1,11 @@
-""" E-I landmarks along w(E→I): the fixed points, their leading growth rates and every change of
-stability on a grid of w(E→I), with no simulation of the model. Everything but w(E→I) is
+""" E-I bifurcations along w(E→I): the fixed points, their leading growth rates and every local
+bifurcation of them on a grid of w(E→I), with no simulation of the model. Everything but w(E→I) is
 Schwalger 2017 Fig. 5's.
 
 stability.scan_cut finds the fixed points (batched Newton on the GPU, plus the exact 1-D starts
-when w(I→I) = 0) and their growth rates (batched power iteration); stability.find_landmarks
-bisects every crossing with ARPACK (type, side, frequency) and every fold on the fixed-point
-count. With w(I→I) != 0 a fixed point no Newton start reaches is not reported. """
+when w(I→I) = 0) and their growth rates (batched power iteration); stability.find_bifurcations
+bisects every crossing of the unit circle with ARPACK (Hopf, period-doubling or branch point;
+side, frequency) and every saddle-node on the fixed-point count. With w(I→I) != 0 a fixed point no Newton start reaches is not reported. """
 
 import torch
 
@@ -33,7 +33,7 @@ R_CAP   = 0.5               # the scan ends where a stable rate reaches r t_abs 
 
 hazard, nu0, t_abs = "poisson_exact", 0.01, 4.0
 dt      = 0.1               # ms
-TOL     = 0.01              # mV ms, the landmarks' bisection
+TOL     = 0.01              # mV ms, the bisection of each bifurcation
 PI_T    = 1000.0            # ms of power iteration per growth rate, after as long a burn-in
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"   # the batched scan's
 
@@ -59,13 +59,13 @@ for s in scan:
 
 counts = [len(s["m"]) for s in scan]
 print(f"\nfixed-point counts over the scan: {sorted(set(counts))}")
-print(f"\nlandmarks (bisected to {TOL:g} mV ms):")
-for lm in stab.find_landmarks(scan, build, tol=TOL):
-    if lm["kind"] == "fold":
-        print(f"  w(E→I) = {lm['value']:.3f} in [{lm['lo']:g}, {lm['hi']:g}]: fold, "
+print(f"\nbifurcations (bisected to {TOL:g} mV ms):")
+for lm in stab.find_bifurcations(scan, build, tol=TOL):
+    if lm["kind"] == "saddle-node":
+        print(f"  w(E→I) = {lm['value']:.3f} in [{lm['lo']:g}, {lm['hi']:g}]: saddle-node, "
               f"{lm['counts'][0]} -> {lm['counts'][1]} fixed points")
     else:
-        print(f"  w(E→I) = {lm['value']:.3f} in [{lm['lo']:g}, {lm['hi']:g}]: {lm['type']}, "
+        print(f"  w(E→I) = {lm['value']:.3f} in [{lm['lo']:g}, {lm['hi']:g}]: {lm['kind']}, "
               f"unstable {lm['side']}; mu {lm['mu']:+.2e} /ms, {lm['freq_hz']:.3f} Hz "
               f"(period {1e3 / max(lm['freq_hz'], 1e-12):.3f} ms); r_E {float(lm['r'][0]):.3f} "
               f"r_I {float(lm['r'][1]):.3f} Hz")

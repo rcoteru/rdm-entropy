@@ -1,5 +1,5 @@
-""" Stability of the mean field: its fixed points, their linear stability, the landmarks along a
-1-D cut of parameter space, and the attractor a run reaches.
+""" Stability of the mean field: its fixed points, their linear stability, their bifurcations
+along a 1-D cut of parameter space, and the attractor a run reaches.
 
 Each section answers one question:
 
@@ -10,11 +10,15 @@ Each section answers one question:
                           frequencies; leading_growth (power iteration) for the growth rate where
                           the leading modes are too degenerate for ARPACK; jacobian_eigvals (dense)
                           as the oracle the other two are tested against.
-  Landmarks along a cut   where along a 1-D cut does stability change, and how? scan_cut for
-                          the fixed points and growth rates on a grid, find_landmarks for the
-                          crossings (bisected with ARPACK) and folds (bisected on the count).
+  Bifurcations on a cut   where along a 1-D cut do the fixed points change, and how? scan_cut
+                          for the fixed points and growth rates on a grid, find_bifurcations
+                          for the saddle-nodes (bisected on the count) and the crossings of the
+                          unit circle -- Hopf, period-doubling, branch point -- (bisected with
+                          ARPACK).
   Attractors              what does a run actually reach? classify_attractor and
-                          compare_starts, on trajectories from batched runs.
+                          compare_starts, on trajectories from batched runs. Not a bifurcation
+                          question: a cycle growing into bursts, or one coexisting with a
+                          stable fixed point, is invisible to the fixed points.
 
 Devices (measured 2026-11-19, E-I state D = 8924, RTX 4070 SUPER): batched work belongs on the
 GPU, single systems on the CPU.
@@ -435,8 +439,8 @@ def leading_growth(state_map: Callable[[torch.Tensor], torch.Tensor], x: torch.T
     return ((tt * (logn - logn.mean(0))).sum(0) / (tt * tt).sum(0)).cpu()
 
 
-# Landmarks along a cut
-# ~~~~~~~~~~~~~~~~~~~~~
+# Bifurcations along a cut
+# ~~~~~~~~~~~~~~~~~~~~~~~~
 #
 # A cut is a 1-D family of systems, built by `build(values, device)`: a batched RDMNetwork, one
 # system per value, for scan_cut on the GPU; and one system per value on the CPU for the
@@ -543,25 +547,40 @@ def _mode_at(build, value: float, m_near: torch.Tensor) -> dict:
                 omega=float(o["omega"][0]), dt=sys.dt)
 
 
-def _kind(omega: float, dt: float) -> str:
+def _crossing_kind(omega: float, dt: float) -> str:
+    """ The bifurcation a fixed point's critical eigenvalue lambda = exp((mu + i omega) dt)
+    marks as it crosses the unit circle with the fixed-point count unchanged. """
     if abs(omega) * dt < 1e-9:
-        return "fold (real +1)"
+        return "branch-point"         # real +1, no count change: transcritical or pitchfork
     if abs(abs(omega) * dt - math.pi) < 1e-9:
-        return "flip (real -1)"
-    return "Hopf (complex pair)"
+        return "period-doubling"      # real -1
+    return "hopf"                     # complex pair
 
 
-def find_landmarks(scan: list[dict], build, tol: float = 0.01) -> list[dict]:
-    """ The landmarks of a scan_cut result, each bisected to `tol` in the cut's value:
+BIFURCATIONS = ("saddle-node", "hopf", "period-doubling", "branch-point")
 
-      fold      the fixed-point count changes; bisected on the count.
-      crossing  a root's growth rate changes sign between neighbours with equal counts (the
-                root followed by nearest neighbour); bisected with ARPACK on single CPU systems,
-                where the critical mode is isolated, which also gives its type and frequency.
 
-    Each landmark is a dict with "kind", "value", the bracket "lo"/"hi" from the scan, and for
-    a crossing "type", "side" (where it is unstable: "above"/"below"), "freq_hz", "r" (Hz) and
-    "mu" at the bisected value. """
+def find_bifurcations(scan: list[dict], build, tol: float = 0.01) -> list[dict]:
+    """ The local bifurcations of the fixed points along a scan_cut result, each bisected to
+    `tol` in the cut's value. One of BIFURCATIONS:
+
+      saddle-node      the fixed-point count changes between neighbours (two fixed points
+                       merge and vanish); bisected on the count. Its real +1 eigenvalue is not
+                       reported again as a crossing.
+      hopf             a complex pair crosses the unit circle: a cycle is born or dies.
+      period-doubling  a real eigenvalue crosses -1.
+      branch-point     a real eigenvalue crosses +1 with the count unchanged (transcritical,
+                       or a pitchfork the grid did not resolve).
+
+    The last three are crossings: a fixed point's growth rate changes sign between neighbours
+    with equal counts (the fixed point followed by nearest neighbour), bisected with ARPACK on
+    single CPU systems, where the critical mode is isolated; the critical eigenvalue gives the
+    kind and the frequency.
+
+    Each is a dict with "kind", "value", and the bracket "lo"/"hi" from the scan; a saddle-node
+    adds "counts" (before, after); a crossing adds "side" (where the fixed point is unstable,
+    "above"/"below" the value), "freq_hz", and "r" (Hz) and "mu" (1/ms) at the bisected
+    value. """
     out = []
     for a, b in zip(scan[:-1], scan[1:]):
         if len(a["m"]) != len(b["m"]):
@@ -570,8 +589,8 @@ def find_landmarks(scan: list[dict], build, tol: float = 0.01) -> list[dict]:
                 mid = 0.5 * (lo + hi)
                 n = len(_fixed_points_at(build, mid))
                 lo, hi = (mid, hi) if n == len(a["m"]) else (lo, mid)
-            out.append(dict(kind="fold", value=0.5 * (lo + hi), lo=a["value"], hi=b["value"],
-                            counts=(len(a["m"]), len(b["m"]))))
+            out.append(dict(kind="saddle-node", value=0.5 * (lo + hi), lo=a["value"],
+                            hi=b["value"], counts=(len(a["m"]), len(b["m"]))))
             continue
         for i, m in enumerate(a["m"]):
             j = int(((b["m"] - m).norm(dim=-1)).argmin())
@@ -585,8 +604,9 @@ def find_landmarks(scan: list[dict], build, tol: float = 0.01) -> list[dict]:
                 else:
                     fhi = f
             crit = flo if abs(flo["mu"]) < abs(fhi["mu"]) else fhi
-            out.append(dict(kind="crossing", value=0.5 * (flo["value"] + fhi["value"]),
-                            lo=a["value"], hi=b["value"], type=_kind(crit["omega"], crit["dt"]),
+            out.append(dict(kind=_crossing_kind(crit["omega"], crit["dt"]),
+                            value=0.5 * (flo["value"] + fhi["value"]),
+                            lo=a["value"], hi=b["value"],
                             side="above" if fhi["mu"] > 0 else "below",
                             freq_hz=abs(crit["omega"]) / (2 * math.pi) * 1e3,
                             r=crit["r"], mu=crit["mu"]))

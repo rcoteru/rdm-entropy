@@ -25,7 +25,7 @@ POINTS = {
     # w(I→I) = -1200 and E_exc = E_inh = 24 mV all as published; only w(E→I) moves. On this
     # cut the mean field has one Hopf, at J_H = 885.98 (19.91 Hz; r_E 21.75 / r_I 18.69 Hz),
     # unstable BELOW J_H, and the cycle grows continuously from it, with the silent start and
-    # a start at the fixed point agreeing everywhere (no bistability; ei_landmarks.py and a
+    # a start at the fixed point agreeing everywhere (no bistability; ei_bifurcations.py and a
     # mean-field attractor map, 2026-11-19). The onset regime is narrow -- r_E max passes the
     # 1/t_abs = 250 Hz ceiling near 0.94 J_H -- so the presets are placed by behaviour, not
     # by fixed fractions of J_H. r_max is dt-resolved down to ~0.97 J_H (dt = 0.2/0.1/0.05).
