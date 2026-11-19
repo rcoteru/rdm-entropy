@@ -61,7 +61,7 @@ def test_fp_sweep_in_chunks_is_the_one_shot_sweep():
     W = torch.tensor([0.0, 400.0, 900.0])
     mf = RDMWilsonCowanBatch(0.8, w_EE=960., w_EI=W, w_IE=-1200., w_II=-1200., E_exc=24.,
                              E_inh=24., **FIG5)
-    r1, ok1 = mf.fp_sweep(n_per_axis=4)
+    r1, ok1 = mf.fp_sweep(n_per_axis=4, chunk=None)
     r2, ok2 = mf.fp_sweep(n_per_axis=4, chunk=5)
     assert torch.equal(ok1, ok2)
     assert torch.allclose(r1[ok1], r2[ok2], rtol=0, atol=1e-12)

@@ -455,15 +455,16 @@ class RDMNetwork:
                  n_per_axis: int = 5,
                  tol: float = 1e-10,
                  res_tol: float | None = None,
-                 chunk: int | None = None,
+                 chunk: int | None = stab.NEWTON_CHUNK,
                  **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         """ Newton from K starting points, for every system at once.
 
         Every (system, starting point) pair is one Newton trajectory and they all run
         simultaneously, so a phase map costs a single vmapped solve -- on the model's device,
         which for a batch should be the GPU (81 x 36 trajectories: 78 s on the CPU, ~1 s on the
-        GPU). Its memory grows with the number of trajectories, so they run in chunks of `chunk`
-        rows (default: all), halved on out-of-memory (stability.run_chunked). Returns (roots,
+        GPU). They run in chunks of `chunk` rows (None: all at once), halved on out-of-memory
+        (stability.run_chunked); a chunk iterates until its slowest row converges, so smaller
+        chunks are faster down to ~128 rows (stability.NEWTON_CHUNK). Returns (roots,
         converged), shaped (*b, K, M) and (*b, K); the rows `converged` marks False hold junk.
 
         Deliberately *not* deduplicated: collapsing K guesses into a variable number of

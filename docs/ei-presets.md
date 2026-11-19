@@ -144,7 +144,7 @@ per question. The stationary closed forms and the overlap map F are in `rdme.equ
 | question | tool | device |
 |---|---|---|
 | fixed points of one system | `RDMNetwork.fixed_points()`: Newton from a lattice over the physical box [0, dt/t_abs]^M, plus the exact 1-D starts (`reduced_guesses`) for M = 2 with w(I→I) = 0; bracketing for M = 1 | CPU |
-| fixed points of a batch | `RDMNetwork.fp_sweep(chunk=...)`: Newton in chunks that halve on out-of-memory (`run_chunked`) | GPU |
+| fixed points of a batch | `RDMNetwork.fp_sweep(chunk=...)`: Newton in chunks of 256 rows (`NEWTON_CHUNK`; one chunk of all rows is ~7× slower, since every row waits for the slowest), halved on out-of-memory (`run_chunked`) | GPU |
 | leading modes: μ, frequency | `RDMNetwork.leading_modes(m)` / `stability.leading_modes`, ARPACK | CPU |
 | growth rate where ARPACK fails | `RDMNetwork.leading_growth(m)` / `stability.leading_growth`, power iteration, one system or a batch | GPU for batches |
 | bifurcations along a cut | `scan_cut` (batched fixed points + growth rates) and `find_bifurcations` (Hopf, period-doubling and branch points bisected with ARPACK; saddle-nodes on the count) | GPU, then CPU |

@@ -1,4 +1,4 @@
-""" Small utilities for the scripts -- run durations, cache naming, device memory --
+""" Small utilities for the scripts -- run durations, cache naming --
 rather than for the model. The file exists so that an array utility or a path rule does not
 have to live in a physics module to be shared between scripts. """
 
@@ -90,19 +90,3 @@ def save_atomic(obj, path: str | Path) -> None:
     tmp = path.with_suffix(".tmp")
     torch.save(obj, tmp)
     tmp.replace(path)
-
-
-# Device memory
-# ~~~~~~~~~~~~~
-
-def device_budget(device: str | torch.device, fraction: float = 0.8) -> int:
-    """ Bytes a run may use on `device`: a fraction of what is actually free right now.
-
-    Read rather than declared, so the same script runs on a different card without a constant
-    to edit, and so a budget set while something else holds half the card does not OOM. """
-    if torch.device(device).type == "cuda":
-        free, _ = torch.cuda.mem_get_info(device)
-        return int(fraction * free)
-    with open("/proc/meminfo") as f:                      # MemAvailable, in kB
-        avail = next(int(l.split()[1]) for l in f if l.startswith("MemAvailable"))
-    return int(fraction * avail * 1024)

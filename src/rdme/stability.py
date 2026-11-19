@@ -23,8 +23,8 @@ Each section answers one question:
 Devices (measured 2026-11-19, E-I state D = 8924, RTX 4070 SUPER): batched work belongs on the
 GPU, single systems on the CPU.
   - Newton over a batch: 81 systems x 36 starts took 78 s on the CPU; 27 x 36 took 0.4 s on the
-    GPU. Its memory grows with the number of Newton trajectories (~0.7 MB each at Q ~ 2100),
-    so fp_sweep runs it in chunks that halve on out-of-memory (run_chunked).
+    GPU. A chunk iterates until its slowest row converges, so the rows run in chunks of
+    NEWTON_CHUNK, which halve on out-of-memory (run_chunked).
   - Power iteration over a batch: 0.43 ms per step for 81 systems on the GPU, 2.2 ms on the CPU.
   - ARPACK is sequential in single-system JVPs, 0.22 ms on the CPU against 0.44 ms on the GPU.
 Every function runs on the device of the tensors (or the model) it is given; the scan helpers
@@ -44,6 +44,14 @@ import rdme.helpers as hlp
 
 # Memory
 # ~~~~~~
+#
+# Batched Newton is chunked for SPEED first: a chunk iterates until its slowest row converges, so
+# one big chunk makes every row pay for the worst one. Fig. 5 cut, 81 systems x 144 starts =
+# 11664 rows, Q = 2231, RTX 4070 SUPER (2026-11-19): all at once 17.8 s and 7.8 GiB; chunks of
+# 512 / 256 / 128 / 64 / 32 rows 3.9 / 2.6 / 3.5 / 6.0 / 11.3 s, at 0.8 / 0.6 / 0.5 GiB. Below
+# ~128 the per-call overhead wins. Out-of-memory is then the rare case, and halving handles it.
+
+NEWTON_CHUNK = 256
 
 def run_chunked(fn: Callable[[slice], torch.Tensor], n: int,
                 chunk: int | None = None) -> tuple[torch.Tensor, int]:
@@ -444,11 +452,11 @@ def leading_growth(state_map: Callable[[torch.Tensor], torch.Tensor], x: torch.T
 def scan_cut(build: Callable[[torch.Tensor, str], object], values: Sequence[float],
              device: str = "cuda" if torch.cuda.is_available() else "cpu",
              n_per_axis: int = 12, t_ms: float = 1000.0,
-             chunk: int | None = None) -> list[dict]:
+             chunk: int | None = NEWTON_CHUNK) -> list[dict]:
     """ Every fixed point and its leading growth rate at each value of a cut, as a list of
     {"value", "m" (R, M), "r" (R, M) Hz, "mu" (R,)}, roots sorted by the first population.
 
-    The fixed points come from a batched Newton (fp_sweep, chunked against out-of-memory) from
+    The fixed points come from a batched Newton (fp_sweep, in chunks of `chunk` rows) from
     a lattice over the physical box, plus the reduced starts of an M = 2, w(I→I) = 0 system;
     the growth rates from a batched leading_growth, one round per root index. """
     vals = torch.as_tensor(values, dtype=torch.float64)
