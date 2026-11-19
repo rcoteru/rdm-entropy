@@ -1,11 +1,11 @@
-""" Mean field vs spin network for one single-population (Ising) system: equilibration,
-age distribution, return map, entropy trajectories and the fixed-point objective G(m). """
+""" Mean field vs spin network for one single-population (Ising) system: the conventions table
+and the fixed points, then rate and entropy production folded over the cycle, the last stretch
+of both, sigma against r, and the age distribution (plots.mf_vs_sm). """
 
 import math
 import time
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import torch
 
 import rdme.analysis as an
@@ -131,8 +131,6 @@ if run_sim and (overwrite or not CACHE.exists()):
     t2 = time.time()
     print(f"Mean field: {t1 - t0:.2f}s. Spin model: {t2 - t1:.2f}s.")
 
-    # G(m) = m - F(m): every zero is a stationary state of the mean field
-    m_grid = torch.linspace(0, 1, 2001, device=DEVICE, dtype=torch.float64).unsqueeze(-1)  # (K, 1)
     out = {
         "params": PARAMS, "ic": IC, "t_equi": T_EQUI, "t_meas": T_MEAS,
         "steps": STEPS, "N": N, "Q": mf.Q,
@@ -141,8 +139,6 @@ if run_sim and (overwrite or not CACHE.exists()):
         "p_mf": mf.p[0].cpu(),               # age distributions, on the mean field's grid
         "phi_mf": mf.firing_prob()[0].cpu(), # final hazard, for the stationary ISI density
         "p_sm": sm.fdist(mf.Q)[0].cpu(),
-        "m_grid": m_grid.squeeze(-1).cpu(),
-        "G": mf.fp_residual(m_grid).squeeze(-1).cpu(),
         "roots": roots.cpu(),
         # largest eigenvalue modulus of the one-step map, from its leading growth rate
         "rho": torch.tensor([math.exp(float(mf.leading_modes(r, k=2)["mu"][0]) * dt)
@@ -162,42 +158,11 @@ if run_plot:
     print(f"Plotting {CACHE.name}.")
     d = torch.load(CACHE, weights_only=False)
 
-    mf_traj1, mf_traj2 = d["mf_traj1"], d["mf_traj2"]
-    sm_traj1, sm_traj2 = d["sm_traj1"], d["sm_traj2"]
-
-    if True:  # final age distribution, on the physical age axis
-        rp.curves({'Spin Model': d["p_sm"], 'Mean Field': d["p_mf"]},
-                  x=torch.arange(len(d["p_mf"]), dtype=torch.float64) * dt,
-                  title="Firing age distribution (mean-field vs spin model)",
-                  xlabel='age u (ms)', ylabel='p(u)')
-
-    if True:  # equilibration trajectories
-        rp.curves({'Spin Model': sm_traj1["m_tot"], 'Mean Field': mf_traj1["m"]},
-                  dt=dt, title=f'Equilibration trajectories\n{TITLE}')
-
-    if True:  # return map (m_t vs m_{t+1}) of the non-transient trajectories
-        rp.return_maps({'Spin Model': sm_traj2["m_tot"], 'Mean Field': mf_traj2["m_tot"]},
-                       suptitle='Return Map - Non-transient Trajectories')
-
-    if True:  # entropy trajectories
-        rp.panels({'Spin Model': sm_traj2, 'Mean Field': mf_traj2},
-                  ["m_tot", "sigma_tot", "H_fwd_tot", "H_rev_tot"], dt=dt,
-                  suptitle='Entropy trajectories')
+    mf_traj2, sm_traj2 = d["mf_traj2"], d["sm_traj2"]
 
     if True:  # standard outputs: rate and EPR in physical units
         out = {"Spin Model": an.rate_and_epr(sm_traj2, dt, POINT["t_abs"]),
                "Mean Field": an.rate_and_epr(mf_traj2, dt, POINT["t_abs"], cycles=True)}
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(12, 6))
-        fig.suptitle(TITLE, fontsize=9)
-        rp.curves({k: o["r"] for k, o in out.items()}, dt=dt, ax=ax1, ylabel='r (Hz)',
-                  title='Firing rate')
-        rp.curves({k: o["sigma"] for k, o in out.items()}, dt=dt, ax=ax2,
-                  ylabel='σ (nats / neuron / s)', title='Entropy production (spin model: '
-                  'sampled per step, unsmoothed)')
-        for ax in (ax1, ax2):
-            ax.grid()
-        fig.tight_layout()
 
         # ISI CV: the mean field's from the stationary ISI density of its final hazard, only
         # when settled (on a cycle or while ringing that hazard is not an ISI distribution);
@@ -222,38 +187,17 @@ if run_plot:
                   f"{o['sigma_mean']:12.6g} {o['sigma_per_spike']:17.6g} {o['dead_frac']:8.4f} "
                   f"{'n/a' if cv[k] is None else f'{cv[k]:.4f}':>7} {cycles_col(o):>7}")
 
-    if True:  # fixed-point objective G(m) = m - F(m)
-        m_grid, G, roots, rho = d["m_grid"], d["G"], d["roots"], d["rho"]
-        m_traj = mf_traj2["m"][:, 0]
+        print("\nmean-field fixed points:")
+        for r, rh in zip(d["roots"], d["rho"]):
+            print(f"  r {float(r[0]) / dt * 1e3:9.4f} Hz   |λ| {float(rh):.6f}  "
+                  f"({'stable' if rh < 1 else 'unstable'})")
 
-        # the roots sit at a few percent activity: the second panel zooms onto them
-        hi   = max(roots.max().item(), m_traj.max().item()) * 1.4
-        zoom = (max(0.0, min(roots.min().item(), m_traj.min().item()) - 0.1 * hi), hi)
-
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        fig.suptitle('Fixed-point objective  G(m) = m - F(m)')
-
-        for ax, xlim, title in ((ax1, (0.0, 1.0), 'Full range'), (ax2, zoom, 'Around the roots')):
-            rp.curves({'G(m)': G}, x=m_grid, ax=ax, title=title, xlabel='m', ylabel='G(m)',
-                      color='C0')
-            ax.axhline(0, color='k', linewidth=0.8, linestyle='--')
-            ax.axvspan(m_traj.min(), m_traj.max(), color='C1', alpha=0.15,
-                       label='range visited by the mean field')
-            for r, rh in zip(roots, rho):
-                stable = rh < 1.0
-                ax.plot(r.item(), 0.0, marker='o', markersize=8, zorder=3,
-                        color='C0' if stable else 'C3',
-                        markerfacecolor='C0' if stable else 'none',
-                        label=f"m*={r.item():.5f}  |λ|={rh:.4f}  "
-                              f"({'stable' if stable else 'unstable'})")
-            ax.set_xlim(*xlim)
-            ax.legend(fontsize=8)
-
-        inside = (m_grid >= zoom[0]) & (m_grid <= zoom[1])
-        if not inside.any():
-            inside[((m_grid - sum(zoom) / 2).abs()).argmin()] = True
-        pad = 0.1 * (G[inside].max() - G[inside].min()).abs().clamp(min=1e-12)
-        ax2.set_ylim(G[inside].min() - pad, G[inside].max() + pad)
-        fig.tight_layout()
+    if True:  # cycle, last stretch, sigma against r, age distribution
+        hz = lambda x: x.double() / dt * 1e3
+        rp.mf_vs_sm(hz(mf_traj2["m"]), hz(mf_traj2["sigma"]),
+                    hz(sm_traj2["m"]), hz(sm_traj2["sigma"]),
+                    d["p_mf"][None], d["p_sm"][None], dt, pops=("E",),
+                    fixed_points=[(hz(r), bool(rh < 1)) for r, rh in zip(d["roots"], d["rho"])],
+                    title=TITLE)
 
     rp.show()

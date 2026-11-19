@@ -101,3 +101,21 @@ def test_observed_order_and_richardson():
                                                                        "out of range")
     with pytest.warns(RuntimeWarning, match="refused"):
         assert math.isnan(an.richardson([1.4, 1.2, 1.3])[0])
+
+
+def test_running_mean_is_centred_and_keeps_the_length():
+    x = torch.arange(10, dtype=torch.float64)
+    y = an.running_mean(x, 3)
+    assert len(y) == 10 and torch.allclose(y[1:-1], x[1:-1])
+    assert y[0] == 0.5 and y[-1] == 8.5            # truncated windows at the ends
+
+
+def test_noisy_cycles_counts_the_cycles_not_the_noise():
+    """ A 25 ms sine under noise that crosses the mean many times per cycle: the period hint
+    gives the right count where the raw signal does not. """
+    g = torch.Generator().manual_seed(0)
+    r = 20.0 + 10.0 * torch.sin(2 * math.pi * torch.arange(30000) * DT / PERIOD)
+    r = r + 2.0 * torch.randn(30000, generator=g, dtype=torch.float64)
+    assert an.cycle_window(r)[2] > 1000                # 120 periods in the window
+    _, per, n = an.noisy_cycles(r, DT, PERIOD)
+    assert n == 118 and per == pytest.approx(PERIOD, rel=1e-2)

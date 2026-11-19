@@ -81,6 +81,30 @@ def phase_profile(x: torch.Tensor, r: torch.Tensor, n_bins: int) -> torch.Tensor
     return s / c
 
 
+def running_mean(x: torch.Tensor, n: int) -> torch.Tensor:
+    """ Centred running mean of `x` over n samples along its first axis, the same length as
+    x; at the ends the window is truncated and the mean taken over what it holds. """
+    x = x.double()
+    c = torch.cat([torch.zeros_like(x[:1]), x.cumsum(0)])
+    i = torch.arange(len(x))
+    lo, hi = (i - n // 2).clamp(min=0), (i - n // 2 + n).clamp(max=len(x))
+    w = (hi - lo).double().view((-1,) + (1,) * (x.dim() - 1))
+    return (c[hi] - c[lo]) / w
+
+
+def noisy_cycles(r: torch.Tensor, dt: float, period_ms: float,
+                 rel_tol: float = 0.05) -> tuple[torch.Tensor, float, int]:
+    """ (phase reference, period in ms, n_cycles) of a noisy rate r whose period is about
+    period_ms (the mean field's): r smoothed over an eighth of that period, and the cycles
+    cycle_window finds in it. Unsmoothed, or smoothed over a few ms, a finite-N rate crosses
+    its mean several times per cycle (on E1 a 4 ms window counts 30 cycles where there are
+    28). The period is taken from the hint, not from r's Fourier peak: on a burst the second
+    harmonic is the larger peak (EI-burst: 23.5 ms against a 47 ms cycle). """
+    ref = running_mean(r, max(1, round(period_ms / 8 / dt)))
+    a, b, n = cycle_window(ref, rel_tol)
+    return ref, ((b - a) * dt / n if n else float("nan")), n
+
+
 # Standard outputs
 # ~~~~~~~~~~~~~~~~
 

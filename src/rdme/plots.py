@@ -22,6 +22,8 @@ import torch
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
+import rdme.analysis as an
+
 # Axis labels for the keys the trajectory dicts carry, so the quantity's units are written
 # down once rather than in every script. Unknown keys fall back to the key itself.
 LABELS = {
@@ -247,6 +249,163 @@ def return_maps(ms: Mapping[str, object], **kw) -> tuple[Figure, np.ndarray]:
     kw.setdefault("ylabel", r'$m_{t+1}$')
     pairs = {label: (_np(m)[:-1], _np(m)[1:]) for label, m in ms.items()}
     return scatter_grid(pairs, **kw)
+
+
+# Mean field against spins
+# ~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# The figure set of the *_mf_vs_sm scripts, one code path for any number of populations. The
+# spin traces are per-step samples whose noise is larger than the signal in sigma, so every
+# figure either averages them (over cycles, or a short running mean) or shows them faint
+# behind the average. The spins' cycle phase comes from analysis.noisy_cycles.
+
+MF_VS_SM_COLORS = {"Spin Model": "C0", "Mean Field": "C1"}
+
+
+def _level_edges(x: np.ndarray, n: int = 80) -> np.ndarray | int:
+    """ About n histogram bins whose edges sit between the levels of a quantized sample (spin
+    counts are integers, so their running means take discrete values), each bin holding the
+    same number of levels; n plain bins when x is not quantized. """
+    lv = np.unique(np.round(x, 6))
+    if len(lv) < 2 or len(lv) > 20 * n:
+        return n
+    q = np.median(np.diff(lv))
+    w = q * max(1, int(np.ceil((lv[-1] - lv[0]) / q / n)))
+    return np.arange(lv[0] - q / 2, lv[-1] + w, w)
+
+
+def mf_vs_sm(r_mf: torch.Tensor, s_mf: torch.Tensor,    # (T, M) Hz and nats / neuron / s
+             r_sm: torch.Tensor, s_sm: torch.Tensor,    # (T, M) the same, spins
+             p_mf: torch.Tensor, p_sm: torch.Tensor,    # (M, Q) final age distributions
+             dt: float,
+             *,
+             pops: Sequence[str],
+             fixed_points: Sequence[tuple[torch.Tensor, bool]] = (),  # ((M,) Hz, stable)
+             title: str = "",
+             n_bins: int | None = None, # phase bins of the folded cycle; default one per step
+             last_ms: float = 200.0,    # window of the trace figure
+             smooth_ms: float = 1.0,    # running mean drawn over the raw spin traces
+             amp_tol: float = 0.05,     # mean-field peak-to-peak / mean below this: settled
+             ) -> dict[str, Figure]:
+    """ Four figures, keyed "cycle", "trace", "plane", "age":
+
+      cycle  rate and sigma per population over one period, each model folded on its own
+             cycle (phase 0 = upward crossing of the mean of population 0's rate). When the
+             mean field has settled there is no cycle, and the figure is instead histograms
+             of the spins' smoothed r and sigma with the mean field's value marked.
+      trace  the last `last_ms` of r and sigma, the spins raw (faint) and smoothed.
+      plane  sigma against r per population: the folded cycles as loops (or the mean field's
+             point), the smoothed spin samples behind them, the fixed points at sigma = 0.
+      age    the final age distributions. """
+    M, C = r_mf.shape[1], MF_VS_SM_COLORS
+    n_smooth = max(1, round(smooth_ms / dt))
+    r_sm_s, s_sm_s = an.running_mean(r_sm, n_smooth), an.running_mean(s_sm, n_smooth)
+    n_mf = an.cycle_window(r_mf[:, 0], rel_tol=amp_tol)[2]
+    figs = {}
+
+    def grid(name, kind, nrows, height, **kw):
+        fig, axs = plt.subplots(nrows, M, squeeze=False, figsize=(max(9.0, 6.0 * M), height),
+                                **kw)
+        fig.suptitle(f"{kind}\n{title}", fontsize=8)
+        figs[name] = fig
+        return axs
+
+    # cycle
+    folded = None
+    if n_mf >= 2:
+        axs = grid("cycle", "Folded cycle", 2, 6.5, sharex=True)
+        a, b, _ = an.cycle_window(r_mf[:, 0], rel_tol=amp_tol)
+        P = (b - a) * dt / n_mf
+        ref_sm, P_sm, n_sm = an.noisy_cycles(r_sm[:, 0], dt, P, rel_tol=amp_tol)
+        lab = {"Mean Field": f"Mean Field ({n_mf} cycles, {P:.2f} ms)",
+               "Spin Model": f"Spin Model ({n_sm} cycles, {P_sm:.2f} ms)"}
+        ref = {"Mean Field": r_mf[:, 0], "Spin Model": ref_sm}
+        data = {"Mean Field": (r_mf, s_mf), "Spin Model": (r_sm, s_sm)}
+        nb = n_bins or round((b - a) / n_mf)
+        folded = {k: [(an.phase_profile(r[:, j], ref[k], nb).numpy(),
+                       an.phase_profile(s[:, j], ref[k], nb).numpy()) for j in range(M)]
+                  for k, (r, s) in data.items()}
+        ph = (np.arange(nb) + 0.5) / nb
+        for j, p in enumerate(pops):
+            for k in ("Spin Model", "Mean Field"):
+                axs[0, j].plot(ph, folded[k][j][0], color=C[k], lw=2, label=lab[k])
+                axs[1, j].plot(ph, folded[k][j][1], color=C[k], lw=2, label=lab[k])
+            axs[0, j].set_title(f"Firing rate {p}, folded over the cycle")
+            axs[1, j].set_title(f"Entropy production {p}, folded over the cycle")
+            axs[1, j].set_xlabel(f"phase (0 = upward crossing of mean r_{pops[0]})")
+    else:
+        axs = grid("cycle", "Distributions (the mean field has settled)", 2, 6.5)
+        for j, p in enumerate(pops):
+            for i, (x_sm, x_mf, what) in enumerate(((r_sm_s, r_mf, "r (Hz)"),
+                                                    (s_sm_s, s_mf, "σ (nats / neuron / s)"))):
+                ax = axs[i, j]
+                ax.hist(_np(x_sm[:, j]), bins=_level_edges(_np(x_sm[:, j])), density=True,
+                        color=C["Spin Model"],
+                        alpha=0.6, label=f"Spin Model, {smooth_ms:g} ms mean")
+                ax.axvline(float(x_sm[:, j].mean()), color=C["Spin Model"], ls="--",
+                           label="Spin Model, mean")
+                ax.axvline(float(x_mf[:, j].mean()), color=C["Mean Field"], lw=2,
+                           label="Mean Field")
+                ax.set_xlabel(what)
+                ax.set_title(f"{what.split(' ')[0]} {p}")
+    for ax, y in zip(axs.T.flat, ["r (Hz)", "σ (nats / neuron / s)"] * M):
+        ax.set_ylabel(y if folded is not None else "density")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=7)
+
+    # trace
+    axs = grid("trace", f"Last {last_ms:g} ms", 2, 6.5, sharex=True)
+    n = min(len(r_mf), round(last_ms / dt))
+    t = np.arange(len(r_mf) - n, len(r_mf)) * dt
+    for j, p in enumerate(pops):
+        for i, (raw, smo, mf, y) in enumerate(((r_sm, r_sm_s, r_mf, "r (Hz)"),
+                                               (s_sm, s_sm_s, s_mf, "σ (nats / neuron / s)"))):
+            ax = axs[i, j]
+            ax.plot(t, _np(raw[-n:, j]), color=C["Spin Model"], lw=0.5, alpha=0.3,
+                    label="Spin Model, per step")
+            ax.plot(t, _np(smo[-n:, j]), color=C["Spin Model"], lw=1.5,
+                    label=f"Spin Model, {smooth_ms:g} ms mean")
+            ax.plot(t, _np(mf[-n:, j]), color=C["Mean Field"], lw=2, label="Mean Field")
+            ax.set_ylabel(y)
+            ax.set_title(f"{'Firing rate' if i == 0 else 'Entropy production'} {p}, "
+                         f"last {n * dt:g} ms")
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=7)
+        axs[1, j].set_xlabel("time (ms)")
+
+    # plane
+    axs = grid("plane", "Phase plane: σ against r", 1, 5)
+    for j, p in enumerate(pops):
+        ax = axs[0, j]
+        ax.plot(_np(r_sm_s[:, j]), _np(s_sm_s[:, j]), ".", color=C["Spin Model"], alpha=0.05,
+                ms=2, label=f"Spin Model, {smooth_ms:g} ms mean")
+        if folded is not None:
+            for k in ("Spin Model", "Mean Field"):
+                r, s = folded[k][j]
+                ax.plot(np.append(r, r[0]), np.append(s, s[0]), color=C[k], lw=2, label=f"{k}, folded cycle")
+        else:
+            ax.plot(float(r_mf[:, j].mean()), float(s_mf[:, j].mean()), "o",
+                    color=C["Mean Field"], ms=9, label="Mean Field")
+        for r, stable in fixed_points:
+            ax.plot(float(r[j]), 0.0, "o", ms=9, color="k" if stable else "C3",
+                    mfc="k" if stable else "none", ls="none",
+                    label=f"fixed point ({'stable' if stable else 'unstable'})")
+        ax.set_xlabel(f"r_{p} (Hz)")
+        ax.set_ylabel(f"σ_{p} (nats / neuron / s)")
+        ax.set_title(f"σ against r, {p}")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=7)
+
+    # age
+    axs = grid("age", "Age distributions", 1, 4)
+    u = torch.arange(p_mf.shape[-1], dtype=torch.float64) * dt
+    for j, p in enumerate(pops):
+        curves({"Spin Model": p_sm[j], "Mean Field": p_mf[j]}, x=u, ax=axs[0, j],
+               title=f"Firing age distribution, {p}", xlabel="age u (ms)", ylabel="p(u)")
+
+    for f in figs.values():
+        f.tight_layout()
+    return figs
 
 
 # 1-D parameter sweeps

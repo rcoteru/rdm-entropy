@@ -1,6 +1,7 @@
-""" Mean field vs spin network for one two-population (E-I) system: rate and entropy production
-of both populations, the attractor in the (r_E, r_I) plane against the mean field's fixed
-points, and the age distributions. The E-I counterpart of ising_mf_vs_sm.py. """
+""" Mean field vs spin network for one two-population (E-I) system: the conventions table per
+population, then rate and entropy production folded over the cycle, the last stretch of both,
+sigma against r and the age distributions (plots.mf_vs_sm), and the attractor in the
+(r_E, r_I) plane against the mean field's fixed points. The E-I counterpart of e1_mf_vs_sm.py. """
 
 import math
 import time
@@ -175,14 +176,6 @@ def rows(traj: dict, a: int, b: int) -> dict:
             "tot": an.rate_and_epr(tot, dt, T_ABS)}
 
 
-def spectral_period(r: torch.Tensor) -> float:
-    """ ms, the period of the largest non-zero Fourier peak of r: for the noisy spin trace,
-    where cycle_window would count noise crossings. """
-    f = torch.fft.rfft(r - r.mean()).abs()
-    k = int(f[1:].argmax()) + 1
-    return len(r) * dt / k
-
-
 if run_plot:
 
     if not CACHE.exists():
@@ -235,8 +228,10 @@ if run_plot:
         print("\nperiod vs mean ISI (1/r_mean), ms:")
         for k, o in out.items():
             for j, p in enumerate(POPS):
-                per = per_mf if k == "Mean Field" else spectral_period(r_sm[:, j])
-                how = "whole cycles of r_E" if k == "Mean Field" else "Fourier peak"
+                per = (per_mf if k == "Mean Field" or not n
+                       else an.noisy_cycles(r_sm[:, j].double(), dt, per_mf)[1])
+                how = ("whole cycles of r_E" if k == "Mean Field"
+                       else "crossings of the smoothed rate")
                 print(f"  {k:<11} {p}: period {per:9.3f} ({how})   mean ISI "
                       f"{1e3 / o[p]['r_mean']:9.3f}")
 
@@ -246,18 +241,12 @@ if run_plot:
                   f"{u:+.6f} /ms  f {abs(w) / (2 * math.pi) * 1e3:7.3f} Hz  "
                   f"({'stable' if u < 0 else 'unstable'})")
 
-    if True:  # rate and sigma against time, both populations
-        fig, axs = plt.subplots(2, 2, sharex=True, figsize=(13, 6))
-        fig.suptitle(TITLE, fontsize=9)
-        for j, p in enumerate(POPS):
-            rp.curves({'Spin Model': r_sm[:, j], 'Mean Field': r_mf[:, j]}, dt=dt,
-                      ax=axs[0, j], ylabel='r (Hz)', title=f'Firing rate, {p}')
-            rp.curves({'Spin Model': s_sm[:, j], 'Mean Field': s_mf[:, j]}, dt=dt,
-                      ax=axs[1, j], ylabel='σ (nats / neuron / s)',
-                      title=f'Entropy production, {p} (spin model: sampled per step, unsmoothed)')
-        for ax in axs.flat:
-            ax.grid()
-        fig.tight_layout()
+    if True:  # cycle, last stretch, sigma against r, age distributions
+        rp.mf_vs_sm(r_mf.double(), s_mf.double(), r_sm.double(), s_sm.double(),
+                    d["p_mf"], d["p_sm"], dt, pops=POPS,
+                    fixed_points=[(r / dt * 1e3, bool(u < 0))
+                                  for r, u in zip(d["roots"], d["mu"])],
+                    title=TITLE)
 
     if True:  # attractor in the (r_E, r_I) plane, with the mean field's fixed points
         fig, ax = plt.subplots(figsize=(7, 6))
@@ -276,15 +265,6 @@ if run_plot:
         ax.set_title(f'Attractor in the (r_E, r_I) plane\n{TITLE}', fontsize=8)
         ax.grid(alpha=0.3)
         ax.legend(fontsize=8)
-        fig.tight_layout()
-
-    if True:  # final age distributions of both populations, on the physical age axis
-        fig, axs = plt.subplots(1, 2, figsize=(12, 4))
-        u = torch.arange(d["p_mf"].shape[-1], dtype=torch.float64) * dt
-        for j, p in enumerate(POPS):
-            rp.curves({'Spin Model': d["p_sm"][j], 'Mean Field': d["p_mf"][j]}, x=u,
-                      ax=axs[j], title=f"Firing age distribution, {p}",
-                      xlabel='age u (ms)', ylabel='p(u)')
         fig.tight_layout()
 
     rp.show()
