@@ -150,7 +150,7 @@ per question. The stationary closed forms and the overlap map F are in `rdme.equ
 | bifurcations along a cut | `scan_cut` (batched fixed points + growth rates) and `find_bifurcations` (Hopf, period-doubling and branch points bisected with ARPACK; saddle-nodes on the count) | GPU, then CPU |
 | branch diagram, M = 1 | `branch_scan` | CPU |
 | which attractor a run reaches | `classify_attractor`, `compare_starts` on batched runs | GPU (the runs) |
-| full spectrum | `jacobian_eigvals` / `RDMNetwork.fp_eigenvalues`: the dense oracle, for tests only | CPU |
+| full spectrum | `jacobian_eigvals` / `RDMNetwork.fp_eigenvalues`: the dense oracle: tests, and the paper's M = 1 sweeps (`paper/fig_ising_EJ_sweeps.py`) | CPU |
 
 **Devices** (measured on an RTX 4070 SUPER, E–I state D ≈ 8900):
 

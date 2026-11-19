@@ -516,15 +516,13 @@ class RDMNetwork:
         return self.flatten_state(p_new, S_new)
 
     def fp_eigenvalues(self, m: torch.Tensor) -> torch.Tensor:
-        """ Eigenvalues of the linearized map at the fixed point with overlaps m (one system). """
+        """ Every eigenvalue of the linearized map at the fixed point with overlaps m (one
+        system): stability.jacobian_eigvals, DENSE and O(D^3) in the state size D = 2*M*Q.
+        Affordable for a single population at moderate Q (the paper's E1 sweeps) and as the
+        oracle in tests; leading_modes / leading_growth for anything larger. """
         assert self.B is None, "fp_eigenvalues is per system: select(b) first"
         x = self.flatten_state(*self.fp_state(m))
         return stab.jacobian_eigvals(self.state_map, x)
-
-    def is_stable(self, m: torch.Tensor, tol: float = 1e-8) -> bool:
-        """ Linear stability of the fixed point with overlaps m: spectral radius < 1. Dense, so
-        for small systems and tests; leading_modes / leading_growth for the rest. """
-        return bool(stab.spectral_radius(self.fp_eigenvalues(m)) < 1.0 - tol)
 
     def leading_modes(self, m: torch.Tensor, **kwargs) -> dict:
         """ The leading modes (mu in 1/ms, omega in rad/ms, warm start v) at the fixed point
