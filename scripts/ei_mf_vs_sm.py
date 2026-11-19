@@ -69,7 +69,7 @@ POINTS = {
 }
 # the async preset is Fig. 5 itself: w(E→I) = 960 = 1.084 J_H, stable (mu = -0.0365 /ms)
 POINTS["EI-async"] = POINTS["EI-fig5"]
-NAME  = "EI-fig5"      # choose one of the above points
+NAME  = "EI-cycle"      # choose one of the above points
 POINT = POINTS[NAME]
 
 N       = 20000     # spins in the network model
@@ -242,10 +242,16 @@ if run_plot:
                   f"({'stable' if u < 0 else 'unstable'})")
 
     if True:  # cycle, last stretch, sigma against r, age distributions
-        rp.mf_vs_sm(r_mf.double(), s_mf.double(), r_sm.double(), s_sm.double(),
-                    d["p_mf"], d["p_sm"], dt, pops=POPS,
-                    fixed_points=[(r / dt * 1e3, bool(u < 0))
-                                  for r, u in zip(d["roots"], d["mu"])],
+        # E and I overlaid, the aggregate (E_RATIO-weighted, as m_tot) in its own column
+        w = torch.tensor([E_RATIO, 1 - E_RATIO], dtype=torch.float64)
+        tot = lambda x, x_tot: torch.cat([x.double(), x_tot.double()[:, None] / dt * 1e3], 1)
+        ages = lambda p: torch.cat([p.double(), (w @ p.double())[None]])
+        rp.mf_vs_sm(tot(r_mf, mf_traj2["m_tot"]), tot(s_mf, mf_traj2["sigma_tot"]),
+                    tot(r_sm, sm_traj2["m_tot"]), tot(s_sm, sm_traj2["sigma_tot"]),
+                    ages(d["p_mf"]), ages(d["p_sm"]), dt, pops=POPS + ("tot",),
+                    panels=(POPS, ("tot",)),
+                    fixed_points=[(torch.cat([r, (w @ r.double())[None]]) / dt * 1e3,
+                                   bool(u < 0)) for r, u in zip(d["roots"], d["mu"])],
                     title=TITLE)
 
     if True:  # attractor in the (r_E, r_I) plane, with the mean field's fixed points
