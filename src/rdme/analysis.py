@@ -252,18 +252,6 @@ def richardson(vals: Sequence[float] | torch.Tensor, p: float | None = None,
     return float(vals[-1] + (vals[-1] - vals[-2]) / (2 ** p - 1)), p
 
 
-def converged_at(dts: Sequence[float], vals: torch.Tensor, limit: float,
-                 thresh: float) -> float:
-    """ Coarsest dt from which the relative error stays under `thresh` all the way down.
-    'And stays': a curve crossing a threshold once on its way past is not converged there. """
-    err = (vals - limit).abs() / max(abs(limit), 1e-300)
-    ok = float('nan')
-    for k in range(len(dts) - 1, -1, -1):
-        if float(err[k]) < thresh: ok = dts[k]
-        else: break
-    return ok
-
-
 # Burst resolution
 # ~~~~~~~~~~~~~~~~
 #
