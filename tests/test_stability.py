@@ -28,7 +28,7 @@ def test_leading_modes_match_the_dense_spectrum(settled):
     eigenvector converges in fewer matvecs. """
     net, m = settled
     dt = net.dt
-    dense = net.fp_eigenvalues(m)
+    dense = stab.jacobian_eigvals(net.state_map, net.flatten_state(*net.fp_state(m)))
     dense = dense[dense.abs().argsort(descending=True)][:2]
     got = net.leading_modes(m, k=2)
     assert torch.allclose(got["mu"], dense.abs().log() / dt, rtol=0, atol=1e-7)

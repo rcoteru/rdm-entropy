@@ -347,8 +347,8 @@ def jacobian_eigvals(state_map: Callable[[torch.Tensor], torch.Tensor],
                      x: torch.Tensor,     # (D,) state vector at the fixed point
                      ) -> torch.Tensor:   # (D,) complex eigenvalues
     """ Every eigenvalue of the linearization of a discrete-time map at a point: the dense
-    oracle. O(D^3) -- 113 s at dt = 0.2 and 613 s at dt = 0.1 for the E-I state -- so for tests,
-    spot checks and single-population states, not for scans. The age distributions are normalized, so the map is confined
+    oracle. O(D^3) -- 113 s at dt = 0.2 and 613 s at dt = 0.1 for the E-I state -- so for tests
+    and spot checks, not for scans. The age distributions are normalized, so the map is confined
     to an affine subspace and the spectrum carries eigenvalues of the directions that leave it;
     they are harmless but should not be mistaken for physical modes. """
     jac = torch.func.jacfwd(state_map)(x)
