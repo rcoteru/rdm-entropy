@@ -45,6 +45,7 @@ TOL    = 1e-2
 DEVICE = 'cpu'
 T_EQUI, T_MEAS = 5000.0, 3000.0   # ms, as in ising_mf_vs_sm.py
 N_BINS = 400                # phase bins of the profiles
+P_RANGE = (0.5, 3.0)        # an observed order outside this is "out of range"
 
 run_sim   = True
 run_plot  = True
@@ -90,21 +91,6 @@ if run_sim:
 
 # ── Analysis & Plot ───────────────────────────────────────────────────────────
 
-def order(v):
-    """ Observed order from three values at halving dt; nan and the reason when the
-    differences change sign, the reason alone when p falls outside [0.5, 3]. """
-    d1, d2 = v[0] - v[1], v[1] - v[2]
-    if d1 * d2 <= 0:
-        return float("nan"), "sign change"
-    p = math.log2(d1 / d2)
-    return p, ("" if 0.5 <= p <= 3 else "out of range")
-
-
-def richardson(v, p):
-    """ Extrapolation from the two finest values at order p. """
-    return v[2] + (v[2] - v[1]) / (2 ** p - 1)
-
-
 if run_plot:
 
     FIG.mkdir(parents=True, exist_ok=True)
@@ -139,14 +125,15 @@ if run_plot:
         out(f"  r_mean (Hz)     dt=0.2 {rb[0]:.6g}  0.1 {rb[1]:.6g}  0.05 {rb[2]:.6g}")
         out(f"  period (ms)     dt=0.2 {pr[0]:.6g}  0.1 {pr[1]:.6g}  0.05 {pr[2]:.6g}")
         for lab, v in (("sigma", sig), ("r_mean", rb), ("period", pr)):
-            p, why = order(v)
+            p, why = an.observed_order(v, P_RANGE)
             out(f"  p[{lab}] = {p:.3f}  {why}  (diffs {v[0] - v[1]:+.4g}, {v[1] - v[2]:+.4g})")
-        p, why = order(sig)
+        p, why = an.observed_order(sig, P_RANGE)
         if why:
             out(f"  Richardson: not asymptotic ({why})")
         else:
-            out(f"  Richardson (0.1, 0.05): observed p {richardson(sig, p):.6g}   "
-                f"p=1 {richardson(sig, 1):.6g}   p=2 {richardson(sig, 2):.6g}")
+            ext = {q: an.richardson(sig, p=q, p_range=P_RANGE)[0] for q in (p, 1, 2)}
+            out(f"  Richardson (0.1, 0.05): observed p {ext[p]:.6g}   "
+                f"p=1 {ext[1]:.6g}   p=2 {ext[2]:.6g}")
 
         # the divergent part of the path entropies: r_mean ln 2 per halving, r_mean at the finer dt
         for c, f in ((0.2, 0.1), (0.1, 0.05)):

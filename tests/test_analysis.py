@@ -87,3 +87,17 @@ def test_phase_profile_needs_a_cycle():
     r = torch.full((100,), 40.0, dtype=torch.float64)
     with pytest.raises(ValueError):
         an.phase_profile(r, r, 10)
+
+
+def test_observed_order_and_richardson():
+    """ A first-order sequence x(dt) = 1 + dt at dt = 0.4, 0.2, 0.1: order 1 and limit 1. A
+    turning point and an order outside the band are refused, and richardson returns nan. """
+    p, why = an.observed_order([1.4, 1.2, 1.1])
+    assert why == "" and p == pytest.approx(1.0)
+    assert an.richardson([1.4, 1.2, 1.1]) == pytest.approx((1.0, 1.0))
+    assert an.richardson([1.4, 1.2, 1.1], p=2)[0] == pytest.approx(1.1 - 0.1 / 3)
+    assert an.observed_order([1.4, 1.2, 1.3])[1] == "sign change"
+    assert an.observed_order([1.4, 1.2, 1.1], p_range=(1.5, 3.0)) == (pytest.approx(1.0),
+                                                                       "out of range")
+    with pytest.warns(RuntimeWarning, match="refused"):
+        assert math.isnan(an.richardson([1.4, 1.2, 1.3])[0])

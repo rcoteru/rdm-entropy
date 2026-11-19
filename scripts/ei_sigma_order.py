@@ -110,16 +110,6 @@ if run_sim:
 
 # ── Analysis & Plot ───────────────────────────────────────────────────────────
 
-def order(v):
-    """ Observed order from three values at halving dt; nan and the reason when the
-    differences change sign, the reason alone when p falls outside P_RANGE. """
-    d1, d2 = v[0] - v[1], v[1] - v[2]
-    if d1 * d2 <= 0:
-        return float("nan"), "sign change"
-    p = math.log2(d1 / d2)
-    return p, ("" if P_RANGE[0] <= p <= P_RANGE[1] else "out of range")
-
-
 def series(tr: dict, pop: str, key: str, dt: float) -> torch.Tensor:
     """ A per-step trace of one population (or the aggregate), per unit time (1/s). """
     x = tr[key + "_tot"] if pop == "tot" else tr[key][:, POPS.index(pop)]
@@ -152,7 +142,7 @@ if run_plot:
                                 chk=(hr[a:b] - hf[a:b] - s[a:b]).abs().max().item())
 
         pr = [R[dt]["per"] for dt in DTS]
-        p_per, why_per = order(pr)
+        p_per, why_per = an.observed_order(pr, P_RANGE)
         out(f"=== {name}   cycles of r_E {[R[dt]['n'] for dt in DTS]}  "
             f"amp ratio {[round(R[dt]['ratio'], 4) for dt in DTS]}  "
             f"max|H_rev - H_fwd - sigma| "
@@ -165,7 +155,7 @@ if run_plot:
             for lab, key in (("sigma (nats/s)", "sig"), ("r_mean (Hz)", "rbar"),
                              ("r_max (Hz)", "rmax")):
                 v = [R[dt][p][key] for dt in DTS]
-                o, why = order(v)
+                o, why = an.observed_order(v, P_RANGE)
                 out(f"    {lab:<15} dt=0.2 {v[0]:.6g}  0.1 {v[1]:.6g}  0.05 {v[2]:.6g}   "
                     f"p = {o:.3f} {why}  (diffs {v[0] - v[1]:+.4g}, {v[1] - v[2]:+.4g})")
             # the divergent part of the path entropies: r_mean ln 2 per halving

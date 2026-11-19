@@ -166,7 +166,25 @@ def orders(vals: torch.Tensor) -> torch.Tensor:
     return torch.log2(d[:-1] / d[1:].clamp_min(1e-300))
 
 
-def richardson(vals: torch.Tensor) -> tuple[float, float]:
+def observed_order(vals: Sequence[float] | torch.Tensor,
+                   p_range: tuple[float, float] = (0.0, 3.0)) -> tuple[float, str]:
+    """ (order the last triple shows, why it is not one): why is "" for an asymptotic
+    sequence, "sign change" when the successive differences change sign anywhere (p is then
+    nan), and "out of range" when any observed order falls outside p_range (p is still
+    returned). Needs at least three values at halving dt. """
+    vals = torch.as_tensor(vals, dtype=torch.float64)
+    if len(vals) < 3:
+        raise ValueError("observed_order needs at least three values")
+    d = vals.diff()
+    if bool(((d[:-1] * d[1:]) < 0).any()):
+        return float("nan"), "sign change"
+    o = orders(vals)
+    ok = bool(((o >= p_range[0]) & (o <= p_range[1])).all())
+    return float(o[-1]), ("" if ok else "out of range")
+
+
+def richardson(vals: Sequence[float] | torch.Tensor, p: float | None = None,
+               p_range: tuple[float, float] = (0.0, 3.0)) -> tuple[float, float]:
     """ (extrapolated limit, order used), from the two finest steps and the order the last
     triple shows. Falls back to first order when the differences are too noisy to read one off
     -- near the limit they are differences of nearly equal numbers and the log2 of their ratio
@@ -180,9 +198,12 @@ def richardson(vals: torch.Tensor) -> tuple[float, float]:
           estimate. Measured on poisson's sigma at J = 17, which falls to dt ~ 1/3 and then
           climbs: the old fallback read an "order" off the turning point and returned a limit
           with four digits, every one of them meaningless.
-      an observed order above ~3 or below zero.  Same disease, caught one step earlier -- a
-          first-order method cannot show p = 8, so a triple that says so is measuring
-          something other than the discretization error.
+      an observed order outside p_range (default [0, 3]).  Same disease, caught one step
+          earlier -- a first-order method cannot show p = 8, so a triple that says so is
+          measuring something other than the discretization error.
+
+    Both are observed_order's verdict. A given `p` extrapolates at that order instead of the
+    observed one, but the refusal still applies.
 
     Returning nan rather than a cautious number is the point. The caller formats it as a
     refusal and the convergence verdicts fall through to "not resolved", which is the honest
@@ -191,21 +212,19 @@ def richardson(vals: torch.Tensor) -> tuple[float, float]:
     A bare PAIR (len 2) has no order to read and no sign change to see, so it is extrapolated
     at first order unconditionally -- which is why the standing rule asks the pair's own order
     to be reported from somewhere else, usually a third, coarser step. """
+    vals = torch.as_tensor(vals, dtype=torch.float64)
     if len(vals) < 2:
         raise ValueError("richardson needs at least a (dt, dt/2) pair")
+    p_obs = 1.0
     if len(vals) > 2:
-        o = orders(vals)
-        d = vals.diff()
-        turning = bool(((d[:-1] * d[1:]) < 0).any())
-        wild = bool((o.abs() > 3.0).any()) or bool((o < 0).any())
-        if turning or wild:
-            why = "differences change sign" if turning else "observed order out of range"
+        p_obs, why = observed_order(vals, p_range)
+        if why:
             warnings.warn(f"richardson refused: {why}; orders "
-                          f"{[f'{v:.2f}' for v in o.tolist()]}", RuntimeWarning, stacklevel=2)
+                          f"{[f'{v:.2f}' for v in orders(vals).tolist()]}", RuntimeWarning,
+                          stacklevel=2)
             return float('nan'), float('nan')
-    p = float(orders(vals)[-1]) if len(vals) > 2 else 1.0
-    if not (0.2 < p < 4.0):
-        p = 1.0
+    if p is None:
+        p = p_obs if 0.2 < p_obs < 4.0 else 1.0
     return float(vals[-1] + (vals[-1] - vals[-2]) / (2 ** p - 1)), p
 
 
