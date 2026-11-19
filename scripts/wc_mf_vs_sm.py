@@ -18,9 +18,6 @@ from rdme.spin_model import SpinWilsonCowan
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 
-N       = 20000     # spins in the network model
-E_RATIO = 0.8       # excitatory fraction; in the mean field it only weights the aggregates
-
 # Schwalger, Deger & Gerstner 2017, Fig. 5 neuron, identical for E and I: LIF with exponential
 # escape noise, Delta_u = 2.5 mV (beta = 0.4 /mV), u_th = 15 mV, tau_m = 20 ms, t_ref = 4 ms,
 # c = 10 Hz; no relative refractoriness (K_ref = 0, so tau_ref is unused)
@@ -74,6 +71,8 @@ POINTS["EI-async"] = POINTS["EI-fig5"]
 NAME  = "EI-fig5"      # choose one of the above points
 POINT = POINTS[NAME]
 
+N       = 20000     # spins in the network model
+E_RATIO = 0.8       # excitatory fraction; in the mean field it only weights the aggregates
 hazard  = "poisson_exact"   # "poisson_exact" | "poisson" | "bernoulli"
 IC      = "silent"          # "silent" | "random", the same start for both models
 AGE_MAX = 25.0              # ms, age window of the "random" start

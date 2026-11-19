@@ -16,7 +16,6 @@ from rdme.spin_model import SpinIsingModel
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 
-N       = 20000     # spins in the network model
 
 # model points: J physical (not divided by dt), nu0 in 1/ms (Poisson reference rate),
 # t_abs / tau_int / tau_ref in ms (absolute window, synaptic integration, relative decay)
@@ -69,6 +68,7 @@ POINTS = {
 }
 POINT = POINTS["E1-15-onset"]  # choose one of the above points
 
+N       = 20000             # spins in the network model
 hazard  = "poisson_exact"   # "poisson_exact" | "poisson" | "bernoulli"
 IC      = "silent"          # "silent" | "random", the same start for both models
 AGE_MAX = 25.0              # ms, age window of the "random" start
