@@ -136,52 +136,60 @@ mean field must collapse onto one population with J = 960 − 1200 = −240 mV·
      Above J_H it is stable up to 3840 (μ between −0.052 and −0.056 /ms), and the
      r·t_abs = 0.5 cap is never reached.
 
-## Tooling
+## Tooling: `rdme.stability`
 
-| question | tool |
-|---|---|
-| fixed points | Newton on the CPU (`fixed_points`), from a lattice over the physical box; with w(I→I) = 0, plus exact 1-D bracketing |
-| crossings: location, type, frequency | `rdme.analysis.leading_modes`, ARPACK, bisected |
-| stable or not, μ anywhere | `rdme.analysis.leading_growth`, power iteration |
-| which attractor a run reaches | batched mean-field runs (`RDMWilsonCowanBatch`, GPU), silent start and fixed-point start |
-| dt-resolution | `scripts/ei_sigma_order.py` |
+Everything about fixed points and their stability lives in `src/rdme/stability.py`, one section
+per question. The stationary closed forms and the overlap map F are in `rdme.equations`.
 
-- **`leading_modes(state_map, x, dt, k=4, ...)`** gives the leading eigenvalues of the
-  linearized one-step map, matrix-free (ARPACK on JVPs).
-  - Returns growth rates μ = ln|λ|/dt (1/ms), frequencies ω = arg λ/dt, and a warm start `v`.
-  - Checked against the dense spectrum (test in `tests/test_analysis.py`).
-  - The dense solve takes 113 s at dt = 0.2 and 613 s at dt = 0.1 for the E–I state
-    (D = 4Q ≈ 8264); this takes 1–7 s.
+| question | tool | device |
+|---|---|---|
+| fixed points of one system | `RDMNetwork.fixed_points()`: Newton from a lattice over the physical box [0, dt/t_abs]^M, plus the exact 1-D starts (`reduced_guesses`) for M = 2 with w(I→I) = 0; bracketing for M = 1 | CPU |
+| fixed points of a batch | `RDMNetwork.fp_sweep(chunk=...)`: Newton in chunks that halve on out-of-memory (`run_chunked`) | GPU |
+| leading modes: μ, frequency | `RDMNetwork.leading_modes(m)` / `stability.leading_modes`, ARPACK | CPU |
+| growth rate where ARPACK fails | `RDMNetwork.leading_growth(m)` / `stability.leading_growth`, power iteration, one system or a batch | GPU for batches |
+| landmarks along a cut | `scan_cut` (batched fixed points + growth rates) and `find_landmarks` (crossings bisected with ARPACK, folds on the count) | GPU, then CPU |
+| branch diagram, M = 1 | `branch_scan` | CPU |
+| which attractor a run reaches | `classify_attractor`, `compare_starts` on batched runs | GPU (the runs) |
+| full spectrum | `jacobian_eigvals` / `RDMNetwork.fp_eigenvalues`: the dense oracle, for tests only | CPU |
+
+**Devices** (measured on an RTX 4070 SUPER, E–I state D ≈ 8900):
+
+| operation | CPU | GPU |
+|---|---|---|
+| single-system JVP (ARPACK steps) | 0.22 ms | 0.44 ms |
+| batched JVP, 81 systems | 2.2 ms | 0.43 ms |
+| batched Newton, 81 × 36 starts | 78 s | ~1 s (27 × 36: 0.4 s, 0.66 GiB) |
+
+**Timings.** The whole landmark scan of the Fig. 5 cut (81 values, the bisection to 0.01) now
+takes 49 s, against about 2 h with dense spectra.
+
+- **`leading_modes`** gives the leading eigenvalues of the linearized one-step map,
+  matrix-free.
+  - Returns μ = ln|λ|/dt (1/ms), ω = arg λ/dt, and a warm start `v`.
+  - Checked against the dense spectrum (`tests/test_stability.py`).
   - **k stays small:** below the few isolated leading modes sits a band of about Q
     near-degenerate eigenvalues, and k = 6 already reaches into it.
   - **tol is explicit:** ARPACK's default tolerance (machine precision) caused the stalls.
-  - The matvec count grows with Q (doubling per halving of dt), while μ and ω converge to
-    about 1e−6 /ms.
-- **Where it fails.** Deep on the stable side, the leading modes are nearly degenerate in
-  modulus (two pairs within about 1e−4 /ms, more just below). ARPACK fails there at any k,
-  ncv or tol. `ArpackNoConvergence` means *unresolved*, not *stable*.
-- **`leading_growth(state_map, x, dt, t_ms=1000)`** takes over there.
-  - Power iteration on the linearized map; μ is the least-squares slope of the cumulative
-    log norm. The rate converges where no eigenvector does. No frequency.
-  - Within 2e−5 /ms of ARPACK where ARPACK converges, and within 5e−4 of the dense spectrum
-    at a degenerate point, closing slowly with t_ms.
-  - About 5 s per point.
-- **No dense spectra anywhere.**
+- **Where ARPACK fails.** Deep on the stable side the leading modes are nearly degenerate in
+  modulus (two pairs within about 1e−4 /ms, more just below). ARPACK fails there at any k, ncv
+  or tol, and `ArpackNoConvergence` means *unresolved*, not *stable*.
+- **`leading_growth`** takes over there.
+  - Power iteration; μ is the least-squares slope of the cumulative log norm. The rate
+    converges where no eigenvector does. No frequency.
+  - Within 2e−5 /ms of ARPACK where ARPACK converges, and within 5e−4 of the dense spectrum at
+    a degenerate point.
 - **Tried and dropped:**
-  - ARPACK on the propagator Jᵖ with Rayleigh–Ritz recovery: slower at every p tried.
-  - A dense fallback on the GPU: replaced by `leading_growth`.
+  - ARPACK on the propagator Jᵖ: slower at every p.
+  - Dense fallbacks: replaced by `leading_growth`.
 - **The real fix for degenerate spectra** is root-finding on the characteristic equation
   det(I − W·Ĝ(z)) = 0, mode by mode. Not done.
-- **Fixed points:** run Newton on the CPU; the GPU batched `fp_sweep` runs out of memory at
-  useful lattice sizes. With w(I→I) = 0 the lattice misses fixed points; there the problem
-  reduces exactly to 1-D (r_I = F_I(r_E)) and is bracketed.
 
 ## Scripts
 
 | script | what it does |
 |---|---|
 | `scripts/wc_mf_vs_sm.py` | one preset, mean field against spins: conventions table per population, rate and σ against time, the attractor in (r_E, r_I) with the fixed points, age distributions |
-| `scripts/ei_landmarks.py` | fixed points along w(E→I), μ by power iteration, crossings bisected with ARPACK, folds by fixed-point count |
+| `scripts/ei_landmarks.py` | the landmarks along w(E→I), via `stability.scan_cut` and `find_landmarks` |
 | `scripts/ei_sigma_order.py` | dt-order of the oscillating presets; tables and phase profiles in `scripts/figures/EI-sigma_order/` |
 | `scripts/ising_mf_vs_sm.py` | holds `I1-fig5-collapsed` for the collapse check |
 
@@ -191,5 +199,3 @@ mean field must collapse onto one population with J = 960 − 1200 = −240 mV·
 - Whether the E_inh = 15 Hopf is subcritical (needs a continuation of the cycle branch).
 - The H_rev threshold for the paper (5 % here).
 - The characteristic equation, for spectra where the leading modes are degenerate.
-- Packaging the stability tooling (fixed points, `leading_modes`, `leading_growth`, crossing
-  bisection, attractor classification) into one module, e.g. `rdme/stability.py`.

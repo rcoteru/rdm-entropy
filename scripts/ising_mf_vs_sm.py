@@ -1,6 +1,7 @@
 """ Mean field vs spin network for one single-population (Ising) system: equilibration,
 age distribution, return map, entropy trajectories and the fixed-point objective G(m). """
 
+import math
 import time
 from pathlib import Path
 
@@ -8,7 +9,6 @@ import matplotlib.pyplot as plt
 import torch
 
 import rdme.analysis as an
-import rdme.fixed_points as fpts
 import rdme.helpers as hlp
 import rdme.plots as rp
 from rdme.mean_field import RDMIsingModel
@@ -144,8 +144,9 @@ if run_sim and (overwrite or not CACHE.exists()):
         "m_grid": m_grid.squeeze(-1).cpu(),
         "G": mf.fp_residual(m_grid).squeeze(-1).cpu(),
         "roots": roots.cpu(),
-        "rho": torch.tensor([fpts.spectral_radius(mf.fp_eigenvalues(r)) for r in roots],
-                            dtype=torch.float64),
+        # largest eigenvalue modulus of the one-step map, from its leading growth rate
+        "rho": torch.tensor([math.exp(float(mf.leading_modes(r, k=2)["mu"][0]) * dt)
+                             for r in roots], dtype=torch.float64),
     }
     hlp.save_atomic(out, CACHE)
     print(f"Saved to {CACHE}.")

@@ -263,7 +263,7 @@ def sweep_figures(axis: torch.Tensor | np.ndarray,    # (B,) the swept parameter
                   dt: float,
                   label: str,                    # x-axis label, e.g. 'Recurrent coupling  J'
                   banner: str = "",              # parameter string for the suptitles
-                  fp: Mapping[str, object] | None = None,   # fixed_points.branch_scan output
+                  fp: Mapping[str, object] | None = None,   # stability.branch_scan output
                   means: Mapping[str, object] | None = None,  # {'sigma_tot': (B,), ...}
                   tail_ms: float = 1000.0,       # tail of each cell shown in the scatter, in ms
                   max_freq: float | None = 0.2,  # spectrogram y-limit (1/ms); None = Nyquist

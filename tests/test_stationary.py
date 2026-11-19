@@ -1,4 +1,4 @@
-""" Stationarity: the closed forms in rdme.fixed_points, and the dynamics sitting on them. """
+""" Stationarity: the closed forms in rdme.equations, and the dynamics sitting on them. """
 
 import math
 
@@ -6,7 +6,6 @@ import pytest
 import torch
 
 import rdme.equations as eq
-import rdme.fixed_points as fpts
 from conftest import SETTLED, WC
 from rdme.mean_field import (
     RDMIsingModel,
@@ -22,7 +21,7 @@ def test_stationary_field_is_the_geometric_sum(n_abs):
     through the window and on its first eligible bin, and integrating from there. """
     Q, alpha, I = 12, 0.3, torch.tensor(1.7)
     blocked = torch.arange(Q) < n_abs
-    S = fpts.compute_stationary_forward_field(I, alpha, blocked)
+    S = eq.compute_stationary_forward_field(I, alpha, blocked)
     assert bool((S[:n_abs + 1] == 0).all())
     assert S[n_abs + 1].item() == pytest.approx(alpha * I.item(), abs=1e-15)
     assert torch.allclose(eq.update_synaptic_term(S, alpha, I, blocked), S, rtol=0, atol=1e-14)
@@ -31,7 +30,7 @@ def test_stationary_field_is_the_geometric_sum(n_abs):
 def test_stationary_age_distribution_is_stationary():
     """ p* is normalized, fixed by the renewal update, and its births equal its spikes. """
     phi = torch.rand(15, generator=torch.Generator().manual_seed(0)).clamp(0.05, 0.95)
-    p, m = fpts.compute_stationary_age_distribution(phi)
+    p, m = eq.compute_stationary_age_distribution(phi)
     assert p.sum().item() == pytest.approx(1.0, abs=1e-14)
     assert torch.allclose(eq.update_age_distribution(p, phi), p, rtol=0, atol=1e-14)
     assert p[0].item() == pytest.approx(m.item(), abs=1e-14)
@@ -41,8 +40,8 @@ def test_stationary_age_distribution_is_stationary():
 def test_stationary_rate_is_the_untruncated_renewal_rate():
     """ With the boundary far out, m* is 1 / sum_n Survival(n). """
     phi = torch.full((400,), 0.05)
-    _, m = fpts.compute_stationary_age_distribution(phi)
-    surv = fpts.compute_stationary_survival(phi)
+    _, m = eq.compute_stationary_age_distribution(phi)
+    surv = eq.compute_stationary_survival(phi)
     assert m.item() == pytest.approx(1.0 / surv.sum().item(), rel=1e-6)
 
 
@@ -78,7 +77,7 @@ def test_stationary_rate_matches_the_dynamics_at_a_fixed_point():
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #
 # No coupling, K_ref = 0, no input and threshold -x: a renewal process with dead time t_abs and
-# constant hazard nu0 e^x, whose rate is fpts.renewal_rate. The drive goes through theta, not
+# constant hazard nu0 e^x, whose rate is eq.renewal_rate. The drive goes through theta, not
 # through E with an instantaneous synapse: S is clamped at 0 on the first eligible bin
 # (equations.update_synaptic_term), which would add a first-order error of its own there.
 
@@ -95,7 +94,7 @@ def _free_run(x, dt, *, nu0=1.0, t_abs=1.0, tol=1e-4, eq_ms=80.0, rec_ms=40.0):
 
 def test_renewal_rate_has_both_closed_forms():
     for x, nu0, t_abs in ((-1.0, 1.0, 1.0), (0.5, 2.0, 0.5)):
-        assert fpts.renewal_rate(x, nu0, t_abs) == pytest.approx(
+        assert eq.renewal_rate(x, nu0, t_abs) == pytest.approx(
             1.0 / (t_abs * (1.0 + math.exp(-(x + math.log(nu0 * t_abs))))), rel=1e-12)
 
 
@@ -103,7 +102,7 @@ def test_renewal_rate_has_both_closed_forms():
 def test_stationary_rate_is_the_dead_time_transfer_function(x):
     """ The exact-survival map overestimates the rate by at most lambda*dt/2, single-signed,
     and the error halves with dt: first-order convergence onto the closed form. """
-    lam, want = math.exp(x), fpts.renewal_rate(x, 1.0, 1.0)
+    lam, want = math.exp(x), eq.renewal_rate(x, 1.0, 1.0)
     errs = []
     for dt in (0.02, 0.01):
         got, trunc = _free_run(x, dt)
@@ -118,7 +117,7 @@ def test_stationary_rate_is_the_dead_time_transfer_function(x):
 def test_the_dead_time_caps_the_rate():
     """ At a hazard of e^3 = 20/ms the realised rate is the closed form, below 1/t_abs. """
     x, dt = 3.0, 0.002
-    want = fpts.renewal_rate(x, 1.0, 1.0)
+    want = eq.renewal_rate(x, 1.0, 1.0)
     got, trunc = _free_run(x, dt, tol=1e-7, eq_ms=60.0, rec_ms=20.0)
     assert trunc < 1e-6, trunc
     assert got < 1.0

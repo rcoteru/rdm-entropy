@@ -82,7 +82,6 @@ AGE_MAX = 25.0              # ms, age window of the "random" start
 dt     = 0.1       # ms, solver step; must divide t_abs
 TOL    = 1e-2      # truncation tolerance: sets the mean field's Q and the spin EPR's lookahead
 DEVICE = 'cpu'     # 'cuda' if torch.cuda.is_available() else 'cpu'
-N_GUESS = 12       # Newton starts per axis for the fixed points, over [0, dt/t_abs]^2
 
 T_EQUI, T_MEAS = 1000.0, 2000.0  # ms: equilibration, then entropy recording
 STORE_SPIKES = False   # keep the spin raster of the recording, for the spin ISI CV;
@@ -124,34 +123,18 @@ if run_sim and (overwrite or not CACHE.exists()):
     sm = SpinWilsonCowan(N, **PARAMS, ic=IC, age_max=AGE_MAX, tol=TOL, device=DEVICE)
     mf = RDMWilsonCowan(**PARAMS, ic=IC, age_max=AGE_MAX, tol=TOL, device=DEVICE)
 
-    # fixed points from a lattice over the physical box (rates up to 1/t_abs), and the
-    # leading mode of each one's Jacobian (matrix-free; growth rate mu < 0 is stable)
-    hi = dt / T_ABS
-    ax = torch.linspace(hi / (2 * N_GUESS), hi * (1 - 1 / (2 * N_GUESS)), N_GUESS,
-                        dtype=torch.float64)
-    guesses = torch.stack(torch.meshgrid(ax, ax, indexing="ij"), -1).reshape(-1, 2)
-    if POINT["w_II"] == 0.0:
-        # then r_I = F_I(r_E), and a start inside every sign change of G_E(m_E, F_I(m_E)) on
-        # a fine grid reaches every fixed point, which the lattice alone can miss
-        mE = torch.linspace(0.0, hi, 4001, dtype=torch.float64)
-        z  = torch.stack([mE, torch.zeros_like(mE)], -1)
-        mI = (z - mf.fp_residual(z))[:, 1]
-        g  = mf.fp_residual(torch.stack([mE, mI], -1))[:, 0]
-        i  = ((g[:-1] * g[1:]) <= 0).nonzero().flatten()
-        guesses = torch.cat([guesses, torch.stack([0.5 * (mE[i] + mE[i + 1]),
-                                                   0.5 * (mI[i] + mI[i + 1])], -1)])
-    roots = mf.fixed_points(guesses=guesses)
-    # where ARPACK cannot separate two nearly degenerate leading pairs, the growth rate from
-    # power iteration (no frequency then)
+    # fixed points (Newton from the physical box, plus the exact 1-D starts when w(I→I) = 0),
+    # and the leading mode of each one's Jacobian: ARPACK, or the growth rate alone by power
+    # iteration where the leading modes are too degenerate for it (growth rate mu < 0 is stable)
+    roots = mf.fixed_points()
     mu, omega = torch.zeros(len(roots), dtype=torch.float64), torch.zeros(len(roots),
                                                                           dtype=torch.float64)
     for i, r in enumerate(roots):
         try:
-            o = an.leading_modes(mf.state_map, mf.flatten_state(*mf.fp_state(r)), dt, k=2)
+            o = mf.leading_modes(r, k=2)
             mu[i], omega[i] = o["mu"][0], o["omega"][0]
         except ArpackNoConvergence:
-            mu[i] = an.leading_growth(mf.state_map, mf.flatten_state(*mf.fp_state(r)), dt)
-            omega[i] = float("nan")
+            mu[i], omega[i] = mf.leading_growth(r), float("nan")
 
     print(f"Running {T_EQUI + T_MEAS:g} ms of each model "
           f"({steps1 + steps2} steps at dt={dt:g}) on {DEVICE}.")

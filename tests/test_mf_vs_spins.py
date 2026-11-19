@@ -8,9 +8,10 @@ enough mass at both points to move the mean field's rate and sigma by percent. "
 import pytest
 import torch
 
+import rdme.equations as eq
+
 import conftest
 import rdme.analysis as an
-import rdme.fixed_points as fpts
 from rdme.mean_field import RDMIsingModel
 from rdme.spin_model import SpinIsingModel
 
@@ -52,7 +53,7 @@ def test_synaptic_clamp_matches_spin_model(t_abs):
     torch.manual_seed(0)
     sm = SpinIsingModel(200, 0.0, E, 1.0, 0.0, tau_int, 1.0, 0.0, ic="silent", **kw)
     mf = RDMIsingModel(0.0, E, 1.0, 0.0, tau_int, 1.0, 0.0, **kw)
-    S_mf = fpts.compute_stationary_forward_field(torch.tensor(E), mf.alpha_int[0],
+    S_mf = eq.compute_stationary_forward_field(torch.tensor(E), mf.alpha_int[0],
                                                  mf.blocked[0]).float()
     assert int(mf.n_abs) == (3 if t_abs else 0)
     seen = torch.zeros(sm.N, dtype=torch.bool)

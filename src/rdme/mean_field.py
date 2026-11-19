@@ -1,7 +1,7 @@
 """ The RDM driver: one class for one system and for a batch of them.
 
 RDMNetwork holds state, parameters and the EPR observer's feed, and orchestrates; it writes no
-equation of its own -- those are rdme.equations, rdme.epr, rdme.fixed_points and rdme.lyapunov,
+equation of its own -- those are rdme.equations, rdme.epr, rdme.stability and rdme.lyapunov,
 all pure functions on tensors with arbitrary leading axes. Batching is the SHAPE of what the
 driver holds: w is (M, M) for one system and (B, M, M) for a batch of B, every per-population
 parameter (M,) or (B, M), and every age-resolved tensor (M, Q) or (B, M, Q) -- one age grid Q
@@ -23,9 +23,9 @@ import torch
 import tqdm
 
 import rdme.equations as eq
-import rdme.fixed_points as fpts
 import rdme.hazards as hzd
 import rdme.lyapunov as lyap
+import rdme.stability as stab
 from rdme import epr
 
 # Parameter grids
@@ -394,12 +394,12 @@ class RDMNetwork:
 
     def fp_residual(self, m: torch.Tensor) -> torch.Tensor:
         """ G(m) = m - F(m), in OVERLAPS (per-bin), (*b, M): on the [0, 1] scale the generic
-        Newton routines in rdme.fixed_points clamp to. Divide a root by dt for the rate. """
-        return fpts.fp_residual(m, *self._fp_args())
+        Newton routines in rdme.stability clamp to. Divide a root by dt for the rate. """
+        return eq.fp_residual(m, *self._fp_args())
 
     def fp_state(self, m: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """ The stationary (p, S), each (*b, M, Q), implied by the overlaps m. """
-        return fpts.fp_state(m, *self._fp_args())
+        return eq.fp_state(m, *self._fp_args())
 
     def set_state(self, m: torch.Tensor) -> None:
         """ Place every system on the stationary state implied by its overlaps m (*b, M). """
@@ -420,56 +420,59 @@ class RDMNetwork:
 
         method='bracket' scans [0, 1] for sign changes of G and bisects them; it is exhaustive
         up to the grid resolution and is the default for M=1, where it reliably picks up the
-        unstable middle branch inside a bistable region. method='newton' runs Newton from a
-        lattice of starting points and is the default for M>1; it finds whatever the basins
-        reach, so a root missing from its output is not proof that none exists.
+        unstable middle branch inside a bistable region. method='newton' runs Newton and is the
+        default for M>1, from stability.default_guesses unless `guesses` are given: a lattice
+        over the physical box [0, dt/t_abs]^M, plus, for M = 2 with w(I→I) = 0, a start in every
+        sign change of the exact 1-D reduction. Elsewhere it finds whatever the basins reach,
+        so a root missing from its output is not proof that none exists.
 
-        Roots come back unclassified -- pass each to fp_eigenvalues (or is_stable). In
-        overlaps, not rates: at small dt [0, 1] is a very coarse net over a root sitting at
-        O(dt), so pass `guesses` explicitly when refining. """
+        Roots come back unclassified -- pass each to leading_modes or leading_growth. In
+        overlaps, not rates. """
         assert self.B is None, "fixed_points is per system: use fp_sweep, or select(b)"
         if method == 'auto':
             method = 'bracket' if self.M == 1 else 'newton'
 
         if method == 'bracket':
             assert self.M == 1, "bracketing is a scalar method; use method='newton' for M > 1"
-            return fpts.bracket_roots(self.fp_residual, n_grid=n_grid, merge_tol=merge_tol,
+            return stab.bracket_roots(self.fp_residual, n_grid=n_grid, merge_tol=merge_tol,
                                       device=self.device, dtype=self.dtype, **kwargs)
         if method == 'newton':
             if guesses is None:
-                guesses = fpts.fp_guess_lattice(self.M, n_per_axis=5, device=self.device,
-                                                dtype=self.dtype)
-            return fpts.newton_roots(self.fp_residual, guesses.to(self.dtype), tol=tol,
-                                     merge_tol=merge_tol, **kwargs)
+                guesses = stab.default_guesses(self)
+            return stab.newton_roots(self.fp_residual, guesses.to(self.device, self.dtype),
+                                     tol=tol, merge_tol=merge_tol, **kwargs)
         raise ValueError(f"unknown method {method!r}, expected 'auto', 'bracket' or 'newton'")
 
     def _fp_residual_one(self, m: torch.Tensor, *params: torch.Tensor) -> torch.Tensor:
         """ G(m) for a *single* system, with that system's parameters passed in rather than
         read off self: the form torch.vmap needs to give every Newton trajectory its own
         parameters. Argument order matches fp_sweep's params tuple. """
-        return fpts.fp_residual(m, *params, hazard=hzd.HAZARDS[self.hazard], nu0=self.nu0,
-                                dt=self.dt)
+        return eq.fp_residual(m, *params, hazard=hzd.HAZARDS[self.hazard], nu0=self.nu0,
+                              dt=self.dt)
 
     def fp_sweep(self,
                  guesses: torch.Tensor | None = None,
                  n_per_axis: int = 5,
                  tol: float = 1e-10,
                  res_tol: float | None = None,
+                 chunk: int | None = None,
                  **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         """ Newton from K starting points, for every system at once.
 
         Every (system, starting point) pair is one Newton trajectory and they all run
-        simultaneously, so a phase map costs a single vmapped solve. Returns (roots,
+        simultaneously, so a phase map costs a single vmapped solve -- on the model's device,
+        which for a batch should be the GPU (81 x 36 trajectories: 78 s on the CPU, ~1 s on the
+        GPU). Its memory grows with the number of trajectories, so they run in chunks of `chunk`
+        rows (default: all), halved on out-of-memory (stability.run_chunked). Returns (roots,
         converged), shaped (*b, K, M) and (*b, K); the rows `converged` marks False hold junk.
 
         Deliberately *not* deduplicated: collapsing K guesses into a variable number of
-        distinct roots is ragged per system; fixed_points.deduplicate is there for the systems
-        worth inspecting. The default lattice spans overlaps in [0, 1] -- pass `guesses`
-        explicitly when refining. """
+        distinct roots is ragged per system; stability.deduplicate is there for the systems
+        worth inspecting. The default lattice spans the physical box [0, dt/t_abs]^M. """
         if guesses is None:
-            guesses = fpts.fp_guess_lattice(self.M, n_per_axis, device=self.device,
-                                            dtype=self.dtype)
-        guesses = guesses.to(self.dtype)
+            guesses = stab.fp_guess_lattice(self.M, n_per_axis, 0.0, stab.overlap_ceiling(self),
+                                            device=self.device, dtype=self.dtype)
+        guesses = guesses.to(self.device, self.dtype)
         K, lead = guesses.shape[0], self.batch_shape
         B = math.prod(lead)
 
@@ -478,8 +481,13 @@ class RDMNetwork:
                   rep(self.theta), rep(self.R), rep(self.blocked))
         m0 = guesses.repeat(B, 1)                                    # (B*K, M)
 
-        m = fpts.newton_iterate(self._fp_residual_one, m0, params, tol=tol, **kwargs)
-        res = fpts.residual_norms(self._fp_residual_one, m, params)
+        def solve(sl: slice) -> torch.Tensor:          # (rows, M + 1): roots and residual
+            ps = tuple(q[sl] for q in params)
+            m = stab.newton_iterate(self._fp_residual_one, m0[sl], ps, tol=tol, **kwargs)
+            return torch.cat([m, stab.residual_norms(self._fp_residual_one, m, ps)[:, None]], -1)
+
+        out, _ = stab.run_chunked(solve, B * K, chunk)
+        m, res = out[:, :-1], out[:, -1]
         converged = torch.isfinite(res) & (res < (res_tol if res_tol is not None else 1e3 * tol))
         return m.reshape(lead + (K, self.M)), converged.reshape(lead + (K,))
 
@@ -511,11 +519,27 @@ class RDMNetwork:
         """ Eigenvalues of the linearized map at the fixed point with overlaps m (one system). """
         assert self.B is None, "fp_eigenvalues is per system: select(b) first"
         x = self.flatten_state(*self.fp_state(m))
-        return fpts.jacobian_eigvals(self.state_map, x)
+        return stab.jacobian_eigvals(self.state_map, x)
 
     def is_stable(self, m: torch.Tensor, tol: float = 1e-8) -> bool:
-        """ Linear stability of the fixed point with overlaps m: spectral radius < 1. """
-        return bool(fpts.spectral_radius(self.fp_eigenvalues(m)) < 1.0 - tol)
+        """ Linear stability of the fixed point with overlaps m: spectral radius < 1. Dense, so
+        for small systems and tests; leading_modes / leading_growth for the rest. """
+        return bool(stab.spectral_radius(self.fp_eigenvalues(m)) < 1.0 - tol)
+
+    def leading_modes(self, m: torch.Tensor, **kwargs) -> dict:
+        """ The leading modes (mu in 1/ms, omega in rad/ms, warm start v) at the fixed point
+        with overlaps m, for one system: stability.leading_modes (ARPACK; CPU). """
+        assert self.B is None, "leading_modes is per system: select(b) first"
+        return stab.leading_modes(self.state_map, self.flatten_state(*self.fp_state(m)),
+                                  self.dt, **kwargs)
+
+    def leading_growth(self, m: torch.Tensor, t_ms: float = 1000.0, **kwargs) -> torch.Tensor:
+        """ The leading growth rate (1/ms) at the fixed points with overlaps m (*b, M), one per
+        system: stability.leading_growth (power iteration; batches on the GPU). Works where the
+        leading modes are too degenerate for ARPACK. """
+        m = torch.as_tensor(m, device=self.device, dtype=self.dtype)
+        return stab.leading_growth(self.state_map, self.flatten_state(*self.fp_state(m)),
+                                   self.dt, t_ms, **kwargs)
 
     # Tangent dynamics (Lyapunov exponents)
     # ~~~~~~~~~~~~

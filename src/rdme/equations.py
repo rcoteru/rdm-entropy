@@ -3,7 +3,7 @@ read off it, as pure functions.
 
 The base layer of the package. Nothing here knows which per-bin kernel is in use -- the hazard
 arrives as an argument (fprobs, or a Hazard callable) or not at all -- and nothing here imports
-the rest of the package: fixed_points, lyapunov and epr build on this module, never the other
+the rest of the package: stability, lyapunov and epr build on this module, never the other
 way round.
 
 The per-step updates act on the age axis, (..., Q), and treat everything before it as
@@ -17,17 +17,20 @@ The arithmetic is the batch class's (decided 2026-11-13): out-of-place updates, 
 rate as a (1, Q) @ (Q, 1) product, which reproduces the batch's einsum bit for bit on every
 shape including 1-D (see compute_firing_rate).
 
-hazard_clamp is a dtype-dependent numerical bound for the stationary survival in
-rdme.fixed_points. The entropy production no longer uses it: it reads ln Phi and ln(1 - Phi)
+hazard_clamp is a dtype-dependent numerical bound for the stationary survival (Stationary
+states, below). The entropy production no longer uses it: it reads ln Phi and ln(1 - Phi)
 off the kernels' exact branches, because a clamped log is what a saturated H_rev is made of. """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from typing import overload
+from typing import TYPE_CHECKING, overload
 
 import torch
+
+if TYPE_CHECKING:          # annotation only: this module imports nothing from the package
+    from rdme.hazards import Hazard
 
 # Per-step updates
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -491,3 +494,143 @@ def advance(p: torch.Tensor, S: torch.Tensor, I: torch.Tensor, fprobs: torch.Ten
     p_new = update_age_distribution(p, fprobs)
     S_new = update_synaptic_term(S, alpha[..., None], I[..., None], blocked)
     return m, p_new, S_new
+
+
+# Stationary states
+# ~~~~~~~~~~~~~~~~~
+#
+# At a fixed point the input is constant, so the whole age-resolved state follows from it: the
+# synaptic term unrolls to a geometric sum, the hazard is then a pure function of age, and the
+# stationary age distribution is its normalized survival.
+
+def compute_stationary_forward_field(
+        I: torch.Tensor,               # (...) constant total input to the population
+        alpha: float | torch.Tensor,   # integration kernel scaling factor
+        blocked: torch.Tensor,         # (..., Q) bool, the absolute window; Q from its length
+        ) -> torch.Tensor:             # (..., Q) S_n at constant input
+    """ The synaptic term at a fixed point, in closed form.
+
+    With I frozen, S_n = alpha*I + (1-alpha)*S_{n-1} from S = 0 unrolls to the geometric
+    sum S_n = I*[1 - (1-alpha)^e_n], e_n = max(n - n_abs, 0) the bins of input integrated
+    since the window ended (equations.integration_age: S is clamped at 0 through the
+    absolute window, see update_synaptic_term). The same saturating profile an isolated
+    neuron has under a constant external drive, with the drive replaced by the
+    self-consistent input; with t_abs = 0, e_n = n.
+
+    This is the exact fixed point of update_synaptic_term, boundary bin included -- that
+    update shifts rather than lumps, so its last bin is just the recursion at n = Q-1. """
+    I = torch.as_tensor(I)
+    decay = torch.as_tensor(1.0 - alpha, device=I.device, dtype=I.dtype)
+    e = integration_age(blocked).to(I.dtype)
+    return I.unsqueeze(-1) * (1.0 - decay.unsqueeze(-1) ** e)
+
+
+def compute_stationary_survival(fprobs: torch.Tensor,   # (..., Q) age-resolved hazard
+                     log: bool = False,
+                     ) -> torch.Tensor:      # (..., Q) survival from age 0
+    """ S_0(n) = prod_{j<n} (1 - Phi_j), with the empty product S_0(0) = 1.
+
+    Accumulated in log space for the same reason the EPR path is: at large beta the hazard
+    saturates and a long product of (1-Phi) underflows to zero, which would send the
+    normalization of the stationary distribution to a ratio of zeros. The hazard is clamped
+    below one first, with a dtype-dependent bound (see hazard_clamp). """
+    log1m = torch.log1p(-fprobs.clamp(max=hazard_clamp(fprobs.dtype)))
+    cum = torch.cumsum(log1m[..., :-1], dim=-1)
+    log_surv = torch.cat([torch.zeros_like(cum[..., :1]), cum], dim=-1)
+    return log_surv if log else torch.exp(log_surv)
+
+
+def compute_stationary_age_distribution(
+        fprobs: torch.Tensor,                      # (..., Q) age-resolved hazard
+        ) -> tuple[torch.Tensor, torch.Tensor]:    # (..., Q) p*, (...) m*
+    """ Stationary age distribution and firing rate at a frozen, age-resolved hazard.
+
+    Iterating the aging branch of update_age_distribution gives p*(n) = p*(0) * S_0(n) on
+    the interior bins, while the lumped bin balances its own outflow against the inflow
+    from n = Q-2, giving p*(Q-1) = p*(0) * S_0(Q-1) / Phi_{Q-1}: the exact resummation of
+    the geometric tail the truncation cuts off, not an approximation of it. Normalization
+    then fixes p*(0), which is the firing rate m* itself, since births equal spikes.
+
+    The reset branch is not an extra condition -- sum_n p*(n) Phi_n = m* holds identically
+    by telescoping -- so this single pass is the whole stationary solution. In the
+    untruncated limit the boundary term drops and m* becomes the renewal firing rate
+    1/sum_n S_0(n) of an isolated neuron. """
+    surv = compute_stationary_survival(fprobs)
+    tail = surv[..., -1] / fprobs[..., -1]                       # lumped bin, geometric tail
+    m = 1.0 / (surv[..., :-1].sum(dim=-1) + tail)
+    p = torch.cat([surv[..., :-1], tail.unsqueeze(-1)], dim=-1) * m.unsqueeze(-1)
+    return p, m
+
+
+def renewal_rate(x: float, nu0: float, t_abs: float) -> float:
+    """ Stationary rate of a renewal process with a hard dead time t_abs followed by the
+    constant route-B hazard lambda = nu0 e^x: the mean interval is t_abs + 1/lambda, so
+    r = lambda / (1 + lambda t_abs) = (1/t_abs) sigma(x + ln(nu0 t_abs)). The continuum
+    answer for an uncoupled population with K_ref = 0 and an instantaneous synapse. """
+    lam = nu0 * math.exp(x)
+    return lam / (1.0 + lam * t_abs)
+
+
+# The overlap map
+# ~~~~~~~~~~~~~~~
+#
+# Composing the two closed forms above gives the overlap map F, whose roots m = F(m) are the
+# fixed points -- one O(M*Q) pass per evaluation, no time integration.
+
+def fp_overlap_map(m: torch.Tensor,        # (M,) trial overlaps
+                   w: torch.Tensor,        # (M, M)
+                   E: torch.Tensor,        # (M,)
+                   alpha: torch.Tensor,    # (M,)
+                   beta: torch.Tensor,     # (M,)
+                   theta: torch.Tensor,    # (M,)
+                   R: torch.Tensor,        # (M, Q)
+                   blocked: torch.Tensor,  # (M, Q) bool, the absolute window
+                   hazard: Hazard,
+                   nu0: float,
+                   dt: float,
+                   ) -> torch.Tensor:      # (M,) F(m)
+    """ One evaluation of the overlap map F: trial overlaps -> stationary overlaps.
+
+    The hazard-parametrised counterpart of mean_field.fp_overlap_map. Only the hazard step
+    differs: compute_stationary_forward_field and compute_stationary_age_distribution are
+    reused from there unchanged, because both already take the hazard as data -- the first
+    never sees it, and the second takes fprobs as an argument.
+
+    Note this works in overlaps m, not rates, so that the residual lives on the same scale as
+    the generic Newton and bracketing routines in rdme.stability (which clamp to
+    [0, 1]) applies unchanged. Rates are m/dt throughout the class API. """
+    return _stationary(m, w, E, alpha, beta, theta, R, blocked, hazard, nu0, dt)[2]
+
+
+def fp_state(m: torch.Tensor,
+             w: torch.Tensor,
+             E: torch.Tensor,
+             alpha: torch.Tensor,
+             beta: torch.Tensor,
+             theta: torch.Tensor,
+             R: torch.Tensor,
+             blocked: torch.Tensor,
+             hazard: Hazard,
+             nu0: float,
+             dt: float,
+             ) -> tuple[torch.Tensor, torch.Tensor]:
+    """ The full stationary state (p, S), each (..., M, Q), implied by a set of overlaps. """
+    return _stationary(m, w, E, alpha, beta, theta, R, blocked, hazard, nu0, dt)[:2]
+
+
+def _stationary(m, w, E, alpha, beta, theta, R, blocked, hazard: Hazard, nu0: float,
+                dt: float):
+    """ (p, S, F(m)) at the overlaps m: the state and the overlaps it fires at. Phi is exactly
+    0 on the blocked bins, where the survival then carries ln(1 - 0) = 0. """
+    I = compute_total_input(m / dt, w, E)       # w is unscaled here, so feed it the rate
+    S = compute_stationary_forward_field(I, alpha, blocked)
+    phi = hazard.phi(S + R - theta[..., None], beta[..., None], nu0, dt).masked_fill(blocked, 0.0)
+    p, m_new = compute_stationary_age_distribution(phi)
+    return p, S, m_new
+
+
+def fp_residual(m: torch.Tensor, w: torch.Tensor, E: torch.Tensor, alpha: torch.Tensor,
+                beta: torch.Tensor, theta: torch.Tensor, R: torch.Tensor,
+                blocked: torch.Tensor, hazard: Hazard, nu0: float, dt: float) -> torch.Tensor:
+    """ G(m) = m - F(m), in overlaps; F is fp_overlap_map. """
+    return m - fp_overlap_map(m, w, E, alpha, beta, theta, R, blocked, hazard, nu0, dt)

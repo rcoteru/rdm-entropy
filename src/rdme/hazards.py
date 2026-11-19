@@ -2,7 +2,7 @@
 
 Model-independent: everything here is a pure function of the field h, the gain beta, the rate
 unit nu0 and the step dt. Nothing knows about populations, age distributions or networks, the
-same way the root finders in rdme.fixed_points know nothing about the model whose roots they
+same way the root finders in rdme.stability know nothing about the model whose roots they
 locate.
 
 The kernels and their relationships are documented below; rdme is what applies them.

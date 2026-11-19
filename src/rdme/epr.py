@@ -46,7 +46,7 @@ def compute_reverse_synaptic_term(
     each reversed-time spike (equations.update_synaptic_term), so a reverse age n has
     integrated e_n bins, the ones nearest t. Those are exactly the first e_n terms of the
     unclamped sum, so the clamp is the unclamped field read at age e_n -- the same clock, by
-    the same function, as the forward field's (fixed_points.compute_stationary_forward_field).
+    the same function, as the forward field's (equations.compute_stationary_forward_field).
     With t_abs = 0, e_n = n and the gather is the identity.
 
     The field is anchored at the buffer's OWN row 0: it reads I[1] onwards and never
